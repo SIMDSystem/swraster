@@ -1173,14 +1173,14 @@ int main() {
     };
     
     // Build torus collision as compound of 12 capsules in a ring
-    // Torus: major radius 1.0, minor radius 0.4
+    // Torus: major radius 1.0, minor radius 0.36
     ShapeRefC torus_shape;
     {
         StaticCompoundShapeSettings compound_settings;
         const float major_radius = 1.0f;
-        const float minor_radius = 0.4f;
+        const float minor_radius = 0.36f; // Tube thickness
         const int num_segments = 12;
-        const float half_height = 0.3f; // Capsule half-length for overlap
+        const float half_height = 0.2f; // Capsule half-length (cylinder part only)
         
         RefConst<Shape> capsule = new CapsuleShape(half_height, minor_radius);
         
@@ -1189,8 +1189,10 @@ int main() {
             float x = major_radius * cosf(angle);
             float z = major_radius * sinf(angle);
             
-            // Capsule oriented tangent to ring (rotated 90° + angle around Y)
-            Quat rot = Quat::sRotation(Vec3(0, 1, 0), angle + M_PI * 0.5f);
+            // Capsule axis is along Y by default.
+            // Tangent to ring at angle θ is (-sin θ, 0, cos θ)
+            // Rotate Y to tangent: 90° around radial axis (cos θ, 0, sin θ)
+            Quat rot = Quat::sRotation(Vec3(cosf(angle), 0, sinf(angle)), M_PI * 0.5f);
             compound_settings.AddShape(Vec3(x, 0, z), rot, capsule);
         }
         
@@ -1211,49 +1213,7 @@ int main() {
         const float scale = 0.5f;
         const int tess = 8;
         
-        // Teapot control points (same as geometry.cpp)
-        static const float teapot_data[32][4][4][3] = {
-            // Lid patches (0-3)
-            {{{1.4,2.25,0.0},{1.3375,2.38125,0.0},{1.4375,2.38125,0.0},{1.5,2.25,0.0}},{{1.4,2.25,0.784},{1.3375,2.38125,0.749},{1.4375,2.38125,0.805},{1.5,2.25,0.84}},{{0.784,2.25,1.4},{0.749,2.38125,1.3375},{0.805,2.38125,1.4375},{0.84,2.25,1.5}},{{0.0,2.25,1.4},{0.0,2.38125,1.3375},{0.0,2.38125,1.4375},{0.0,2.25,1.5}}},
-            {{{0.0,2.25,1.4},{0.0,2.38125,1.3375},{0.0,2.38125,1.4375},{0.0,2.25,1.5}},{{-0.784,2.25,1.4},{-0.749,2.38125,1.3375},{-0.805,2.38125,1.4375},{-0.84,2.25,1.5}},{{-1.4,2.25,0.784},{-1.3375,2.38125,0.749},{-1.4375,2.38125,0.805},{-1.5,2.25,0.84}},{{-1.4,2.25,0.0},{-1.3375,2.38125,0.0},{-1.4375,2.38125,0.0},{-1.5,2.25,0.0}}},
-            {{{-1.4,2.25,0.0},{-1.3375,2.38125,0.0},{-1.4375,2.38125,0.0},{-1.5,2.25,0.0}},{{-1.4,2.25,-0.784},{-1.3375,2.38125,-0.749},{-1.4375,2.38125,-0.805},{-1.5,2.25,-0.84}},{{-0.784,2.25,-1.4},{-0.749,2.38125,-1.3375},{-0.805,2.38125,-1.4375},{-0.84,2.25,-1.5}},{{0.0,2.25,-1.4},{0.0,2.38125,-1.3375},{0.0,2.38125,-1.4375},{0.0,2.25,-1.5}}},
-            {{{0.0,2.25,-1.4},{0.0,2.38125,-1.3375},{0.0,2.38125,-1.4375},{0.0,2.25,-1.5}},{{0.784,2.25,-1.4},{0.749,2.38125,-1.3375},{0.805,2.38125,-1.4375},{0.84,2.25,-1.5}},{{1.4,2.25,-0.784},{1.3375,2.38125,-0.749},{1.4375,2.38125,-0.805},{1.5,2.25,-0.84}},{{1.4,2.25,0.0},{1.3375,2.38125,0.0},{1.4375,2.38125,0.0},{1.5,2.25,0.0}}},
-            // Body patches (4-7)
-            {{{1.5,2.25,0.0},{1.75,1.725,0.0},{2,1.2,0.0},{2,0.75,0.0}},{{1.5,2.25,0.84},{1.75,1.725,0.98},{2,1.2,1.12},{2,0.75,1.12}},{{0.84,2.25,1.5},{0.98,1.725,1.75},{1.12,1.2,2},{1.12,0.75,2}},{{0.0,2.25,1.5},{0.0,1.725,1.75},{0.0,1.2,2},{0.0,0.75,2}}},
-            {{{0.0,2.25,1.5},{0.0,1.725,1.75},{0.0,1.2,2},{0.0,0.75,2}},{{-0.84,2.25,1.5},{-0.98,1.725,1.75},{-1.12,1.2,2},{-1.12,0.75,2}},{{-1.5,2.25,0.84},{-1.75,1.725,0.98},{-2,1.2,1.12},{-2,0.75,1.12}},{{-1.5,2.25,0.0},{-1.75,1.725,0.0},{-2,1.2,0.0},{-2,0.75,0.0}}},
-            {{{-1.5,2.25,0.0},{-1.75,1.725,0.0},{-2,1.2,0.0},{-2,0.75,0.0}},{{-1.5,2.25,-0.84},{-1.75,1.725,-0.98},{-2,1.2,-1.12},{-2,0.75,-1.12}},{{-0.84,2.25,-1.5},{-0.98,1.725,-1.75},{-1.12,1.2,-2},{-1.12,0.75,-2}},{{0.0,2.25,-1.5},{0.0,1.725,-1.75},{0.0,1.2,-2},{0.0,0.75,-2}}},
-            {{{0.0,2.25,-1.5},{0.0,1.725,-1.75},{0.0,1.2,-2},{0.0,0.75,-2}},{{0.84,2.25,-1.5},{0.98,1.725,-1.75},{1.12,1.2,-2},{1.12,0.75,-2}},{{1.5,2.25,-0.84},{1.75,1.725,-0.98},{2,1.2,-1.12},{2,0.75,-1.12}},{{1.5,2.25,0.0},{1.75,1.725,0.0},{2,1.2,0.0},{2,0.75,0.0}}},
-            // Bottom patches (8-11)
-            {{{2,0.75,0.0},{2,0.3,0.0},{1.5,0.075,0.0},{1.5,0.0,0.0}},{{2,0.75,1.12},{2,0.3,1.12},{1.5,0.075,0.84},{1.5,0.0,0.84}},{{1.12,0.75,2},{1.12,0.3,2},{0.84,0.075,1.5},{0.84,0.0,1.5}},{{0.0,0.75,2},{0.0,0.3,2},{0.0,0.075,1.5},{0.0,0.0,1.5}}},
-            {{{0.0,0.75,2},{0.0,0.3,2},{0.0,0.075,1.5},{0.0,0.0,1.5}},{{-1.12,0.75,2},{-1.12,0.3,2},{-0.84,0.075,1.5},{-0.84,0.0,1.5}},{{-2,0.75,1.12},{-2,0.3,1.12},{-1.5,0.075,0.84},{-1.5,0.0,0.84}},{{-2,0.75,0.0},{-2,0.3,0.0},{-1.5,0.075,0.0},{-1.5,0.0,0.0}}},
-            {{{-2,0.75,0.0},{-2,0.3,0.0},{-1.5,0.075,0.0},{-1.5,0.0,0.0}},{{-2,0.75,-1.12},{-2,0.3,-1.12},{-1.5,0.075,-0.84},{-1.5,0.0,-0.84}},{{-1.12,0.75,-2},{-1.12,0.3,-2},{-0.84,0.075,-1.5},{-0.84,0.0,-1.5}},{{0.0,0.75,-2},{0.0,0.3,-2},{0.0,0.075,-1.5},{0.0,0.0,-1.5}}},
-            {{{0.0,0.75,-2},{0.0,0.3,-2},{0.0,0.075,-1.5},{0.0,0.0,-1.5}},{{1.12,0.75,-2},{1.12,0.3,-2},{0.84,0.075,-1.5},{0.84,0.0,-1.5}},{{2,0.75,-1.12},{2,0.3,-1.12},{1.5,0.075,-0.84},{1.5,0.0,-0.84}},{{2,0.75,0.0},{2,0.3,0.0},{1.5,0.075,0.0},{1.5,0.0,0.0}}},
-            // Handle patches (12-15)
-            {{{-1.6,1.875,0.0},{-2.3,1.875,0.0},{-2.7,1.875,0.0},{-2.7,1.65,0.0}},{{-1.6,1.875,0.3},{-2.3,1.875,0.3},{-2.7,1.875,0.3},{-2.7,1.65,0.3}},{{-1.5,2.1,0.3},{-2.5,2.1,0.3},{-3,2.1,0.3},{-3,1.65,0.3}},{{-1.5,2.1,0.0},{-2.5,2.1,0.0},{-3,2.1,0.0},{-3,1.65,0.0}}},
-            {{{-1.5,2.1,0.0},{-2.5,2.1,0.0},{-3,2.1,0.0},{-3,1.65,0.0}},{{-1.5,2.1,-0.3},{-2.5,2.1,-0.3},{-3,2.1,-0.3},{-3,1.65,-0.3}},{{-1.6,1.875,-0.3},{-2.3,1.875,-0.3},{-2.7,1.875,-0.3},{-2.7,1.65,-0.3}},{{-1.6,1.875,0.0},{-2.3,1.875,0.0},{-2.7,1.875,0.0},{-2.7,1.65,0.0}}},
-            {{{-2.7,1.65,0.0},{-2.7,1.425,0.0},{-2.5,0.975,0.0},{-2,0.75,0.0}},{{-2.7,1.65,0.3},{-2.7,1.425,0.3},{-2.5,0.975,0.3},{-2,0.75,0.3}},{{-3,1.65,0.3},{-3,1.2,0.3},{-2.65,0.7875,0.3},{-1.9,0.45,0.3}},{{-3,1.65,0.0},{-3,1.2,0.0},{-2.65,0.7875,0.0},{-1.9,0.45,0.0}}},
-            {{{-3,1.65,0.0},{-3,1.2,0.0},{-2.65,0.7875,0.0},{-1.9,0.45,0.0}},{{-3,1.65,-0.3},{-3,1.2,-0.3},{-2.65,0.7875,-0.3},{-1.9,0.45,-0.3}},{{-2.7,1.65,-0.3},{-2.7,1.425,-0.3},{-2.5,0.975,-0.3},{-2,0.75,-0.3}},{{-2.7,1.65,0.0},{-2.7,1.425,0.0},{-2.5,0.975,0.0},{-2,0.75,0.0}}},
-            // Spout patches (16-19)
-            {{{1.7,1.275,0.0},{2.6,1.275,0.0},{2.3,1.95,0.0},{2.7,2.25,0.0}},{{1.7,1.275,0.66},{2.6,1.275,0.66},{2.3,1.95,0.25},{2.7,2.25,0.25}},{{1.7,0.45,0.66},{3.1,0.675,0.66},{2.4,1.875,0.25},{3.3,2.25,0.25}},{{1.7,0.45,0.0},{3.1,0.675,0.0},{2.4,1.875,0.0},{3.3,2.25,0.0}}},
-            {{{1.7,0.45,0.0},{3.1,0.675,0.0},{2.4,1.875,0.0},{3.3,2.25,0.0}},{{1.7,0.45,-0.66},{3.1,0.675,-0.66},{2.4,1.875,-0.25},{3.3,2.25,-0.25}},{{1.7,1.275,-0.66},{2.6,1.275,-0.66},{2.3,1.95,-0.25},{2.7,2.25,-0.25}},{{1.7,1.275,0.0},{2.6,1.275,0.0},{2.3,1.95,0.0},{2.7,2.25,0.0}}},
-            {{{2.7,2.25,0.0},{2.8,2.325,0.0},{2.9,2.325,0.0},{2.8,2.25,0.0}},{{2.7,2.25,0.25},{2.8,2.325,0.25},{2.9,2.325,0.15},{2.8,2.25,0.15}},{{3.3,2.25,0.25},{3.525,2.34375,0.25},{3.45,2.3625,0.15},{3.2,2.25,0.15}},{{3.3,2.25,0.0},{3.525,2.34375,0.0},{3.45,2.3625,0.0},{3.2,2.25,0.0}}},
-            {{{3.3,2.25,0.0},{3.525,2.34375,0.0},{3.45,2.3625,0.0},{3.2,2.25,0.0}},{{3.3,2.25,-0.25},{3.525,2.34375,-0.25},{3.45,2.3625,-0.15},{3.2,2.25,-0.15}},{{2.7,2.25,-0.25},{2.8,2.325,-0.25},{2.9,2.325,-0.15},{2.8,2.25,-0.15}},{{2.7,2.25,0.0},{2.8,2.325,0.0},{2.9,2.325,0.0},{2.8,2.25,0.0}}},
-            // Lid handle patches (20-23)
-            {{{0.01,3,0.0},{0.8,3,0.0},{0.0,2.7,0.0},{0.2,2.55,0.0}},{{0.0,3,0.01},{0.8,3,0.45},{0.0,2.7,0.0},{0.2,2.55,0.112}},{{0.01,3,0.0},{0.45,3,0.8},{0.0,2.7,0.0},{0.112,2.55,0.2}},{{0.0,3,0.01},{0.0,3,0.8},{0.0,2.7,0.0},{0.0,2.55,0.2}}},
-            {{{0.0,3,0.01},{0.0,3,0.8},{0.0,2.7,0.0},{0.0,2.55,0.2}},{{-0.01,3,0.0},{-0.45,3,0.8},{0.0,2.7,0.0},{-0.112,2.55,0.2}},{{0.0,3,0.01},{-0.8,3,0.45},{0.0,2.7,0.0},{-0.2,2.55,0.112}},{{-0.01,3,0.0},{-0.8,3,0.0},{0.0,2.7,0.0},{-0.2,2.55,0.0}}},
-            {{{-0.01,3,0.0},{-0.8,3,0.0},{0.0,2.7,0.0},{-0.2,2.55,0.0}},{{0.0,3,-0.01},{-0.8,3,-0.45},{0.0,2.7,0.0},{-0.2,2.55,-0.112}},{{-0.01,3,0.0},{-0.45,3,-0.8},{0.0,2.7,0.0},{-0.112,2.55,-0.2}},{{0.0,3,-0.01},{0.0,3,-0.8},{0.0,2.7,0.0},{0.0,2.55,-0.2}}},
-            {{{0.0,3,-0.01},{0.0,3,-0.8},{0.0,2.7,0.0},{0.0,2.55,-0.2}},{{0.01,3,0.0},{0.45,3,-0.8},{0.0,2.7,0.0},{0.112,2.55,-0.2}},{{0.0,3,-0.01},{0.8,3,-0.45},{0.0,2.7,0.0},{0.2,2.55,-0.112}},{{0.01,3,0.0},{0.8,3,0.0},{0.0,2.7,0.0},{0.2,2.55,0.0}}},
-            // Lid handle base patches (24-27)
-            {{{0.2,2.55,0.0},{0.4,2.4,0.0},{1.3,2.4,0.0},{1.3,2.25,0.0}},{{0.2,2.55,0.112},{0.4,2.4,0.224},{1.3,2.4,0.728},{1.3,2.25,0.728}},{{0.112,2.55,0.2},{0.224,2.4,0.4},{0.728,2.4,1.3},{0.728,2.25,1.3}},{{0.0,2.55,0.2},{0.0,2.4,0.4},{0.0,2.4,1.3},{0.0,2.25,1.3}}},
-            {{{0.0,2.55,0.2},{0.0,2.4,0.4},{0.0,2.4,1.3},{0.0,2.25,1.3}},{{-0.112,2.55,0.2},{-0.224,2.4,0.4},{-0.728,2.4,1.3},{-0.728,2.25,1.3}},{{-0.2,2.55,0.112},{-0.4,2.4,0.224},{-1.3,2.4,0.728},{-1.3,2.25,0.728}},{{-0.2,2.55,0.0},{-0.4,2.4,0.0},{-1.3,2.4,0.0},{-1.3,2.25,0.0}}},
-            {{{-0.2,2.55,0.0},{-0.4,2.4,0.0},{-1.3,2.4,0.0},{-1.3,2.25,0.0}},{{-0.2,2.55,-0.112},{-0.4,2.4,-0.224},{-1.3,2.4,-0.728},{-1.3,2.25,-0.728}},{{-0.112,2.55,-0.2},{-0.224,2.4,-0.4},{-0.728,2.4,-1.3},{-0.728,2.25,-1.3}},{{0.0,2.55,-0.2},{0.0,2.4,-0.4},{0.0,2.4,-1.3},{0.0,2.25,-1.3}}},
-            {{{0.0,2.55,-0.2},{0.0,2.4,-0.4},{0.0,2.4,-1.3},{0.0,2.25,-1.3}},{{0.112,2.55,-0.2},{0.224,2.4,-0.4},{0.728,2.4,-1.3},{0.728,2.25,-1.3}},{{0.2,2.55,-0.112},{0.4,2.4,-0.224},{1.3,2.4,-0.728},{1.3,2.25,-0.728}},{{0.2,2.55,0.0},{0.4,2.4,0.0},{1.3,2.4,0.0},{1.3,2.25,0.0}}},
-            // Bottom surface (28-31) - not used for collision
-            {{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}}},
-            {{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}}},
-            {{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}}},
-            {{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}},{{0,0,0},{0,0,0},{0,0,0},{0,0,0}}}
-        };
+        // teapot_data is now shared from geometry.h
         
         // Helper to sample bezier patch
         auto bezier_sample = [](float p[4], float t) -> float {
@@ -1836,18 +1796,22 @@ int main() {
         Uint64 now = SDL_GetTicks64();
         float delta_time = (now - last_physics_time) / 1000.0f;
         last_physics_time = now;
-        float time = now / 1000.0f;
         
-        // Clamp delta to avoid physics explosion on lag spikes
-        if (delta_time > 0.1f) delta_time = 0.1f;
-        if (delta_time < 0.001f) delta_time = 0.001f;
+        // Clamp delta to 16ms max to avoid physics explosion on pause/lag
+        if (delta_time > 0.016f) delta_time = 0.016f;
+        
+        // Track simulated time (only advances by clamped delta)
+        static float sim_time = 0.0f;
+        sim_time += delta_time;
+        float time = sim_time;
         
         // Tumble the container box
         Quat box_rotation = Quat::sEulerAngles(Vec3(time * 0.8f, time * 0.6f, time * 0.4f));
         for (const auto& wall : walls) {
             // Rotate local position around origin
             Vec3 rotated_pos = box_rotation * wall.local_pos;
-            body_interface.SetPositionAndRotation(wall.id, RVec3(rotated_pos.GetX(), rotated_pos.GetY(), rotated_pos.GetZ()), box_rotation, EActivation::Activate);
+            // Use MoveKinematic so Jolt computes wall velocity for proper collision response
+            body_interface.MoveKinematic(wall.id, RVec3(rotated_pos.GetX(), rotated_pos.GetY(), rotated_pos.GetZ()), box_rotation, delta_time);
         }
         
         // Physics Update with real delta time
@@ -2078,6 +2042,140 @@ int main() {
                 }
             }
         }
+        
+#if 0 // Disabled: wireframe torus collision capsules
+        // Draw wireframe torus collision capsules (no depth testing)
+        {
+            const float major_radius = 1.0f;
+            const float minor_radius = 0.36f; // Match collision shape
+            const float half_height = 0.2f; // Match collision shape
+            const int num_segments = 12;
+            uint32_t capsule_color = SDL_MapRGB(fb->format, 0, 255, 255); // Cyan
+            Matrix4f vp = projection * view_matrix;
+            
+            // Projection scale factor: proj(0,0) for X, proj(1,1) for Y
+            float proj_scale = projection(1,1); // f = 1/tan(fov/2)
+            
+            for (const auto& inst : instances) {
+                if (inst.type != 2) continue; // Only tori
+                
+                // Build instance transform from physics state
+                float qx = inst.qx, qy = inst.qy, qz = inst.qz, qw = inst.qw;
+                Matrix4f rot;
+                rot(0,0) = 1.0f - 2.0f*(qy*qy + qz*qz);
+                rot(0,1) = 2.0f*(qx*qy - qz*qw);
+                rot(0,2) = 2.0f*(qx*qz + qy*qw);
+                rot(0,3) = 0;
+                rot(1,0) = 2.0f*(qx*qy + qz*qw);
+                rot(1,1) = 1.0f - 2.0f*(qx*qx + qz*qz);
+                rot(1,2) = 2.0f*(qy*qz - qx*qw);
+                rot(1,3) = 0;
+                rot(2,0) = 2.0f*(qx*qz - qy*qw);
+                rot(2,1) = 2.0f*(qy*qz + qx*qw);
+                rot(2,2) = 1.0f - 2.0f*(qx*qx + qy*qy);
+                rot(2,3) = 0;
+                rot(3,0)=0; rot(3,1)=0; rot(3,2)=0; rot(3,3)=1;
+                
+                Matrix4f translate = Matrix4f::Identity();
+                translate(0,3) = inst.tx;
+                translate(1,3) = inst.ty;
+                translate(2,3) = inst.tz;
+                Matrix4f model = translate * rot;
+                Matrix4f mv = view_matrix * model;
+                Matrix4f mvp = vp * model;
+                
+                // Draw each capsule - showing TRUE extent including hemispherical caps
+                // CapsuleShape(half_height, radius) has total length = 2*(half_height + radius)
+                // The axis endpoints are at ±half_height, but hemispheres extend ±radius beyond
+                const float total_half_length = half_height + minor_radius; // True capsule half-extent
+                
+                for (int seg = 0; seg < num_segments; seg++) {
+                    float angle = (float)seg * 2.0f * M_PI / num_segments;
+                    float px = major_radius * cosf(angle);
+                    float pz = major_radius * sinf(angle);
+                    
+                    // Capsule axis: tangent to ring = (-sin θ, 0, cos θ)
+                    // Matches Jolt: 90° rotation around radial axis (cos θ, 0, sin θ)
+                    float tx = -sinf(angle);
+                    float tz = cosf(angle);
+                    
+                    // Capsule TRUE endpoints (including hemisphere extent)
+                    Vector4f p0_local(px - tx * total_half_length, 0, pz - tz * total_half_length, 1);
+                    Vector4f p1_local(px + tx * total_half_length, 0, pz + tz * total_half_length, 1);
+                    
+                    // Transform to view space for depth
+                    Vector4f p0_view = mv * p0_local;
+                    Vector4f p1_view = mv * p1_local;
+                    float depth0 = -p0_view.z(); // View space Z is negative forward
+                    float depth1 = -p1_view.z();
+                    
+                    // Transform to clip space
+                    Vector4f p0_clip = mvp * p0_local;
+                    Vector4f p1_clip = mvp * p1_local;
+                    
+                    if (p0_clip.w() > 0.1f && p1_clip.w() > 0.1f) {
+                        float x0f = (p0_clip.x() / p0_clip.w() + 1.0f) * 0.5f * screen_width;
+                        float y0f = (1.0f - p0_clip.y() / p0_clip.w()) * 0.5f * screen_height;
+                        float x1f = (p1_clip.x() / p1_clip.w() + 1.0f) * 0.5f * screen_width;
+                        float y1f = (1.0f - p1_clip.y() / p1_clip.w()) * 0.5f * screen_height;
+                        
+                        int x0 = (int)x0f, y0 = (int)y0f;
+                        int x1 = (int)x1f, y1 = (int)y1f;
+                        
+                        // Proper perspective radius: screen_r = world_r * proj_scale * screen_h / (2 * depth)
+                        float r0f = minor_radius * proj_scale * screen_height / (2.0f * depth0);
+                        float r1f = minor_radius * proj_scale * screen_height / (2.0f * depth1);
+                        int r0 = (int)fmaxf(3.0f, r0f);
+                        int r1 = (int)fmaxf(3.0f, r1f);
+                        
+                        // Draw capsule axis
+                        draw_line(pixels, pitch, x0, y0, x1, y1, capsule_color, screen_width, screen_height);
+                        
+                        // Draw circles at endpoints (12 segments for smoother circles)
+                        const int circle_segs = 12;
+                        for (int c = 0; c < circle_segs; c++) {
+                            float a0 = c * 2.0f * M_PI / circle_segs;
+                            float a1 = (c + 1) * 2.0f * M_PI / circle_segs;
+                            
+                            // Circle at p0
+                            int cx0 = x0 + (int)(r0 * cosf(a0));
+                            int cy0 = y0 + (int)(r0 * sinf(a0));
+                            int cx1 = x0 + (int)(r0 * cosf(a1));
+                            int cy1 = y0 + (int)(r0 * sinf(a1));
+                            draw_line(pixels, pitch, cx0, cy0, cx1, cy1, capsule_color, screen_width, screen_height);
+                            
+                            // Circle at p1
+                            cx0 = x1 + (int)(r1 * cosf(a0));
+                            cy0 = y1 + (int)(r1 * sinf(a0));
+                            cx1 = x1 + (int)(r1 * cosf(a1));
+                            cy1 = y1 + (int)(r1 * sinf(a1));
+                            draw_line(pixels, pitch, cx0, cy0, cx1, cy1, capsule_color, screen_width, screen_height);
+                        }
+                        
+                        // Draw tangent lines connecting the two circles (cylinder sides)
+                        // Perpendicular to capsule axis in screen space
+                        float dx = x1f - x0f;
+                        float dy = y1f - y0f;
+                        float len = sqrtf(dx*dx + dy*dy);
+                        if (len > 0.1f) {
+                            float nx = -dy / len; // perpendicular
+                            float ny = dx / len;
+                            // Top edge
+                            draw_line(pixels, pitch, 
+                                      x0 + (int)(nx * r0), y0 + (int)(ny * r0),
+                                      x1 + (int)(nx * r1), y1 + (int)(ny * r1),
+                                      capsule_color, screen_width, screen_height);
+                            // Bottom edge
+                            draw_line(pixels, pitch,
+                                      x0 - (int)(nx * r0), y0 - (int)(ny * r0),
+                                      x1 - (int)(nx * r1), y1 - (int)(ny * r1),
+                                      capsule_color, screen_width, screen_height);
+                        }
+                    }
+                }
+            }
+        }
+#endif
         
         // Draw FPS (Safe now that Raster is done)
         int fps_x = fb->w - 50;

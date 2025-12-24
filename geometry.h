@@ -26,6 +26,9 @@ struct Face {
     SDL_Surface* texture;  // Texture surface (nullptr if no texture)
 };
 
+// Utah Teapot Bezier patch control points (32 patches, 4x4 control points each)
+extern const float teapot_data[32][4][4][3];
+
 // Geometry generation functions
 void generate_cube(std::vector<Vertex3D>& vertices, std::vector<Face>& faces);
 void generate_sphere(float radius, int slices, int stacks, std::vector<Vertex3D>& vertices, std::vector<Face>& faces);
