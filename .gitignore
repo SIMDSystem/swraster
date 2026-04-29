@@ -1,0 +1,18 @@
+# Build outputs
+raster
+*.o
+*.d
+*.dSYM/
+build/
+out/
+
+# Generated app bundle
+Raster.app/
+
+# Temporary icon generation output
+*.iconset/
+icon.iconset/
+
+# Editor and OS noise
+.DS_Store
+.vscode/

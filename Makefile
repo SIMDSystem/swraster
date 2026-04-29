@@ -45,7 +45,7 @@ $(TARGET): $(SOURCES) $(JOLT_LIB)
 # App bundle depends on executable - will rebuild exe if source changes
 # IMPORTANT: Check if exe in bundle is older than source exe and copy if needed
 # This ensures app bundle always has the latest executable
-$(APP_NAME): $(TARGET) Info.plist icon.icns baboon.bmp lenna.bmp
+$(APP_NAME): $(TARGET) Info.plist icon.icns baboon.bmp lenna.bmp tiles.bmp
 	@echo "Updating app bundle..."
 	@mkdir -p $(APP_NAME)/Contents/MacOS
 	@mkdir -p $(APP_NAME)/Contents/Resources
@@ -69,6 +69,13 @@ $(APP_NAME): $(TARGET) Info.plist icon.icns baboon.bmp lenna.bmp
 		echo "Copied lenna.bmp to app bundle Resources"; \
 	else \
 		echo "Error: lenna.bmp not found!"; \
+		exit 1; \
+	fi
+	@if [ -f tiles.bmp ]; then \
+		cp tiles.bmp $(APP_NAME)/Contents/Resources/tiles.bmp && \
+		echo "Copied tiles.bmp to app bundle Resources"; \
+	else \
+		echo "Error: tiles.bmp not found!"; \
 		exit 1; \
 	fi
 	@echo "APPL????" > $(APP_NAME)/Contents/PkgInfo

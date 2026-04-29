@@ -15,6 +15,7 @@ struct Vertex3D {
     float r, g, b;
     float u, v;         // Texture coordinates
     
+    Vertex3D() : position(0, 0, 0, 1.0f), normal(0, 0, 0), r(1), g(1), b(1), u(0), v(0) {}
     Vertex3D(float x, float y, float z, float r = 1.0f, float g = 1.0f, float b = 1.0f, float u = 0.0f, float v = 0.0f)
         : position(x, y, z, 1.0f), normal(0, 0, 0), r(r), g(g), b(b), u(u), v(v) {}
 };
@@ -36,4 +37,3 @@ void generate_torus(float main_radius, float tube_radius, int slices, int stacks
 void generate_teapot(std::vector<Vertex3D>& vertices, std::vector<Face>& faces);
 
 #endif // GEOMETRY_H
-

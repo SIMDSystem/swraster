@@ -9,7 +9,6 @@
 
 // Utah Teapot Bezier patch control points (32 patches, 4x4 control points each)
 // Shared between geometry.cpp (rendering) and main.cpp (collision)
-extern const float teapot_data[32][4][4][3];
 const float teapot_data[32][4][4][3] = {
     // Lid patches (0-3)
     {{{1.4,2.25,0.0},{1.3375,2.38125,0.0},{1.4375,2.38125,0.0},{1.5,2.25,0.0}},{{1.4,2.25,0.784},{1.3375,2.38125,0.749},{1.4375,2.38125,0.805},{1.5,2.25,0.84}},{{0.784,2.25,1.4},{0.749,2.38125,1.3375},{0.805,2.38125,1.4375},{0.84,2.25,1.5}},{{0.0,2.25,1.4},{0.0,2.38125,1.3375},{0.0,2.38125,1.4375},{0.0,2.25,1.5}}},
@@ -243,27 +242,6 @@ static Vector3f bezier_patch(const Vector3f patch[4][4], float u, float v) {
     return bezier_curve(u_curve, u);
 }
 
-// Compute normal for Bezier patch using cross product of partial derivatives
-static Vector3f bezier_patch_normal(const Vector3f patch[4][4], float u, float v) {
-    // Approximate partial derivatives
-    float eps = 0.001f;
-    Vector3f p_uv = bezier_patch(patch, u, v);
-    Vector3f p_u_plus = bezier_patch(patch, fminf(u + eps, 1.0f), v);
-    Vector3f p_v_plus = bezier_patch(patch, u, fminf(v + eps, 1.0f));
-    
-    Vector3f du = (p_u_plus - p_uv) / eps;
-    Vector3f dv = (p_v_plus - p_uv) / eps;
-    
-    Vector3f normal = du.cross(dv);
-    float len = normal.norm();
-    if (len > 0.0001f) {
-        normal /= len;
-    } else {
-        normal = Vector3f(0, 1, 0);
-    }
-    return normal;
-}
-
 void generate_teapot(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
@@ -273,8 +251,6 @@ void generate_teapot(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) 
     // Scale: Classic teapot is ~3.0 units tall, scale to fit our scene
     const float scale = 0.5f;
     const int tessellation = 8; // Triangles per patch edge
-    
-    // teapot_data is defined at file scope above and shared with main.cpp
     
     // Map to share vertices at patch boundaries: position -> vertex_index
     std::map<std::tuple<int, int, int>, int> vertex_map;
