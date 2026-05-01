@@ -78,8 +78,11 @@ constexpr float NEAR_PLANE = 0.1f;
 constexpr bool ENABLE_NEAR_CLIP = true;
 constexpr bool ENABLE_PHONG_SHADING = true;
 constexpr bool USE_SPOTLIGHT = true;
+constexpr bool ENABLE_SSAO = true;
+constexpr bool ENABLE_RGB_TRIANGLE_SORT = true;
+constexpr bool ENABLE_SHADOW_TRIANGLE_SORT = true;
 constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
-constexpr int SHADOW_MAP_SIZE = 2048;
+constexpr int SHADOW_MAP_SIZE = 1024;
 constexpr float SHADOW_DEPTH_BIAS = 0.0025f;
 
 // Physics layers
@@ -102,7 +105,7 @@ std::mutex mtx_raster;
 std::condition_variable cv_raster;
 int frame_raster_target = 0;
 int active_raster_buf_id = 0; // Set by main under mtx_raster before signaling
-enum class RasterJobMode { ShadowDepth, Color };
+enum class RasterJobMode { ShadowDepth, Color, Ssao, Luminaire };
 RasterJobMode active_raster_job = RasterJobMode::Color;
 
 std::mutex mtx_main;
@@ -181,6 +184,25 @@ static inline bool project_eye_point(const Matrix4f& projection, const Vector3f&
     return true;
 }
 
+static inline bool project_eye_point(const Matrix4f& projection, const Vector3f& p,
+                                     int screen_width, int screen_height,
+                                     float& sx, float& sy, float& sz, float& inv_w) {
+    Vector4f clip = projection * Vector4f(p.x(), p.y(), p.z(), 1.0f);
+    if (clip.w() <= 0.1f) return false;
+    inv_w = 1.0f / clip.w();
+    float nx = clip.x() * inv_w;
+    float ny = clip.y() * inv_w;
+    sz = clip.z() * inv_w;
+    sx = (nx + 1.0f) * 0.5f * screen_width;
+    sy = (1.0f - ny) * 0.5f * screen_height;
+    return true;
+}
+
+enum class TriangleShader {
+    Lit,
+    LuminaireCone
+};
+
 static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* format,
                                  float add_r, float add_g, float add_b) {
     uint8_t dr, dg, db;
@@ -225,8 +247,7 @@ static inline float sample_shadow_pcf(const float* shadow_depth, int shadow_size
 
 void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
                               int screen_width, int screen_height, SDL_PixelFormat* format,
-                              const Matrix4f& projection, const Vector3f& light_pos,
-                              const Vector3f& spot_dir, float spot_outer_cos) {
+                              const Matrix4f& projection, const Vector3f& light_pos) {
     float lx, ly, lz;
     if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
     
@@ -250,101 +271,6 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
             if (d2 > disk_radius * disk_radius) continue;
             float a = expf(-d2 * inv_sigma2);
             add_pixel_rgb(row_pixels, x, format, 255.0f * a, 255.0f * a, 255.0f * a);
-        }
-    }
-    
-    // Actual additive cone: apex at the luminaire, circular base perpendicular
-    // to the spotlight axis, tessellated as side triangles in eye space.
-    float outer_angle = acosf(fmaxf(-1.0f, fminf(1.0f, spot_outer_cos)));
-    const float cone_len = 4.5f;
-    Vector3f axis = spot_dir.normalized();
-    Vector3f base_center = light_pos + axis * cone_len;
-    
-    Vector3f u = axis.cross(Vector3f(0.0f, 1.0f, 0.0f));
-    if (u.squaredNorm() < 0.0001f) u = axis.cross(Vector3f(1.0f, 0.0f, 0.0f));
-    u.normalize();
-    Vector3f v = axis.cross(u).normalized();
-    float radius = tanf(outer_angle) * cone_len;
-    
-    struct ConePV {
-        float x, y, z;
-        Vector3f p;
-        Vector3f n;
-        bool visible;
-    };
-    auto project_cone_point = [&](const Vector3f& p, const Vector3f& n) {
-        ConePV out{};
-        out.p = p;
-        out.n = n;
-        out.visible = project_eye_point(projection, p, screen_width, screen_height, out.x, out.y, out.z);
-        return out;
-    };
-    auto draw_cone_triangle = [&](const ConePV& a, const ConePV& b, const ConePV& c) {
-        if (!a.visible || !b.visible || !c.visible) return;
-        int tx_min = std::max(0, (int)floorf(fminf(a.x, fminf(b.x, c.x))));
-        int tx_max = std::min(screen_width - 1, (int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))));
-        int ty_min = std::max(0, (int)floorf(fminf(a.y, fminf(b.y, c.y))));
-        int ty_max = std::min(screen_height - 1, (int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))));
-        if (tx_min > tx_max || ty_min > ty_max) return;
-        
-        float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if (fabsf(area) < 0.0001f) return;
-        float inv_area = 1.0f / area;
-        
-        for (int y = ty_min; y <= ty_max; y++) {
-            uint32_t* row_pixels = (uint32_t*)pixels + y * pixels_per_row;
-            float* row_depth = depth_buffer + y * screen_width;
-            for (int x = tx_min; x <= tx_max; x++) {
-                float px = (float)x + 0.5f;
-                float py = (float)y + 0.5f;
-                float w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) * inv_area;
-                float w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) * inv_area;
-                float w2 = 1.0f - w0 - w1;
-                if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) continue;
-                float z = a.z * w0 + b.z * w1 + c.z * w2;
-                if (z > row_depth[x] + 0.002f) continue;
-                
-                Vector3f p = a.p * w0 + b.p * w1 + c.p * w2;
-                Vector3f n = a.n * w0 + b.n * w1 + c.n * w2;
-                float n_len2 = n.squaredNorm();
-                float p_len2 = p.squaredNorm();
-                if (n_len2 < 0.000001f || p_len2 < 0.000001f) continue;
-                
-                float cone_t = (p - light_pos).dot(axis) / cone_len;
-                cone_t = fminf(1.0f, fmaxf(0.0f, cone_t));
-                float distal_fade = 0.5f + 0.5f * cosf((float)M_PI * cone_t);
-                
-                n *= 1.0f / sqrtf(n_len2);
-                Vector3f view_vec = -p * (1.0f / sqrtf(p_len2));
-                float vdotn = fabsf(view_vec.dot(n));
-                float silhouette_t = fminf(1.0f, fmaxf(0.0f, vdotn / 0.45f));
-                float silhouette_fade = silhouette_t * silhouette_t * (3.0f - 2.0f * silhouette_t);
-                
-                float a_add = 0.22f * distal_fade * silhouette_fade;
-                add_pixel_rgb(row_pixels, x, format, 255.0f * a_add, 255.0f * a_add, 255.0f * a_add);
-            }
-        }
-    };
-    
-    const int cone_segments = 32;
-    ConePV apex_base{};
-    ConePV prev{};
-    Vector3f prev_normal;
-    for (int i = 0; i <= cone_segments; i++) {
-        float angle = (2.0f * (float)M_PI * i) / cone_segments;
-        Vector3f radial = cosf(angle) * u + sinf(angle) * v;
-        Vector3f side_normal = (cone_len * radial - radius * axis).normalized();
-        Vector3f p = base_center + radius * radial;
-        ConePV cur = project_cone_point(p, side_normal);
-        if (i > 0) {
-            ConePV apex = apex_base;
-            apex.n = (prev_normal + side_normal).normalized();
-            draw_cone_triangle(apex, prev, cur);
-        }
-        prev = cur;
-        prev_normal = side_normal;
-        if (i == 0) {
-            apex_base = project_cone_point(light_pos, side_normal);
         }
     }
 }
@@ -437,9 +363,8 @@ Matrix4f build_shadow_tex_matrix(const Matrix4f& view_matrix, const Vector3f& li
     return m;
 }
 
-Matrix4f build_spot_shadow_tex_matrix(const Vector3f& light_pos_eye, const Vector3f& target_eye,
+Matrix4f build_spot_shadow_tex_matrix(const Matrix4f& light_view_eye,
                                       float fov_degrees, float near_plane, float far_plane) {
-    Matrix4f light_view = lookAt(light_pos_eye, target_eye, Vector3f(0.0f, 1.0f, 0.0f));
     Matrix4f light_proj = build_projection_matrix(fov_degrees, 1.0f, near_plane, far_plane);
     
     Matrix4f bias = Matrix4f::Identity();
@@ -447,7 +372,7 @@ Matrix4f build_spot_shadow_tex_matrix(const Vector3f& light_pos_eye, const Vecto
     bias(1, 1) = -0.5f; bias(1, 3) = 0.5f;
     bias(2, 2) = 0.5f; bias(2, 3) = 0.5f;
     
-    return bias * light_proj * light_view;
+    return bias * light_proj * light_view_eye;
 }
 
 static inline bool sphere_intersects_camera_frustum_eye(const Vector3f& center, float radius,
@@ -570,12 +495,20 @@ struct ClipVertex {
     float u, v;
 };
 
-static inline bool is_inside_near(const ClipVertex& v) {
-    return v.position.z() <= -NEAR_PLANE;
+static inline float near_plane_distance(const ClipVertex& v, const Matrix4f& view_matrix, float near_plane) {
+    Vector4f p = view_matrix * v.position;
+    return -p.z() - near_plane;
 }
 
-static inline ClipVertex interpolate_clip_vertex(const ClipVertex& a, const ClipVertex& b) {
-    float t = (-NEAR_PLANE - a.position.z()) / (b.position.z() - a.position.z());
+static inline bool is_inside_near(const ClipVertex& v, const Matrix4f& view_matrix, float near_plane) {
+    return near_plane_distance(v, view_matrix, near_plane) >= 0.0f;
+}
+
+static inline ClipVertex interpolate_clip_vertex(const ClipVertex& a, const ClipVertex& b,
+                                                 const Matrix4f& view_matrix, float near_plane) {
+    float da = near_plane_distance(a, view_matrix, near_plane);
+    float db = near_plane_distance(b, view_matrix, near_plane);
+    float t = da / (da - db);
     ClipVertex out;
     out.position = a.position + t * (b.position - a.position);
     out.normal = a.normal + t * (b.normal - a.normal);
@@ -588,17 +521,18 @@ static inline ClipVertex interpolate_clip_vertex(const ClipVertex& a, const Clip
     return out;
 }
 
-static int clip_triangle_near(const ClipVertex in[3], ClipVertex out[4]) {
+static int clip_triangle_near(const ClipVertex in[3], ClipVertex out[4],
+                              const Matrix4f& view_matrix, float near_plane) {
     int out_count = 0;
     ClipVertex prev = in[2];
-    bool prev_inside = is_inside_near(prev);
+    bool prev_inside = is_inside_near(prev, view_matrix, near_plane);
     
     for (int i = 0; i < 3; i++) {
         const ClipVertex& cur = in[i];
-        bool cur_inside = is_inside_near(cur);
+        bool cur_inside = is_inside_near(cur, view_matrix, near_plane);
         
         if (cur_inside != prev_inside) {
-            out[out_count++] = interpolate_clip_vertex(prev, cur);
+            out[out_count++] = interpolate_clip_vertex(prev, cur, view_matrix, near_plane);
         }
         if (cur_inside) {
             out[out_count++] = cur;
@@ -894,7 +828,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                                       const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
                                       bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                       const float* shadow_depth, int shadow_size,
-                                      int y_strip_min, int y_strip_max, bool depth_write) {
+                                      int y_strip_min, int y_strip_max, bool depth_write,
+                                      TriangleShader shader = TriangleShader::Lit) {
     // Compute bounding box and clamp to screen + strip
     int x_min = (int)fminf(v0.x, fminf(v1.x, v2.x));
     int x_max = (int)fmaxf(v0.x, fmaxf(v1.x, v2.x));
@@ -987,6 +922,41 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             
             // Perspective-correct UV
             float inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
+            if (shader == TriangleShader::LuminaireCone) {
+                float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
+                float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
+                float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
+                float nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
+                float ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
+                float nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+                
+                float px = ex - light_pos.x();
+                float py = ey - light_pos.y();
+                float pz = ez - light_pos.z();
+                constexpr float cone_len = 4.5f;
+                float cone_t = (px * spot_dir.x() + py * spot_dir.y() + pz * spot_dir.z()) / cone_len;
+                cone_t = fminf(1.0f, fmaxf(0.0f, cone_t));
+                float distal_fade = 0.5f + 0.5f * cosf((float)M_PI * cone_t);
+                
+                float n_len2 = nx * nx + ny * ny + nz * nz;
+                float p_len2 = ex * ex + ey * ey + ez * ez;
+                if (n_len2 > 0.000001f && p_len2 > 0.000001f) {
+                    float inv_n_len = 1.0f / sqrtf(n_len2);
+                    float inv_p_len = -1.0f / sqrtf(p_len2);
+                    nx *= inv_n_len; ny *= inv_n_len; nz *= inv_n_len;
+                    ex *= inv_p_len; ey *= inv_p_len; ez *= inv_p_len;
+                    
+                    float vdotn = fabsf(ex * nx + ey * ny + ez * nz);
+                    float silhouette_t = fminf(1.0f, fmaxf(0.0f, vdotn / 0.45f));
+                    float silhouette_fade = silhouette_t * silhouette_t * (3.0f - 2.0f * silhouette_t);
+                    float a_add = 0.22f * distal_fade * silhouette_fade;
+                    add_pixel_rgb(row_pixels, x, format, 255.0f * a_add, 255.0f * a_add, 255.0f * a_add);
+                }
+                
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
+            
             float u = (u0_w * b0 + u1_w * b1 + u2_w * b2) / inv_w;
             float v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w;
             
@@ -1148,6 +1118,177 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             w0 += A0; w1 += A1; w2 += A2;
         }
         w0_row += B0; w1_row += B1; w2_row += B2;
+    }
+}
+
+void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                               int screen_width, int screen_height, SDL_PixelFormat* format,
+                               const Matrix4f& projection, const Vector3f& light_pos,
+                               const Vector3f& spot_dir, float spot_outer_cos,
+                               int y_strip_min, int y_strip_max) {
+    Vector3f axis = spot_dir.normalized();
+    float outer_angle = acosf(fmaxf(-1.0f, fminf(1.0f, spot_outer_cos)));
+    constexpr float cone_len = 4.5f;
+    Vector3f base_center = light_pos + axis * cone_len;
+    
+    Vector3f u = axis.cross(Vector3f(0.0f, 1.0f, 0.0f));
+    if (u.squaredNorm() < 0.0001f) u = axis.cross(Vector3f(1.0f, 0.0f, 0.0f));
+    u.normalize();
+    Vector3f v = axis.cross(u).normalized();
+    float radius = tanf(outer_angle) * cone_len;
+    
+    auto make_vertex = [&](const Vector3f& p, const Vector3f& n, VertexVaryings& out) {
+        if (!project_eye_point(projection, p, screen_width, screen_height, out.x, out.y, out.z, out.inv_w)) {
+            return false;
+        }
+        out.r = out.g = out.b = out.a = 1.0f;
+        out.u = out.v = 0.0f;
+        out.nx = n.x(); out.ny = n.y(); out.nz = n.z();
+        out.ex = p.x(); out.ey = p.y(); out.ez = p.z();
+        out.ss = out.st = out.sr = 0.0f;
+        out.sq = 1.0f;
+        return true;
+    };
+    
+    constexpr int cone_segments = 64;
+    for (int i = 0; i < cone_segments; i++) {
+        float a0 = (2.0f * (float)M_PI * i) / cone_segments;
+        float a1 = (2.0f * (float)M_PI * (i + 1)) / cone_segments;
+        Vector3f radial0 = cosf(a0) * u + sinf(a0) * v;
+        Vector3f radial1 = cosf(a1) * u + sinf(a1) * v;
+        Vector3f n0 = (cone_len * radial0 - radius * axis).normalized();
+        Vector3f n1 = (cone_len * radial1 - radius * axis).normalized();
+        Vector3f apex_n = (n0 + n1).normalized();
+        
+        VertexVaryings apex, p0, p1;
+        if (!make_vertex(light_pos, apex_n, apex)) continue;
+        if (!make_vertex(base_center + radius * radial0, n0, p0)) continue;
+        if (!make_vertex(base_center + radius * radial1, n1, p1)) continue;
+        
+        draw_triangle_barycentric_strip(pixels, pitch, depth_buffer,
+                                        screen_width, screen_height,
+                                        apex, p0, p1,
+                                        format, nullptr,
+                                        Vector3f::Zero(), light_pos, axis,
+                                        true, 1.0f, spot_outer_cos,
+                                        nullptr, 0,
+                                        y_strip_min, y_strip_max, false,
+                                        TriangleShader::LuminaireCone);
+    }
+}
+
+void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
+                      int screen_width, int screen_height, SDL_PixelFormat* format,
+                      int y_strip_min, int y_strip_max) {
+    static constexpr int sample_offsets[16][2] = {
+        { 2,  0}, {-2,  0}, { 0,  2}, { 0, -2},
+        { 4,  3}, {-4,  3}, { 4, -3}, {-4, -3},
+        { 7,  1}, {-7,  1}, { 1,  7}, { 1, -7},
+        { 8,  6}, {-8,  6}, { 8, -6}, {-8, -6}
+    };
+    constexpr float near_plane = 0.1f;
+    constexpr float far_plane = 100.0f;
+    constexpr float proj_a = (far_plane + near_plane) / (near_plane - far_plane);
+    constexpr float proj_b = (2.0f * far_plane * near_plane) / (near_plane - far_plane);
+    constexpr float angle_bias = 0.12f;
+    constexpr float sample_radius = 3.25f;
+    constexpr float sample_radius2 = sample_radius * sample_radius;
+    constexpr float max_occlusion = 0.9f;
+    constexpr float inv_sample_radius = 1.0f / sample_radius;
+    constexpr float inv_sample_count = 1.0f / 16.0f;
+    constexpr float inv_angle_range = 1.0f / (1.0f - angle_bias);
+    float f = 1.0f / tanf(60.0f * (float)M_PI / 360.0f);
+    float aspect = (float)screen_width / (float)screen_height;
+    float x_scale = aspect / f;
+    float y_scale = 1.0f / f;
+    float inv_screen_width = 1.0f / (float)screen_width;
+    float inv_screen_height = 1.0f / (float)screen_height;
+    
+    auto linear_eye_depth = [](float ndc_z) {
+        return proj_b / (ndc_z + proj_a);
+    };
+    auto reconstruct_position = [&](int x, int y, float ndc_z, float& px, float& py, float& pz) {
+        float depth = linear_eye_depth(ndc_z);
+        float ndc_x = (((float)x + 0.5f) * inv_screen_width) * 2.0f - 1.0f;
+        float ndc_y = 1.0f - (((float)y + 0.5f) * inv_screen_height) * 2.0f;
+        px = ndc_x * depth * x_scale;
+        py = ndc_y * depth * y_scale;
+        pz = -depth;
+    };
+    
+    for (int y = y_strip_min; y <= y_strip_max; y++) {
+        uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
+        for (int x = 0; x < screen_width; x++) {
+            float center_z = depth_buffer[y * screen_width + x];
+            if (center_z >= 0.999f) continue;
+            float cx, cy, cz;
+            reconstruct_position(x, y, center_z, cx, cy, cz);
+            
+            int xl = std::max(0, x - 1);
+            int xr = std::min(screen_width - 1, x + 1);
+            int yu = std::max(0, y - 1);
+            int yd = std::min(screen_height - 1, y + 1);
+            float zl = depth_buffer[y * screen_width + xl];
+            float zr = depth_buffer[y * screen_width + xr];
+            float zu = depth_buffer[yu * screen_width + x];
+            float zd = depth_buffer[yd * screen_width + x];
+            if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
+            
+            float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
+            reconstruct_position(xl, y, zl, plx, ply, plz);
+            reconstruct_position(xr, y, zr, prx, pry, prz);
+            reconstruct_position(x, yu, zu, pux, puy, puz);
+            reconstruct_position(x, yd, zd, pdx, pdy, pdz);
+            
+            float dx_x = prx - plx, dx_y = pry - ply, dx_z = prz - plz;
+            float dy_x = pdx - pux, dy_y = pdy - puy, dy_z = pdz - puz;
+            float nx = dy_y * dx_z - dy_z * dx_y;
+            float ny = dy_z * dx_x - dy_x * dx_z;
+            float nz = dy_x * dx_y - dy_y * dx_x;
+            float normal_len2 = nx * nx + ny * ny + nz * nz;
+            if (normal_len2 <= 0.000001f) continue;
+            float inv_normal_len = 1.0f / sqrtf(normal_len2);
+            nx *= inv_normal_len; ny *= inv_normal_len; nz *= inv_normal_len;
+            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) {
+                nx = -nx; ny = -ny; nz = -nz;
+            }
+            
+            float occlusion = 0.0f;
+            for (const auto& offset : sample_offsets) {
+                int sx = x + offset[0];
+                int sy = y + offset[1];
+                if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
+                
+                float sample_z = depth_buffer[sy * screen_width + sx];
+                if (sample_z >= 0.999f) continue;
+                
+                float spx, spy, spz;
+                reconstruct_position(sx, sy, sample_z, spx, spy, spz);
+                float dx = spx - cx;
+                float dy = spy - cy;
+                float dz = spz - cz;
+                float dist2 = dx * dx + dy * dy + dz * dz;
+                if (dist2 > 0.000001f && dist2 < sample_radius2) {
+                    float dist = sqrtf(dist2);
+                    float inv_dist = 1.0f / dist;
+                    float hemisphere = (nx * dx + ny * dy + nz * dz) * inv_dist;
+                    if (hemisphere > angle_bias) {
+                        float normal_weight = (hemisphere - angle_bias) * inv_angle_range;
+                        occlusion += normal_weight * (1.0f - dist * inv_sample_radius);
+                    }
+                }
+            }
+            
+            float ao = 1.0f - fminf(max_occlusion, (occlusion * inv_sample_count) * max_occlusion * 1.8f);
+            if (ao >= 0.999f) continue;
+            
+            uint8_t r, g, b;
+            SDL_GetRGB(row_pixels[x], format, &r, &g, &b);
+            row_pixels[x] = SDL_MapRGB(format,
+                                       (uint8_t)(r * ao),
+                                       (uint8_t)(g * ao),
+                                       (uint8_t)(b * ao));
+        }
     }
 }
 
@@ -1388,7 +1529,7 @@ int main() {
     
     // Render-only ground plane: low enough to remain below the rotating cube envelope.
     const float ground_y = -(sqrtf(3.0f) * box_half + wall_thick + 0.5f);
-    const float ground_half = 24.0f;
+    const float ground_half = 48.0f;
     std::vector<Vertex3D> ground_vertices;
     std::vector<Face> ground_faces;
     ground_vertices.reserve(4);
@@ -1401,9 +1542,9 @@ int main() {
         return (int)ground_vertices.size() - 1;
     };
     int g0 = add_ground_vertex(-ground_half, -ground_half, 0.0f, 0.0f);
-    int g1 = add_ground_vertex( ground_half, -ground_half, 1.0f, 0.0f);
-    int g2 = add_ground_vertex( ground_half,  ground_half, 1.0f, 1.0f);
-    int g3 = add_ground_vertex(-ground_half,  ground_half, 0.0f, 1.0f);
+    int g1 = add_ground_vertex( ground_half, -ground_half, 2.0f, 0.0f);
+    int g2 = add_ground_vertex( ground_half,  ground_half, 2.0f, 2.0f);
+    int g3 = add_ground_vertex(-ground_half,  ground_half, 0.0f, 2.0f);
     ground_faces.push_back({g0, g2, g1, 0.68f, 0.68f, 0.68f, 1.0f, nullptr});
     ground_faces.push_back({g0, g3, g2, 0.68f, 0.68f, 0.68f, 1.0f, nullptr});
     
@@ -1661,9 +1802,15 @@ int main() {
         std::vector<RenderTriangle> triangles;
         size_t count;  // Valid triangle count, immutable once T&L completes
     };
+    struct StripTriangleBuffer {
+        std::vector<std::vector<RenderTriangle>> strips;
+    };
     TriangleBuffer opaque_buffers[2];
     TriangleBuffer trans_buffers[2];
     TriangleBuffer shadow_buffers[2];
+    StripTriangleBuffer opaque_strip_buffers[2];
+    StripTriangleBuffer trans_strip_buffers[2];
+    StripTriangleBuffer shadow_strip_buffers[2];
     // Pre-allocate large fixed buffers - never resize during render
     opaque_buffers[0].triangles.resize(100000);
     opaque_buffers[1].triangles.resize(100000);
@@ -1674,6 +1821,11 @@ int main() {
     opaque_buffers[0].count = opaque_buffers[1].count = 0;
     trans_buffers[0].count = trans_buffers[1].count = 0;
     shadow_buffers[0].count = shadow_buffers[1].count = 0;
+    for (int b = 0; b < 2; b++) {
+        opaque_strip_buffers[b].strips.resize(NUM_STRIPS);
+        trans_strip_buffers[b].strips.resize(NUM_STRIPS);
+        shadow_strip_buffers[b].strips.resize(NUM_STRIPS);
+    }
     // Double-buffer indices managed by frame_num % 2 in the render loop
     
     struct ShadowBoxBuffer {
@@ -1684,7 +1836,10 @@ int main() {
     Vector3f light_dir_buffers[2];
     Vector3f light_pos_buffers[2];
     Vector3f spot_dir_buffers[2];
-Matrix4f shadow_matrix_buffers[2];
+    Matrix4f view_matrix_buffers[2];
+    Matrix4f projection_buffers[2];
+    Matrix4f shadow_matrix_buffers[2];
+    float time_buffers[2];
 
     // Shared data for T&L threads
     struct TLSharedData {
@@ -1708,9 +1863,13 @@ Matrix4f shadow_matrix_buffers[2];
         std::atomic<size_t>* trans_count;
         std::vector<RenderTriangle>* shadow_triangles;
         std::atomic<size_t>* shadow_count;
+        StripTriangleBuffer* opaque_strip_triangles;
+        StripTriangleBuffer* trans_strip_triangles;
+        StripTriangleBuffer* shadow_strip_triangles;
         Matrix4f projection;
         Matrix4f view_matrix;
         Matrix4f shadow_matrix;
+        Matrix4f shadow_view_matrix;
         Vector3f light_dir;
         Vector3f light_pos;
         Vector3f spot_dir;
@@ -1728,12 +1887,16 @@ Matrix4f shadow_matrix_buffers[2];
         SDL_PixelFormat* format;
     };
     TLSharedData tl_shared;
+    std::mutex mtx_strip_bins;
     
     // Shared data for raster threads
     struct RasterSharedData {
         const std::vector<RenderTriangle>* opaque_triangles;
         const std::vector<RenderTriangle>* trans_triangles;
         const std::vector<RenderTriangle>* shadow_triangles;
+        const StripTriangleBuffer* opaque_strip_triangles;
+        const StripTriangleBuffer* trans_strip_triangles;
+        const StripTriangleBuffer* shadow_strip_triangles;
         size_t opaque_count;
         size_t trans_count;
         size_t shadow_count;
@@ -1744,6 +1907,7 @@ Matrix4f shadow_matrix_buffers[2];
         int screen_height;
         SDL_PixelFormat* format;
         uint32_t clear_color; // For strip clearing
+        Matrix4f projection;
         Vector3f light_dir;
         Vector3f light_pos;
         Vector3f spot_dir;
@@ -1764,6 +1928,9 @@ Matrix4f shadow_matrix_buffers[2];
         std::vector<RenderTriangle> local_opaque;
         std::vector<RenderTriangle> local_trans;
         std::vector<RenderTriangle> local_shadow;
+        std::vector<std::vector<RenderTriangle>> local_opaque_strips(NUM_STRIPS);
+        std::vector<std::vector<RenderTriangle>> local_trans_strips(NUM_STRIPS);
+        std::vector<std::vector<RenderTriangle>> local_shadow_strips(NUM_STRIPS);
         local_opaque.reserve(1000);
         local_trans.reserve(1000);
         local_shadow.reserve(1000);
@@ -1797,12 +1964,43 @@ Matrix4f shadow_matrix_buffers[2];
             local_opaque.clear();
             local_trans.clear();
             local_shadow.clear();
+            for (int s = 0; s < NUM_STRIPS; s++) {
+                local_opaque_strips[s].clear();
+                local_trans_strips[s].clear();
+                local_shadow_strips[s].clear();
+            }
             
             // Process assigned instances
             int num_instances = (int)tl_shared.sorted_instances->size();
             int instances_per_thread = (num_instances + NUM_TL_THREADS - 1) / NUM_TL_THREADS;
             int start_idx = thread_id * instances_per_thread;
             int end_idx = std::min(start_idx + instances_per_thread, num_instances);
+            auto screen_strip_range = [&](float y0, float y1, float y2, int height, int& first_strip, int& last_strip) {
+                int y_min = (int)floorf(fminf(y0, fminf(y1, y2)));
+                int y_max = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
+                if (y_max < 0 || y_min >= height) return false;
+                if (y_min < 0) y_min = 0;
+                if (y_max >= height) y_max = height - 1;
+                first_strip = (y_min * NUM_STRIPS) / height;
+                last_strip = (y_max * NUM_STRIPS) / height;
+                if (first_strip < 0) first_strip = 0;
+                if (last_strip >= NUM_STRIPS) last_strip = NUM_STRIPS - 1;
+                return first_strip <= last_strip;
+            };
+            auto rgb_strip_range = [&](const RenderTriangle& tri, int& first_strip, int& last_strip) {
+                return screen_strip_range(tri.v0.y, tri.v1.y, tri.v2.y,
+                                          tl_shared.screen_height, first_strip, last_strip);
+            };
+            auto shadow_strip_range = [&](const RenderTriangle& tri, int& first_strip, int& last_strip) {
+                ShadowVertex sv0, sv1, sv2;
+                if (!shadow_vertex_from_varying(tri.v0, sv0) ||
+                    !shadow_vertex_from_varying(tri.v1, sv1) ||
+                    !shadow_vertex_from_varying(tri.v2, sv2)) {
+                    return false;
+                }
+                return screen_strip_range(sv0.y, sv1.y, sv2.y,
+                                          SHADOW_MAP_SIZE, first_strip, last_strip);
+            };
             
             // Pre-allocated thread-local vertex buffers (reused across instances)
             std::vector<Vertex3D> eye_space_vertices;
@@ -1937,16 +2135,54 @@ Matrix4f shadow_matrix_buffers[2];
                         : tl_shared.light_dir;
                     bool shadow_backface = face_normal.dot(shadow_light_vec) < 0.0f;
                     if (shadow_visible && shadow_backface) {
-                        RenderTriangle shadow_tri{};
-                        Vector4f sh0 = tl_shared.shadow_matrix * v0_eye.position;
-                        Vector4f sh1 = tl_shared.shadow_matrix * v1_eye.position;
-                        Vector4f sh2 = tl_shared.shadow_matrix * v2_eye.position;
-                        shadow_tri.v0.ss = sh0.x(); shadow_tri.v0.st = sh0.y(); shadow_tri.v0.sr = sh0.z(); shadow_tri.v0.sq = sh0.w();
-                        shadow_tri.v1.ss = sh1.x(); shadow_tri.v1.st = sh1.y(); shadow_tri.v1.sr = sh1.z(); shadow_tri.v1.sq = sh1.w();
-                        shadow_tri.v2.ss = sh2.x(); shadow_tri.v2.st = sh2.y(); shadow_tri.v2.sr = sh2.z(); shadow_tri.v2.sq = sh2.w();
-                        shadow_tri.shadow_backface = true;
-                        shadow_tri.shadow_screendoor_mask = inst.shadow_screendoor_mask;
-                        local_shadow.push_back(shadow_tri);
+                        auto emit_shadow_triangle = [&](const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
+                            RenderTriangle shadow_tri{};
+                            Vector4f sh0 = tl_shared.shadow_matrix * a.position;
+                            Vector4f sh1 = tl_shared.shadow_matrix * b.position;
+                            Vector4f sh2 = tl_shared.shadow_matrix * c.position;
+                            shadow_tri.v0.ss = sh0.x(); shadow_tri.v0.st = sh0.y(); shadow_tri.v0.sr = sh0.z(); shadow_tri.v0.sq = sh0.w();
+                            shadow_tri.v1.ss = sh1.x(); shadow_tri.v1.st = sh1.y(); shadow_tri.v1.sr = sh1.z(); shadow_tri.v1.sq = sh1.w();
+                            shadow_tri.v2.ss = sh2.x(); shadow_tri.v2.st = sh2.y(); shadow_tri.v2.sr = sh2.z(); shadow_tri.v2.sq = sh2.w();
+                            shadow_tri.shadow_backface = true;
+                            shadow_tri.shadow_screendoor_mask = inst.shadow_screendoor_mask;
+                            ShadowVertex sv0, sv1, sv2;
+                            if (shadow_vertex_from_varying(shadow_tri.v0, sv0) &&
+                                shadow_vertex_from_varying(shadow_tri.v1, sv1) &&
+                                shadow_vertex_from_varying(shadow_tri.v2, sv2)) {
+                                shadow_tri.sort_z = (sv0.z + sv1.z + sv2.z) * (1.0f / 3.0f);
+                            } else {
+                                shadow_tri.sort_z = 1.0f;
+                            }
+                            int first_strip = 0, last_strip = -1;
+                            if (shadow_strip_range(shadow_tri, first_strip, last_strip) &&
+                                (last_strip - first_strip + 1) <= 2) {
+                                for (int s = first_strip; s <= last_strip; s++) {
+                                    local_shadow_strips[s].push_back(shadow_tri);
+                                }
+                            } else {
+                                local_shadow.push_back(shadow_tri);
+                            }
+                        };
+                        
+                        ClipVertex shadow_in[3] = {
+                            {v0_eye.position, v0_eye.normal, s0.x(), s0.y(), s0.z(), face.a, v0_eye.u, v0_eye.v},
+                            {v1_eye.position, v1_eye.normal, s1.x(), s1.y(), s1.z(), face.a, v1_eye.u, v1_eye.v},
+                            {v2_eye.position, v2_eye.normal, s2.x(), s2.y(), s2.z(), face.a, v2_eye.u, v2_eye.v}
+                        };
+                        if (tl_shared.use_spotlight) {
+                            ClipVertex shadow_clipped[4];
+                            int shadow_count = clip_triangle_near(shadow_in, shadow_clipped,
+                                                                  tl_shared.shadow_view_matrix,
+                                                                  tl_shared.shadow_near);
+                            if (shadow_count >= 3) {
+                                emit_shadow_triangle(shadow_clipped[0], shadow_clipped[1], shadow_clipped[2]);
+                                if (shadow_count == 4) {
+                                    emit_shadow_triangle(shadow_clipped[0], shadow_clipped[2], shadow_clipped[3]);
+                                }
+                            }
+                        } else {
+                            emit_shadow_triangle(shadow_in[0], shadow_in[1], shadow_in[2]);
+                        }
                     }
                     
                     if (!camera_visible) {
@@ -1960,11 +2196,26 @@ Matrix4f shadow_matrix_buffers[2];
                         tri.sort_z = (v0.z + v1.z + v2.z) / 3.0f;
                         tri.shadow_backface = shadow_backface;
                         tri.shadow_screendoor_mask = -1;
+                        int first_strip = 0, last_strip = -1;
+                        bool use_strip_bins = rgb_strip_range(tri, first_strip, last_strip) &&
+                            (last_strip - first_strip + 1) <= 2;
                         
                         if (inst.type == 2) {
-                            local_trans.push_back(tri);
+                            if (use_strip_bins) {
+                                for (int s = first_strip; s <= last_strip; s++) {
+                                    local_trans_strips[s].push_back(tri);
+                                }
+                            } else {
+                                local_trans.push_back(tri);
+                            }
                         } else {
-                            local_opaque.push_back(tri);
+                            if (use_strip_bins) {
+                                for (int s = first_strip; s <= last_strip; s++) {
+                                    local_opaque_strips[s].push_back(tri);
+                                }
+                            } else {
+                                local_opaque.push_back(tri);
+                            }
                         }
                     };
                     
@@ -2001,7 +2252,7 @@ Matrix4f shadow_matrix_buffers[2];
                             {v2_eye.position, v2_eye.normal, s2.x(), s2.y(), s2.z(), face.a, v2_eye.u, v2_eye.v}
                         };
                         ClipVertex clipped[4];
-                        int clipped_count = clip_triangle_near(in, clipped);
+                        int clipped_count = clip_triangle_near(in, clipped, Matrix4f::Identity(), NEAR_PLANE);
                         if (clipped_count < 3) continue;
                         
                         auto emit_clipped = [&](const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
@@ -2056,6 +2307,18 @@ Matrix4f shadow_matrix_buffers[2];
                 }
                 for (size_t i = 0; i < write_count; i++) {
                     (*tl_shared.shadow_triangles)[my_start + i] = local_shadow[i];
+                }
+            }
+            
+            {
+                std::lock_guard<std::mutex> lock(mtx_strip_bins);
+                for (int s = 0; s < NUM_STRIPS; s++) {
+                    auto& opaque_dst = tl_shared.opaque_strip_triangles->strips[s];
+                    auto& trans_dst = tl_shared.trans_strip_triangles->strips[s];
+                    auto& shadow_dst = tl_shared.shadow_strip_triangles->strips[s];
+                    opaque_dst.insert(opaque_dst.end(), local_opaque_strips[s].begin(), local_opaque_strips[s].end());
+                    trans_dst.insert(trans_dst.end(), local_trans_strips[s].begin(), local_trans_strips[s].end());
+                    shadow_dst.insert(shadow_dst.end(), local_shadow_strips[s].begin(), local_shadow_strips[s].end());
                 }
             }
             
@@ -2132,7 +2395,18 @@ Matrix4f shadow_matrix_buffers[2];
                                                        tri.shadow_screendoor_mask);
                         }
                     };
-                    for (size_t ti = 0; ti < rs.shadow_count; ti++) draw_shadow_tri((*rs.shadow_triangles)[ti]);
+                    const auto& shadow_strip = rs.shadow_strip_triangles->strips[strip_idx];
+                    if (ENABLE_SHADOW_TRIANGLE_SORT) {
+                        size_t gi = 0, si = 0;
+                        while (gi < rs.shadow_count || si < shadow_strip.size()) {
+                            bool take_global = (si >= shadow_strip.size()) ||
+                                (gi < rs.shadow_count && (*rs.shadow_triangles)[gi].sort_z <= shadow_strip[si].sort_z);
+                            draw_shadow_tri(take_global ? (*rs.shadow_triangles)[gi++] : shadow_strip[si++]);
+                        }
+                    } else {
+                        for (size_t ti = 0; ti < rs.shadow_count; ti++) draw_shadow_tri((*rs.shadow_triangles)[ti]);
+                        for (const auto& tri : shadow_strip) draw_shadow_tri(tri);
+                    }
                     
                     static const int edges[12][2] = {{0,1},{1,2},{2,3},{3,0}, {4,5},{5,6},{6,7},{7,4}, {0,4},{1,5},{2,6},{3,7}};
                     for (int i = 0; i < 12; i++) {
@@ -2143,7 +2417,7 @@ Matrix4f shadow_matrix_buffers[2];
                                                    y_min, y_max);
                         }
                     }
-                } else {
+                } else if (job_mode == RasterJobMode::Color) {
                     // Clear strip (vectorizable by compiler with -O3)
                     uint32_t* pixel_buffer = (uint32_t*)rs.pixels;
                     int pixels_per_row = rs.pitch / 4;
@@ -2152,10 +2426,7 @@ Matrix4f shadow_matrix_buffers[2];
                         std::fill(rs.depth_buffer + y * rs.screen_width, rs.depth_buffer + (y + 1) * rs.screen_width, 1.0f);
                     }
                     
-                    // Render strip
-                    // Opaque first
-                    for (size_t ti = 0; ti < rs.opaque_count; ti++) {
-                        const auto& tri = (*rs.opaque_triangles)[ti];
+                    auto draw_color_tri = [&](const RenderTriangle& tri, bool depth_write) {
                         draw_triangle_barycentric_strip(rs.pixels, rs.pitch,
                                                         rs.depth_buffer,
                                                         rs.screen_width, rs.screen_height,
@@ -2164,21 +2435,52 @@ Matrix4f shadow_matrix_buffers[2];
                                                         rs.light_dir, rs.light_pos, rs.spot_dir,
                                                         rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos,
                                                         rs.shadow_depth, rs.shadow_size,
-                                                        y_min, y_max, rs.depth_write_enabled);
+                                                        y_min, y_max, depth_write);
+                    };
+                    
+                    // Render strip: large global triangles plus small triangles binned to this strip.
+                    // Opaque first, merged front-to-back with the per-strip bin.
+                    const auto& opaque_strip = rs.opaque_strip_triangles->strips[strip_idx];
+                    if (ENABLE_RGB_TRIANGLE_SORT) {
+                        size_t og = 0, os = 0;
+                        while (og < rs.opaque_count || os < opaque_strip.size()) {
+                            bool take_global = (os >= opaque_strip.size()) ||
+                                (og < rs.opaque_count && (*rs.opaque_triangles)[og].sort_z <= opaque_strip[os].sort_z);
+                            draw_color_tri(take_global ? (*rs.opaque_triangles)[og++] : opaque_strip[os++],
+                                           rs.depth_write_enabled);
+                        }
+                    } else {
+                        for (size_t ti = 0; ti < rs.opaque_count; ti++) draw_color_tri((*rs.opaque_triangles)[ti], rs.depth_write_enabled);
+                        for (const auto& tri : opaque_strip) draw_color_tri(tri, rs.depth_write_enabled);
                     }
                     
-                    // Transparent second
-                    for (size_t ti = 0; ti < rs.trans_count; ti++) {
-                        const auto& tri = (*rs.trans_triangles)[ti];
-                        draw_triangle_barycentric_strip(rs.pixels, rs.pitch,
-                                                        rs.depth_buffer,
-                                                        rs.screen_width, rs.screen_height,
-                                                        tri.v0, tri.v1, tri.v2,
-                                                        rs.format, tri.texture,
-                                                        rs.light_dir, rs.light_pos, rs.spot_dir,
-                                                        rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos,
-                                                        rs.shadow_depth, rs.shadow_size,
-                                                        y_min, y_max, false);
+                    // Transparent second, merged back-to-front with depth writes disabled.
+                    const auto& trans_strip = rs.trans_strip_triangles->strips[strip_idx];
+                    if (ENABLE_RGB_TRIANGLE_SORT) {
+                        size_t tg = 0, ts = 0;
+                        while (tg < rs.trans_count || ts < trans_strip.size()) {
+                            bool take_global = (ts >= trans_strip.size()) ||
+                                (tg < rs.trans_count && (*rs.trans_triangles)[tg].sort_z >= trans_strip[ts].sort_z);
+                            draw_color_tri(take_global ? (*rs.trans_triangles)[tg++] : trans_strip[ts++],
+                                           false);
+                        }
+                    } else {
+                        for (size_t ti = 0; ti < rs.trans_count; ti++) draw_color_tri((*rs.trans_triangles)[ti], false);
+                        for (const auto& tri : trans_strip) draw_color_tri(tri, false);
+                    }
+                } else if (job_mode == RasterJobMode::Ssao) {
+                    if (ENABLE_SSAO) {
+                        apply_ssao_strip(rs.pixels, rs.pitch, rs.depth_buffer,
+                                         rs.screen_width, rs.screen_height, rs.format,
+                                         y_min, y_max);
+                    }
+                } else {
+                    if (rs.use_spotlight) {
+                        draw_spotlight_cone_strip(rs.pixels, rs.pitch, rs.depth_buffer,
+                                                  rs.screen_width, rs.screen_height,
+                                                  rs.format, rs.projection,
+                                                  rs.light_pos, rs.spot_dir, rs.spot_outer_cos,
+                                                  y_min, y_max);
                     }
                 }
                 
@@ -2351,6 +2653,7 @@ Matrix4f shadow_matrix_buffers[2];
         const float shadow_near = 1.0f;
         const float shadow_far = 80.0f;
         Matrix4f shadow_matrix;
+        Matrix4f shadow_view_matrix = Matrix4f::Identity();
         if (USE_SPOTLIGHT) {
             Vector3f light_target_world(0.0f, 0.0f, 0.0f);
             float light_azimuth = time * 0.37f + 0.31f * sinf(time * 0.17f);
@@ -2363,7 +2666,9 @@ Matrix4f shadow_matrix_buffers[2];
             Vector3f light_target_eye = (view_matrix * Vector4f(light_target_world.x(), light_target_world.y(), light_target_world.z(), 1.0f)).head<3>();
             spot_dir_eye = (light_target_eye - light_pos_eye).normalized();
             light_dir = spot_dir_eye;
-            shadow_matrix = build_spot_shadow_tex_matrix(light_pos_eye, light_target_eye, 60.0f, shadow_near, shadow_far);
+            Matrix4f light_view_world = lookAt(light_pos_world, light_target_world, Vector3f(0.0f, 1.0f, 0.0f));
+            shadow_view_matrix = light_view_world * view_matrix.inverse();
+            shadow_matrix = build_spot_shadow_tex_matrix(shadow_view_matrix, 60.0f, shadow_near, shadow_far);
         } else {
             // Directional support: fixed world-space direction transformed into eye space.
             Vector3f light_dir_world(1.0f, 2.0f, 1.0f);
@@ -2417,6 +2722,11 @@ Matrix4f shadow_matrix_buffers[2];
         opaque_counter.store(0);
         trans_counter.store(0);
         shadow_counter.store(0);
+        for (int s = 0; s < NUM_STRIPS; s++) {
+            opaque_strip_buffers[tl_buf_idx].strips[s].clear();
+            trans_strip_buffers[tl_buf_idx].strips[s].clear();
+            shadow_strip_buffers[tl_buf_idx].strips[s].clear();
+        }
         
         tl_shared.instances = &instances;
         tl_shared.sorted_instances = &instance_depths;
@@ -2439,9 +2749,13 @@ Matrix4f shadow_matrix_buffers[2];
         tl_shared.trans_count = &trans_counter;
         tl_shared.shadow_triangles = &shadow_buffers[tl_buf_idx].triangles;
         tl_shared.shadow_count = &shadow_counter;
+        tl_shared.opaque_strip_triangles = &opaque_strip_buffers[tl_buf_idx];
+        tl_shared.trans_strip_triangles = &trans_strip_buffers[tl_buf_idx];
+        tl_shared.shadow_strip_triangles = &shadow_strip_buffers[tl_buf_idx];
         tl_shared.view_matrix = view_matrix;
         tl_shared.projection = projection;
         tl_shared.shadow_matrix = shadow_matrix;
+        tl_shared.shadow_view_matrix = shadow_view_matrix;
         tl_shared.light_dir = light_dir;
         tl_shared.light_pos = light_pos_eye;
         tl_shared.spot_dir = spot_dir_eye;
@@ -2460,7 +2774,10 @@ Matrix4f shadow_matrix_buffers[2];
         light_dir_buffers[tl_buf_idx] = light_dir;
         light_pos_buffers[tl_buf_idx] = light_pos_eye;
         spot_dir_buffers[tl_buf_idx] = spot_dir_eye;
+        view_matrix_buffers[tl_buf_idx] = view_matrix;
+        projection_buffers[tl_buf_idx] = projection;
         shadow_matrix_buffers[tl_buf_idx] = shadow_matrix;
+        time_buffers[tl_buf_idx] = time;
         
         {
             const float b = box_half;
@@ -2502,6 +2819,9 @@ Matrix4f shadow_matrix_buffers[2];
             raster_shared[raster_buf_idx].opaque_triangles = &opaque_buffers[raster_buf_idx].triangles;
             raster_shared[raster_buf_idx].trans_triangles = &trans_buffers[raster_buf_idx].triangles;
             raster_shared[raster_buf_idx].shadow_triangles = &shadow_buffers[raster_buf_idx].triangles;
+            raster_shared[raster_buf_idx].opaque_strip_triangles = &opaque_strip_buffers[raster_buf_idx];
+            raster_shared[raster_buf_idx].trans_strip_triangles = &trans_strip_buffers[raster_buf_idx];
+            raster_shared[raster_buf_idx].shadow_strip_triangles = &shadow_strip_buffers[raster_buf_idx];
             raster_shared[raster_buf_idx].opaque_count = opaque_buffers[raster_buf_idx].count;
             raster_shared[raster_buf_idx].trans_count = trans_buffers[raster_buf_idx].count;
             raster_shared[raster_buf_idx].shadow_count = shadow_buffers[raster_buf_idx].count;
@@ -2512,6 +2832,7 @@ Matrix4f shadow_matrix_buffers[2];
             raster_shared[raster_buf_idx].screen_height = screen_height;
             raster_shared[raster_buf_idx].format = fb->format;
             raster_shared[raster_buf_idx].clear_color = clear_color;
+            raster_shared[raster_buf_idx].projection = projection_buffers[raster_buf_idx];
             raster_shared[raster_buf_idx].light_dir = light_dir_buffers[raster_buf_idx];
             raster_shared[raster_buf_idx].light_pos = light_pos_buffers[raster_buf_idx];
             raster_shared[raster_buf_idx].spot_dir = spot_dir_buffers[raster_buf_idx];
@@ -2554,19 +2875,22 @@ Matrix4f shadow_matrix_buffers[2];
         if (do_raster) {
             run_raster_job(RasterJobMode::ShadowDepth, raster_buf_idx);
             run_raster_job(RasterJobMode::Color, raster_buf_idx);
+            run_raster_job(RasterJobMode::Ssao, raster_buf_idx);
+            run_raster_job(RasterJobMode::Luminaire, raster_buf_idx);
         }
         
         if (do_raster && raster_shared[raster_buf_idx].use_spotlight) {
             draw_spotlight_luminaire(pixels, pitch, depth_buffer.data(),
                                      screen_width, screen_height, fb->format,
-                                     projection,
-                                     raster_shared[raster_buf_idx].light_pos,
-                                     raster_shared[raster_buf_idx].spot_dir,
-                                     raster_shared[raster_buf_idx].spot_outer_cos);
+                                     projection_buffers[raster_buf_idx],
+                                     raster_shared[raster_buf_idx].light_pos);
         }
         
         // Draw wireframe cube around container box
         {
+            Matrix4f overlay_view_matrix = do_raster ? view_matrix_buffers[raster_buf_idx] : view_matrix;
+            Matrix4f overlay_projection = do_raster ? projection_buffers[raster_buf_idx] : projection;
+            float overlay_time = do_raster ? time_buffers[raster_buf_idx] : time;
             const float b = box_half; // Container inner boundary
             // 8 corners of the cube
             Vector4f corners[8] = {
@@ -2574,7 +2898,7 @@ Matrix4f shadow_matrix_buffers[2];
                 {-b, -b, +b, 1}, {+b, -b, +b, 1}, {+b, +b, +b, 1}, {-b, +b, +b, 1}
             };
             // Apply box rotation to corners
-            Quat box_rot = Quat::sEulerAngles(Vec3(time * 0.8f, time * 0.6f, time * 0.4f));
+            Quat box_rot = Quat::sEulerAngles(Vec3(overlay_time * 0.8f, overlay_time * 0.6f, overlay_time * 0.4f));
             for (int i = 0; i < 8; i++) {
                 Vec3 p(corners[i].x(), corners[i].y(), corners[i].z());
                 Vec3 rp = box_rot * p;
@@ -2586,11 +2910,10 @@ Matrix4f shadow_matrix_buffers[2];
             float invw[8];
             Vector3f eye_corners[8];
             bool visible[8];
-            Matrix4f vp = projection * view_matrix;
             for (int i = 0; i < 8; i++) {
-                Vector4f eye = view_matrix * corners[i];
+                Vector4f eye = overlay_view_matrix * corners[i];
                 eye_corners[i] = eye.head<3>();
-                Vector4f clip = projection * eye;
+                Vector4f clip = overlay_projection * eye;
                 if (clip.w() > 0.1f) {
                     float inv_w = 1.0f / clip.w();
                     float nx = clip.x() * inv_w;
@@ -2648,7 +2971,7 @@ Matrix4f shadow_matrix_buffers[2];
             cv_main.wait(lock, []{ return tl_done_counter.load() >= NUM_TL_THREADS; });
         }
         
-        // Finalize T&L Buffers and SORT
+        // Finalize T&L Buffers and optional sort
         // Block T&L from racing ahead to next use of this buffer
         buffer_tl_ready[tl_buf_idx].store(false);
         
@@ -2661,18 +2984,50 @@ Matrix4f shadow_matrix_buffers[2];
         if (count_trans > 100000) count_trans = 100000;
         if (count_shadow > 200000) count_shadow = 200000;
         
-        // Sort only the valid portion - don't resize the buffer
-        std::sort(opaque_buffers[tl_buf_idx].triangles.begin(), 
-                  opaque_buffers[tl_buf_idx].triangles.begin() + count_opaque,
-                  [](const RenderTriangle& a, const RenderTriangle& b) {
-                      return a.sort_z < b.sort_z;
-                  });
-                  
-        std::sort(trans_buffers[tl_buf_idx].triangles.begin(), 
-                  trans_buffers[tl_buf_idx].triangles.begin() + count_trans,
-                  [](const RenderTriangle& a, const RenderTriangle& b) {
-                      return a.sort_z > b.sort_z;
-                  });
+        if (ENABLE_RGB_TRIANGLE_SORT) {
+            // Sort only the valid portion - don't resize the buffer
+            std::sort(opaque_buffers[tl_buf_idx].triangles.begin(), 
+                      opaque_buffers[tl_buf_idx].triangles.begin() + count_opaque,
+                      [](const RenderTriangle& a, const RenderTriangle& b) {
+                          return a.sort_z < b.sort_z;
+                      });
+                      
+            std::sort(trans_buffers[tl_buf_idx].triangles.begin(), 
+                      trans_buffers[tl_buf_idx].triangles.begin() + count_trans,
+                      [](const RenderTriangle& a, const RenderTriangle& b) {
+                          return a.sort_z > b.sort_z;
+                      });
+                      
+            for (int s = 0; s < NUM_STRIPS; s++) {
+                std::sort(opaque_strip_buffers[tl_buf_idx].strips[s].begin(),
+                          opaque_strip_buffers[tl_buf_idx].strips[s].end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) {
+                              return a.sort_z < b.sort_z;
+                          });
+                std::sort(trans_strip_buffers[tl_buf_idx].strips[s].begin(),
+                          trans_strip_buffers[tl_buf_idx].strips[s].end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) {
+                              return a.sort_z > b.sort_z;
+                          });
+            }
+        }
+        
+        if (ENABLE_SHADOW_TRIANGLE_SORT) {
+            // Sort the reduced global shadow stream and each strip-local stream separately;
+            // raster workers merge the two sorted streams for their strip.
+            std::sort(shadow_buffers[tl_buf_idx].triangles.begin(),
+                      shadow_buffers[tl_buf_idx].triangles.begin() + count_shadow,
+                      [](const RenderTriangle& a, const RenderTriangle& b) {
+                          return a.sort_z < b.sort_z;
+                      });
+            for (int s = 0; s < NUM_STRIPS; s++) {
+                std::sort(shadow_strip_buffers[tl_buf_idx].strips[s].begin(),
+                          shadow_strip_buffers[tl_buf_idx].strips[s].end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) {
+                              return a.sort_z < b.sort_z;
+                          });
+            }
+        }
         
         // Store counts with buffer (immutable until next T&L pass on this buffer)
         opaque_buffers[tl_buf_idx].count = count_opaque;
