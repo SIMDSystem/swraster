@@ -8,6 +8,7 @@
 #include <thread>
 #include <atomic>
 #include <cstdarg>
+#include <memory>
 #include <Eigen/Dense>
 #include "geometry.h"
 #ifdef __APPLE__
@@ -253,6 +254,41 @@ static inline void unpack_rgb_fast(uint32_t pixel, SDL_PixelFormat* format, uint
     r = expand_channel((pixel & format->Rmask) >> format->Rshift, format->Rloss);
     g = expand_channel((pixel & format->Gmask) >> format->Gshift, format->Gloss);
     b = expand_channel((pixel & format->Bmask) >> format->Bshift, format->Bloss);
+}
+
+struct PackedTexture {
+    int w = 0;
+    int h = 0;
+    std::vector<uint32_t> rgb; // Canonical 0x00RRGGBB for cheap byte extraction.
+};
+
+static std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src) {
+    if (!src || !src->pixels || !src->format) return nullptr;
+    auto tex = std::make_unique<PackedTexture>();
+    tex->w = src->w;
+    tex->h = src->h;
+    tex->rgb.resize((size_t)tex->w * tex->h);
+    int bpp = src->format->BytesPerPixel;
+    for (int y = 0; y < tex->h; y++) {
+        const uint8_t* row = (const uint8_t*)src->pixels + y * src->pitch;
+        for (int x = 0; x < tex->w; x++) {
+            const uint8_t* p = row + x * bpp;
+            uint32_t pixel;
+            if (bpp == 4) {
+                pixel = *(const uint32_t*)p;
+            } else if (bpp == 3) {
+                pixel = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
+            } else if (bpp == 2) {
+                pixel = *(const uint16_t*)p;
+            } else {
+                pixel = *p;
+            }
+            uint8_t r, g, b;
+            unpack_rgb_fast(pixel, src->format, r, g, b);
+            tex->rgb[(size_t)y * tex->w + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+        }
+    }
+    return tex;
 }
 
 static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* format,
@@ -944,7 +980,7 @@ void draw_shadow_line_strip(float* shadow_depth, int shadow_size,
 // Barycentric rasterization - perspective correct (with Y range clipping for strip rendering)
 // Optimized: incremental edge functions, direct pixel writes, cached texture info
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer, int screen_width, int screen_height,
-                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2, SDL_PixelFormat* format, SDL_Surface* texture,
+                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2, SDL_PixelFormat* format, const PackedTexture* texture,
                                       const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
                                       bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                       const float* shadow_depth, int shadow_size,
@@ -1004,15 +1040,12 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     bool perspective_correct_normals = setup->perspective_correct_normals;
     
     // Cache texture info outside the loop
-    bool has_texture = (texture && texture->pixels);
-    int tex_w = 0, tex_h = 0, tex_pitch = 0, tex_bpp = 0;
-    uint8_t* tex_pixels = nullptr;
-    SDL_PixelFormat* tex_fmt = nullptr;
+    bool has_texture = (texture && !texture->rgb.empty());
+    int tex_w = 0, tex_h = 0;
+    const uint32_t* tex_pixels = nullptr;
     if (has_texture) {
         tex_w = texture->w; tex_h = texture->h;
-        tex_pitch = texture->pitch; tex_bpp = texture->format->BytesPerPixel;
-        tex_pixels = (uint8_t*)texture->pixels;
-        tex_fmt = texture->format;
+        tex_pixels = texture->rgb.data();
     }
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
@@ -1100,14 +1133,10 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 if (tx < 0) tx = 0; else if (tx >= tex_w) tx = tex_w - 1;
                 if (ty < 0) ty = 0; else if (ty >= tex_h) ty = tex_h - 1;
                 
-                uint8_t* tp = tex_pixels + ty * tex_pitch + tx * tex_bpp;
-                uint32_t tc;
-                if (tex_bpp == 4) tc = *(uint32_t*)tp;
-                else if (tex_bpp == 3) tc = tp[0] | (tp[1] << 8) | (tp[2] << 16);
-                else tc = 0xFFFFFFFF;
-                
-                uint8_t tr, tg, tb;
-                unpack_rgb_fast(tc, tex_fmt, tr, tg, tb);
+                uint32_t tc = tex_pixels[(size_t)ty * tex_w + tx];
+                uint8_t tr = (uint8_t)(tc >> 16);
+                uint8_t tg = (uint8_t)(tc >> 8);
+                uint8_t tb = (uint8_t)tc;
                 final_r = tr * r_attr;
                 final_g = tg * g_attr;
                 final_b = tb * b_attr;
@@ -1413,10 +1442,12 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             
             uint8_t r, g, b;
             unpack_rgb_fast(row_pixels[x], format, r, g, b);
+            int ao8 = (int)(ao * 256.0f);
+            if (ao8 < 0) ao8 = 0; else if (ao8 > 256) ao8 = 256;
             row_pixels[x] = pack_rgb_fast(format,
-                                          (uint8_t)(r * ao),
-                                          (uint8_t)(g * ao),
-                                          (uint8_t)(b * ao));
+                                          (uint8_t)((r * ao8) >> 8),
+                                          (uint8_t)((g * ao8) >> 8),
+                                          (uint8_t)((b * ao8) >> 8));
         }
     }
 }
@@ -1449,9 +1480,9 @@ int main() {
     }
 
     // Load textures
-    SDL_Surface* texture_baboon = nullptr;
-    SDL_Surface* texture_lenna = nullptr;
-    SDL_Surface* texture_tiles = nullptr;
+    SDL_Surface* surface_baboon = nullptr;
+    SDL_Surface* surface_lenna = nullptr;
+    SDL_Surface* surface_tiles = nullptr;
     
     {
         char texture_path[PATH_MAX] = {0};
@@ -1468,43 +1499,49 @@ int main() {
                 if (macos_pos) {
                     *macos_pos = '\0';
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/baboon.bmp", real_path);
-                    texture_baboon = SDL_LoadBMP(texture_path);
+                    surface_baboon = SDL_LoadBMP(texture_path);
                     
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/lenna.bmp", real_path);
-                    texture_lenna = SDL_LoadBMP(texture_path);
+                    surface_lenna = SDL_LoadBMP(texture_path);
                     
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/tiles.bmp", real_path);
-                    texture_tiles = SDL_LoadBMP(texture_path);
+                    surface_tiles = SDL_LoadBMP(texture_path);
                 }
             }
         }
 #endif
         
         // Fallback paths if bundle path didn't work
-        if (!texture_baboon) {
+        if (!surface_baboon) {
             const char* paths[] = { "../Resources/baboon.bmp", "baboon.bmp" };
             for (const char* p : paths) {
-                texture_baboon = SDL_LoadBMP(p);
-                if (texture_baboon) break;
+                surface_baboon = SDL_LoadBMP(p);
+                if (surface_baboon) break;
             }
         }
         
-        if (!texture_lenna) {
+        if (!surface_lenna) {
             const char* paths[] = { "../Resources/lenna.bmp", "lenna.bmp" };
             for (const char* p : paths) {
-                texture_lenna = SDL_LoadBMP(p);
-                if (texture_lenna) break;
+                surface_lenna = SDL_LoadBMP(p);
+                if (surface_lenna) break;
             }
         }
         
-        if (!texture_tiles) {
+        if (!surface_tiles) {
             const char* paths[] = { "../Resources/tiles.bmp", "tiles.bmp" };
             for (const char* p : paths) {
-                texture_tiles = SDL_LoadBMP(p);
-                if (texture_tiles) break;
+                surface_tiles = SDL_LoadBMP(p);
+                if (surface_tiles) break;
             }
         }
     }
+    std::unique_ptr<PackedTexture> texture_baboon = make_packed_texture(surface_baboon);
+    std::unique_ptr<PackedTexture> texture_lenna = make_packed_texture(surface_lenna);
+    std::unique_ptr<PackedTexture> texture_tiles = make_packed_texture(surface_tiles);
+    if (surface_baboon) SDL_FreeSurface(surface_baboon);
+    if (surface_lenna) SDL_FreeSurface(surface_lenna);
+    if (surface_tiles) SDL_FreeSurface(surface_tiles);
 
     // 1. Generate Cube Geometry
     std::vector<Vertex3D> cube_vertices;
@@ -1642,7 +1679,7 @@ int main() {
         float tx, ty, tz;
         float rot_speed_x, rot_speed_y, rot_speed_z; // Unused now - physics controls rotation
         float qx, qy, qz, qw; // Quaternion rotation from physics
-        SDL_Surface* texture;
+        const PackedTexture* texture;
         int type; // 0=Cube, 1=Sphere, 2=Torus, 3=Teapot, 4=SmallBall, 5=Ground
         float color_r, color_g, color_b; // For untextured objects
         int shadow_screendoor_mask; // Transparent casters rotate through 4x4 50% shadow masks.
@@ -1820,7 +1857,7 @@ int main() {
     int transparent_shadow_mask_counter = 0;
     
     // Create 4 main objects: cube, large sphere, torus (donut), teapot
-    auto create_main_object = [&](int type, float px, float py, float pz, const Shape* shape, SDL_Surface* tex) {
+    auto create_main_object = [&](int type, float px, float py, float pz, const Shape* shape, const PackedTexture* tex) {
         CubeInstance inst;
         inst.tx = px; inst.ty = py; inst.tz = pz;
         inst.rot_speed_x = inst.rot_speed_y = inst.rot_speed_z = 0;
@@ -1846,25 +1883,25 @@ int main() {
         float px = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float py = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float pz = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
-        create_main_object(0, px, py, pz, new BoxShape(Vec3(1.0f, 1.0f, 1.0f)), texture_baboon);  // Cube
+        create_main_object(0, px, py, pz, new BoxShape(Vec3(1.0f, 1.0f, 1.0f)), texture_baboon.get());  // Cube
     }
     for (int i = 0; i < 10; i++) {
         float px = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float py = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float pz = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
-        create_main_object(1, px, py, pz, new SphereShape(1.3f), texture_lenna);                  // Large sphere
+        create_main_object(1, px, py, pz, new SphereShape(1.3f), texture_lenna.get());                  // Large sphere
     }
     for (int i = 0; i < 10; i++) {
         float px = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float py = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float pz = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
-        create_main_object(2, px, py, pz, torus_shape.GetPtr(), texture_baboon);                  // Torus (instanced)
+        create_main_object(2, px, py, pz, torus_shape.GetPtr(), texture_baboon.get());                  // Torus (instanced)
     }
     for (int i = 0; i < 10; i++) {
         float px = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float py = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
         float pz = ((float)rand() / RAND_MAX) * 10.0f - 5.0f;
-        create_main_object(3, px, py, pz, teapot_shape.GetPtr(), texture_lenna);                  // Teapot (instanced)
+        create_main_object(3, px, py, pz, teapot_shape.GetPtr(), texture_lenna.get());                  // Teapot (instanced)
     }
     
     // Add 400 small colored balls
@@ -1905,7 +1942,7 @@ int main() {
     ground.tx = 0.0f; ground.ty = ground_y; ground.tz = 0.0f;
     ground.rot_speed_x = ground.rot_speed_y = ground.rot_speed_z = 0.0f;
     ground.qx = ground.qy = ground.qz = 0.0f; ground.qw = 1.0f;
-    ground.texture = texture_tiles;
+    ground.texture = texture_tiles.get();
     ground.type = 5;
     ground.color_r = ground.color_g = ground.color_b = 0.68f;
     ground.shadow_screendoor_mask = -1;
@@ -1920,7 +1957,7 @@ int main() {
     struct RenderTriangle {
         VertexVaryings v0, v1, v2;
         RasterTriangleSetup rgb_setup;
-        SDL_Surface* texture;
+        const PackedTexture* texture;
         float sort_z;
         bool shadow_backface;
         int shadow_screendoor_mask; // -1 = solid, 0..7 = 4x4 50% mask

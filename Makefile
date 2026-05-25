@@ -2,8 +2,8 @@ CXX = clang++
 JOLT_DIR = JoltPhysics
 JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
-CXXFLAGS = -std=c++17 -Wall -Wextra -O3 -march=native -ffast-math -funroll-loops -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_ENABLE_ASSERTS
-LDFLAGS = # -flto  # Temporarily disabled for Jolt
+CXXFLAGS = -std=c++17 -Wall -Wextra -Ofast -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_ENABLE_ASSERTS
+LDFLAGS = -flto=thin
 TARGET = raster
 APP_NAME = Raster.app
 SOURCES = main.cpp geometry.cpp
