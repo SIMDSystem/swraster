@@ -107,6 +107,7 @@ static inline size_t tile_index(int x, int y, int width, int height) {
 constexpr int JOLT_MAX_PHYSICS_JOBS = 1024;
 constexpr int JOLT_MAX_PHYSICS_BARRIERS = 8;
 constexpr float NEAR_PLANE = 0.1f;
+constexpr float CAMERA_FAR_PLANE = 200.0f;
 constexpr bool ENABLE_NEAR_CLIP = true;
 constexpr bool ENABLE_PHONG_SHADING = true;
 constexpr bool USE_SPOTLIGHT = true;
@@ -258,22 +259,38 @@ static inline void unpack_rgb_fast(uint32_t pixel, SDL_PixelFormat* format, uint
     b = expand_channel((pixel & format->Bmask) >> format->Bshift, format->Bloss);
 }
 
-struct PackedTexture {
+struct PackedTextureLevel {
     int w = 0;
     int h = 0;
     std::vector<uint32_t> rgb; // Canonical 0x00RRGGBB for cheap byte extraction.
 };
 
+struct PackedTexture {
+    std::vector<PackedTextureLevel> levels;
+};
+
+static bool is_power_of_two(int v) {
+    return v > 0 && (v & (v - 1)) == 0;
+}
+
+static int previous_power_of_two(int v) {
+    if (v <= 1) return 1;
+    int p = 1;
+    while ((p << 1) > 0 && (p << 1) <= v) p <<= 1;
+    return p;
+}
+
 static std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src) {
     if (!src || !src->pixels || !src->format) return nullptr;
     auto tex = std::make_unique<PackedTexture>();
-    tex->w = src->w;
-    tex->h = src->h;
-    tex->rgb.resize((size_t)tex->w * tex->h);
+    PackedTextureLevel source;
+    source.w = src->w;
+    source.h = src->h;
+    source.rgb.resize((size_t)source.w * source.h);
     int bpp = src->format->BytesPerPixel;
-    for (int y = 0; y < tex->h; y++) {
+    for (int y = 0; y < source.h; y++) {
         const uint8_t* row = (const uint8_t*)src->pixels + y * src->pitch;
-        for (int x = 0; x < tex->w; x++) {
+        for (int x = 0; x < source.w; x++) {
             const uint8_t* p = row + x * bpp;
             uint32_t pixel;
             if (bpp == 4) {
@@ -287,10 +304,100 @@ static std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src) {
             }
             uint8_t r, g, b;
             unpack_rgb_fast(pixel, src->format, r, g, b);
-            tex->rgb[(size_t)y * tex->w + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+            source.rgb[(size_t)y * source.w + x] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
         }
     }
+
+    PackedTextureLevel base;
+    base.w = is_power_of_two(source.w) ? source.w : previous_power_of_two(source.w);
+    base.h = is_power_of_two(source.h) ? source.h : previous_power_of_two(source.h);
+    base.rgb.resize((size_t)base.w * base.h);
+    if (base.w == source.w && base.h == source.h) {
+        base.rgb = std::move(source.rgb);
+    } else {
+        for (int y = 0; y < base.h; y++) {
+            int sy = std::min(source.h - 1, (int)(((float)y + 0.5f) * source.h / base.h));
+            for (int x = 0; x < base.w; x++) {
+                int sx = std::min(source.w - 1, (int)(((float)x + 0.5f) * source.w / base.w));
+                base.rgb[(size_t)y * base.w + x] = source.rgb[(size_t)sy * source.w + sx];
+            }
+        }
+    }
+
+    tex->levels.push_back(std::move(base));
+    while (tex->levels.back().w > 1 || tex->levels.back().h > 1) {
+        const PackedTextureLevel& prev = tex->levels.back();
+        PackedTextureLevel next;
+        next.w = std::max(1, prev.w >> 1);
+        next.h = std::max(1, prev.h >> 1);
+        next.rgb.resize((size_t)next.w * next.h);
+        for (int y = 0; y < next.h; y++) {
+            for (int x = 0; x < next.w; x++) {
+                uint32_t r = 0, g = 0, b = 0, count = 0;
+                for (int oy = 0; oy < 2; oy++) {
+                    int sy = std::min(prev.h - 1, y * 2 + oy);
+                    for (int ox = 0; ox < 2; ox++) {
+                        int sx = std::min(prev.w - 1, x * 2 + ox);
+                        uint32_t c = prev.rgb[(size_t)sy * prev.w + sx];
+                        r += (c >> 16) & 0xff;
+                        g += (c >> 8) & 0xff;
+                        b += c & 0xff;
+                        count++;
+                    }
+                }
+                next.rgb[(size_t)y * next.w + x] =
+                    ((r / count) << 16) | ((g / count) << 8) | (b / count);
+            }
+        }
+        tex->levels.push_back(std::move(next));
+    }
     return tex;
+}
+
+static inline uint32_t sample_texture_bilinear(const PackedTextureLevel& level, float u, float v) {
+    float fx = u * level.w - 0.5f;
+    float fy = v * level.h - 0.5f;
+    int x0 = (int)floorf(fx);
+    int y0 = (int)floorf(fy);
+    float tx = fx - x0;
+    float ty = fy - y0;
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    // Texture bases are resampled to powers of two, so every mip level can wrap by mask.
+    int xm = level.w - 1;
+    int ym = level.h - 1;
+    uint32_t c00 = level.rgb[(size_t)(y0 & ym) * level.w + (x0 & xm)];
+    uint32_t c10 = level.rgb[(size_t)(y0 & ym) * level.w + (x1 & xm)];
+    uint32_t c01 = level.rgb[(size_t)(y1 & ym) * level.w + (x0 & xm)];
+    uint32_t c11 = level.rgb[(size_t)(y1 & ym) * level.w + (x1 & xm)];
+
+    float w00 = (1.0f - tx) * (1.0f - ty);
+    float w10 = tx * (1.0f - ty);
+    float w01 = (1.0f - tx) * ty;
+    float w11 = tx * ty;
+    uint32_t r = (uint32_t)(((c00 >> 16) & 0xff) * w00 + ((c10 >> 16) & 0xff) * w10 +
+                            ((c01 >> 16) & 0xff) * w01 + ((c11 >> 16) & 0xff) * w11 + 0.5f);
+    uint32_t g = (uint32_t)(((c00 >> 8) & 0xff) * w00 + ((c10 >> 8) & 0xff) * w10 +
+                            ((c01 >> 8) & 0xff) * w01 + ((c11 >> 8) & 0xff) * w11 + 0.5f);
+    uint32_t b = (uint32_t)((c00 & 0xff) * w00 + (c10 & 0xff) * w10 +
+                            (c01 & 0xff) * w01 + (c11 & 0xff) * w11 + 0.5f);
+    return (r << 16) | (g << 8) | b;
+}
+
+static inline uint32_t sample_texture_anisotropic(const PackedTextureLevel& level, float u, float v,
+                                                  float axis_u, float axis_v, int taps) {
+    if (taps <= 1) return sample_texture_bilinear(level, u, v);
+
+    uint32_t r = 0, g = 0, b = 0;
+    for (int i = 0; i < taps; i++) {
+        float t = ((float)i + 0.5f) / (float)taps - 0.5f;
+        uint32_t c = sample_texture_bilinear(level, u + axis_u * t, v + axis_v * t);
+        r += (c >> 16) & 0xff;
+        g += (c >> 8) & 0xff;
+        b += c & 0xff;
+    }
+    return ((r / taps) << 16) | ((g / taps) << 8) | (b / taps);
 }
 
 static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* format,
@@ -306,6 +413,50 @@ static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* f
                                   (uint8_t)std::min(b, 255));
 }
 
+static inline float sample_shadow_compare_bilinear(const float* shadow_depth, int shadow_size,
+                                                   float s, float t, float r) {
+    if (!shadow_depth || shadow_size <= 0) return 1.0f;
+    if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f || r < 0.0f || r > 1.0f) {
+        return 1.0f;
+    }
+
+    float fx = s * (shadow_size - 1);
+    float fy = t * (shadow_size - 1);
+    int x0 = (int)floorf(fx);
+    int y0 = (int)floorf(fy);
+    float tx = fx - x0;
+    float ty = fy - y0;
+
+    auto compare = [&](int x, int y) {
+        if (x < 0 || x >= shadow_size || y < 0 || y >= shadow_size) return 1.0f;
+        float fetched = shadow_depth[(size_t)y * shadow_size + x];
+        return (r <= fetched + SHADOW_DEPTH_BIAS) ? 1.0f : 0.0f;
+    };
+
+    float c00 = compare(x0, y0);
+    float c10 = compare(x0 + 1, y0);
+    float c01 = compare(x0, y0 + 1);
+    float c11 = compare(x0 + 1, y0 + 1);
+    float cx0 = c00 + (c10 - c00) * tx;
+    float cx1 = c01 + (c11 - c01) * tx;
+    return cx0 + (cx1 - cx0) * ty;
+}
+
+static inline float sample_shadow_compare_bilinear_2x2(const float* shadow_depth, int shadow_size,
+                                                       float s, float t, float r) {
+    if (!shadow_depth || shadow_size <= 0) return 1.0f;
+    float texel = 1.0f / (float)(shadow_size - 1);
+    float sum = 0.0f;
+    for (int oy = 0; oy <= 1; oy++) {
+        for (int ox = 0; ox <= 1; ox++) {
+            sum += sample_shadow_compare_bilinear(shadow_depth, shadow_size,
+                                                  s + (ox - 0.5f) * texel,
+                                                  t + (oy - 0.5f) * texel, r);
+        }
+    }
+    return sum * 0.25f;
+}
+
 static inline float sample_shadow_pcf(const float* shadow_depth, int shadow_size, const Vector4f& shadow) {
     if (!shadow_depth || shadow_size <= 0 || shadow.w() == 0.0f) return 1.0f;
     
@@ -316,23 +467,7 @@ static inline float sample_shadow_pcf(const float* shadow_depth, int shadow_size
     if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f || r < 0.0f || r > 1.0f) {
         return 1.0f;
     }
-    
-    int sx = (int)(s * (shadow_size - 1) + 0.5f);
-    int sy = (int)(t * (shadow_size - 1) + 0.5f);
-    float visible_samples = 0.0f;
-    for (int oy = -1; oy <= 1; oy++) {
-        int py = sy + oy;
-        for (int ox = -1; ox <= 1; ox++) {
-            int px = sx + ox;
-            if (px < 0 || px >= shadow_size || py < 0 || py >= shadow_size) {
-                visible_samples += 1.0f;
-            } else {
-                float fetched = shadow_depth[py * shadow_size + px];
-                visible_samples += (r <= fetched + SHADOW_DEPTH_BIAS) ? 1.0f : 0.0f;
-            }
-        }
-    }
-    return visible_samples * (1.0f / 9.0f);
+    return sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size, s, t, r);
 }
 
 void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
@@ -1042,12 +1177,74 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     bool perspective_correct_normals = setup->perspective_correct_normals;
     
     // Cache texture info outside the loop
-    bool has_texture = (texture && !texture->rgb.empty());
-    int tex_w = 0, tex_h = 0;
-    const uint32_t* tex_pixels = nullptr;
+    bool has_texture = (texture && !texture->levels.empty() && !texture->levels[0].rgb.empty());
+    const PackedTextureLevel* tex_level = nullptr;
+    float aniso_axis_u = 0.0f;
+    float aniso_axis_v = 0.0f;
+    int aniso_taps = 1;
     if (has_texture) {
-        tex_w = texture->w; tex_h = texture->h;
-        tex_pixels = texture->rgb.data();
+        const PackedTextureLevel& base = texture->levels[0];
+        int mip_level = 0;
+        float dx1 = v1.x - v0.x, dy1 = v1.y - v0.y;
+        float dx2 = v2.x - v0.x, dy2 = v2.y - v0.y;
+        float den = dx1 * dy2 - dy1 * dx2;
+        float major = 1.0f;
+        float minor = 1.0f;
+        float major_vec_u = 0.0f;
+        float major_vec_v = 0.0f;
+        if (fabsf(den) > 0.0001f) {
+            float inv_den = 1.0f / den;
+            float du1 = v1.u - v0.u, du2 = v2.u - v0.u;
+            float dv1 = v1.v - v0.v, dv2 = v2.v - v0.v;
+            float du_dx = (du1 * dy2 - du2 * dy1) * inv_den * base.w;
+            float du_dy = (dx1 * du2 - dx2 * du1) * inv_den * base.w;
+            float dv_dx = (dv1 * dy2 - dv2 * dy1) * inv_den * base.h;
+            float dv_dy = (dx1 * dv2 - dx2 * dv1) * inv_den * base.h;
+
+            float a = du_dx * du_dx + du_dy * du_dy;
+            float b = du_dx * dv_dx + du_dy * dv_dy;
+            float c = dv_dx * dv_dx + dv_dy * dv_dy;
+            float trace = a + c;
+            float disc = sqrtf(fmaxf(0.0f, (a - c) * (a - c) + 4.0f * b * b));
+            float lambda_major = fmaxf(0.0f, 0.5f * (trace + disc));
+            float lambda_minor = fmaxf(0.0f, 0.5f * (trace - disc));
+            major = sqrtf(lambda_major);
+            minor = sqrtf(lambda_minor);
+
+            if (fabsf(b) > 0.000001f) {
+                major_vec_u = b;
+                major_vec_v = lambda_major - a;
+            } else if (a >= c) {
+                major_vec_u = 1.0f;
+                major_vec_v = 0.0f;
+            } else {
+                major_vec_u = 0.0f;
+                major_vec_v = 1.0f;
+            }
+            float vec_len = sqrtf(major_vec_u * major_vec_u + major_vec_v * major_vec_v);
+            if (vec_len > 0.000001f) {
+                major_vec_u /= vec_len;
+                major_vec_v /= vec_len;
+            }
+        }
+
+        float lod_footprint = major;
+        if (major > 1.0f && minor > 0.0f) {
+            float aniso = major / fmaxf(minor, 0.0001f);
+            if (aniso > 1.5f) {
+                float filtered_major = fminf(major, fmaxf(minor, 1.0f) * 4.0f);
+                lod_footprint = fmaxf(minor, 1.0f);
+                aniso_taps = std::min(4, std::max(2, (int)ceilf(filtered_major / lod_footprint)));
+                aniso_axis_u = major_vec_u * filtered_major / (float)base.w;
+                aniso_axis_v = major_vec_v * filtered_major / (float)base.h;
+            }
+        }
+        if (lod_footprint > 1.0f) {
+            mip_level = (int)(log2f(lod_footprint) + 0.5f);
+            if (mip_level >= (int)texture->levels.size()) mip_level = (int)texture->levels.size() - 1;
+        }
+        const PackedTextureLevel& level = texture->levels[mip_level];
+        tex_level = &level;
     }
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
@@ -1136,12 +1333,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             // Shade pixel
             float final_r, final_g, final_b;
             if (has_texture) {
-                int tx = (int)(u * (tex_w - 1) + 0.5f);
-                int ty = (int)(v * (tex_h - 1) + 0.5f);
-                if (tx < 0) tx = 0; else if (tx >= tex_w) tx = tex_w - 1;
-                if (ty < 0) ty = 0; else if (ty >= tex_h) ty = tex_h - 1;
-                
-                uint32_t tc = tex_pixels[(size_t)ty * tex_w + tx];
+                uint32_t tc = sample_texture_anisotropic(*tex_level, u, v,
+                                                         aniso_axis_u, aniso_axis_v, aniso_taps);
                 uint8_t tr = (uint8_t)(tc >> 16);
                 uint8_t tg = (uint8_t)(tc >> 8);
                 uint8_t tb = (uint8_t)tc;
@@ -1165,26 +1358,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                     float shadow_s = ss * inv_sq;
                     float shadow_t = st * inv_sq;
                     float shadow_r = sr * inv_sq;
-                    if (shadow_s >= 0.0f && shadow_s <= 1.0f &&
-                        shadow_t >= 0.0f && shadow_t <= 1.0f &&
-                        shadow_r >= 0.0f && shadow_r <= 1.0f) {
-                        int sx = (int)(shadow_s * (shadow_size - 1) + 0.5f);
-                        int sy = (int)(shadow_t * (shadow_size - 1) + 0.5f);
-                        float visible_samples = 0.0f;
-                        for (int oy = -1; oy <= 1; oy++) {
-                            int py = sy + oy;
-                            for (int ox = -1; ox <= 1; ox++) {
-                                int px = sx + ox;
-                                if (px < 0 || px >= shadow_size || py < 0 || py >= shadow_size) {
-                                    visible_samples += 1.0f;
-                                } else {
-                                    float fetched = shadow_depth[py * shadow_size + px];
-                                    visible_samples += (shadow_r <= fetched + SHADOW_DEPTH_BIAS) ? 1.0f : 0.0f;
-                                }
-                            }
-                        }
-                        light_visibility = visible_samples * (1.0f / 9.0f);
-                    }
+                    light_visibility = sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size,
+                                                                          shadow_s, shadow_t, shadow_r);
                 }
                 
                 float diffuse = 0.35f;
@@ -1345,7 +1520,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
         { 8,  6}, {-8,  6}, { 8, -6}, {-8, -6}
     };
     constexpr float near_plane = 0.1f;
-    constexpr float far_plane = 100.0f;
+    constexpr float far_plane = CAMERA_FAR_PLANE;
     constexpr float proj_a = (far_plane + near_plane) / (near_plane - far_plane);
     constexpr float proj_b = (2.0f * far_plane * near_plane) / (near_plane - far_plane);
     constexpr float angle_bias = 0.12f;
@@ -2742,7 +2917,6 @@ int main() {
     std::vector<std::pair<float, size_t>> instance_depths;
     instance_depths.reserve(instances.size());
     std::vector<uint8_t> instance_occlusion_flags(instances.size(), 0);
-    bool instance_occlusion_flags_valid = false;
     Uint64 last_physics_time = SDL_GetTicks64();
     auto window_can_render = [&]() {
         Uint32 flags = SDL_GetWindowFlags(win);
@@ -2869,7 +3043,7 @@ int main() {
         static Matrix4f projection = Matrix4f::Identity();
         float aspect = (float)fb->w / (float)fb->h;
         if (aspect != last_aspect) {
-            projection = build_projection_matrix(60.0f, aspect, 0.1f, 100.0f);
+            projection = build_projection_matrix(60.0f, aspect, NEAR_PLANE, CAMERA_FAR_PLANE);
             last_aspect = aspect;
         }
         
@@ -2923,14 +3097,10 @@ int main() {
         // Also cheaply cull small balls hidden behind conservative inner spheres of
         // large opaque occluders from the camera and spotlight views.
         instance_depths.clear();
-        bool update_occlusion_flags = !paused || !instance_occlusion_flags_valid;
         if (instance_occlusion_flags.size() != instances.size()) {
             instance_occlusion_flags.resize(instances.size(), 0);
-            update_occlusion_flags = true;
         }
-        if (update_occlusion_flags) {
-            std::fill(instance_occlusion_flags.begin(), instance_occlusion_flags.end(), 0);
-        }
+        std::fill(instance_occlusion_flags.begin(), instance_occlusion_flags.end(), 0);
         auto point_occluded_by_sphere = [](const Vector3f& viewer, const Vector3f& p,
                                            const Vector3f& occ, float occ_inner_radius,
                                            float p_radius) {
@@ -2970,7 +3140,7 @@ int main() {
             Vector4f center_world(instances[i].tx, instances[i].ty, instances[i].tz, 1.0f);
             Vector4f center_view = view_matrix * center_world;
             uint8_t occlusion_flags = instance_occlusion_flags[i];
-            if (update_occlusion_flags && instances[i].type == 4) {
+            if (instances[i].type == 4) {
                 occlusion_flags = 0;
                 Vector3f small_eye = center_view.head<3>();
                 for (const CubeInstance& occ_inst : instances) {
@@ -3010,9 +3180,6 @@ int main() {
                 instance_occlusion_flags[i] = occlusion_flags;
             }
             instance_depths.push_back({center_view.z(), i});
-        }
-        if (update_occlusion_flags) {
-            instance_occlusion_flags_valid = true;
         }
         
         // Sort instances: Opaque (Front-to-Back), then Transparent (Back-to-Front)
@@ -3093,7 +3260,7 @@ int main() {
         tl_shared.shadow_far = shadow_far;
         tl_shared.camera_aspect = aspect;
         tl_shared.camera_tan_half_fov_y = tanf(60.0f * (float)M_PI / 360.0f);
-        tl_shared.camera_far = 100.0f;
+        tl_shared.camera_far = CAMERA_FAR_PLANE;
         tl_shared.time = time;
         tl_shared.screen_width = screen_width;
         tl_shared.screen_height = screen_height;
