@@ -172,6 +172,8 @@ static const uint8_t font_5x7[10][7] = {
     {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x11, 0x0E}, // 9
 };
 
+static inline uint32_t pack_rgb_fast(SDL_PixelFormat* format, uint8_t r, uint8_t g, uint8_t b);
+
 void draw_digit(uint8_t* pixels, int pitch, int x, int y, int digit, uint32_t color, SDL_PixelFormat* format) {
     if (digit < 0 || digit > 9) return;
     int bpp = format->BytesPerPixel;
@@ -189,7 +191,7 @@ void draw_digit(uint8_t* pixels, int pitch, int x, int y, int digit, uint32_t co
 }
 
 void draw_number(uint8_t* pixels, int pitch, int x, int y, int number, uint8_t r, uint8_t g, uint8_t b, SDL_PixelFormat* format) {
-    uint32_t color = SDL_MapRGB(format, r, g, b);
+    uint32_t color = pack_rgb_fast(format, r, g, b);
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", number);
     int pos = 0;
@@ -234,17 +236,36 @@ enum class TriangleShader {
     LuminaireCone
 };
 
+static inline uint8_t expand_channel(uint32_t value, uint8_t loss) {
+    value <<= loss;
+    if (loss && value < 255) value |= value >> (8 - loss);
+    return (uint8_t)value;
+}
+
+static inline uint32_t pack_rgb_fast(SDL_PixelFormat* format, uint8_t r, uint8_t g, uint8_t b) {
+    return (((uint32_t)(r >> format->Rloss) << format->Rshift) & format->Rmask) |
+           (((uint32_t)(g >> format->Gloss) << format->Gshift) & format->Gmask) |
+           (((uint32_t)(b >> format->Bloss) << format->Bshift) & format->Bmask) |
+           format->Amask;
+}
+
+static inline void unpack_rgb_fast(uint32_t pixel, SDL_PixelFormat* format, uint8_t& r, uint8_t& g, uint8_t& b) {
+    r = expand_channel((pixel & format->Rmask) >> format->Rshift, format->Rloss);
+    g = expand_channel((pixel & format->Gmask) >> format->Gshift, format->Gloss);
+    b = expand_channel((pixel & format->Bmask) >> format->Bshift, format->Bloss);
+}
+
 static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* format,
                                  float add_r, float add_g, float add_b) {
     uint8_t dr, dg, db;
-    SDL_GetRGB(row_pixels[x], format, &dr, &dg, &db);
+    unpack_rgb_fast(row_pixels[x], format, dr, dg, db);
     int r = (int)dr + (int)add_r;
     int g = (int)dg + (int)add_g;
     int b = (int)db + (int)add_b;
-    row_pixels[x] = SDL_MapRGB(format,
-                               (uint8_t)std::min(r, 255),
-                               (uint8_t)std::min(g, 255),
-                               (uint8_t)std::min(b, 255));
+    row_pixels[x] = pack_rgb_fast(format,
+                                  (uint8_t)std::min(r, 255),
+                                  (uint8_t)std::min(g, 255),
+                                  (uint8_t)std::min(b, 255));
 }
 
 static inline float sample_shadow_pcf(const float* shadow_depth, int shadow_size, const Vector4f& shadow) {
@@ -746,7 +767,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                 }
                 float illum = fminf(1.0f, 0.35f + direct * visibility);
                 uint32_t* row_pixels = (uint32_t*)(pixels + y0 * pitch);
-                row_pixels[x0] = SDL_MapRGB(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
+                row_pixels[x0] = pack_rgb_fast(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
                 depth_buffer[idx] = z;
             }
         }
@@ -1086,7 +1107,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 else tc = 0xFFFFFFFF;
                 
                 uint8_t tr, tg, tb;
-                SDL_GetRGB(tc, tex_fmt, &tr, &tg, &tb);
+                unpack_rgb_fast(tc, tex_fmt, tr, tg, tb);
                 final_r = tr * r_attr;
                 final_g = tg * g_attr;
                 final_b = tb * b_attr;
@@ -1204,7 +1225,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             // Alpha blending (read-modify-write)
             if (alpha < 0.995f && alpha > 0.005f) {
                 uint8_t dst_r, dst_g, dst_b;
-                SDL_GetRGB(row_pixels[x], format, &dst_r, &dst_g, &dst_b);
+                unpack_rgb_fast(row_pixels[x], format, dst_r, dst_g, dst_b);
                 float inv_alpha = 1.0f - alpha;
                 final_r = final_r * alpha + dst_r * inv_alpha;
                 final_g = final_g * alpha + dst_g * inv_alpha;
@@ -1212,7 +1233,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             }
             
             // Write pixel directly (bounds guaranteed by bbox clamp)
-            row_pixels[x] = SDL_MapRGB(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
+            row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
             if (depth_write) row_depth[x] = z;
             
             w0 += A0; w1 += A1; w2 += A2;
@@ -1297,6 +1318,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     constexpr float inv_sample_radius = 1.0f / sample_radius;
     constexpr float inv_sample_count = 1.0f / 16.0f;
     constexpr float inv_angle_range = 1.0f / (1.0f - angle_bias);
+    int sample_linear_offsets[16];
+    for (int i = 0; i < 16; i++) {
+        sample_linear_offsets[i] = sample_offsets[i][1] * screen_width + sample_offsets[i][0];
+    }
     float f = 1.0f / tanf(60.0f * (float)M_PI / 360.0f);
     float aspect = (float)screen_width / (float)screen_height;
     float x_scale = aspect / f;
@@ -1318,8 +1343,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     
     for (int y = y_strip_min; y <= y_strip_max; y++) {
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
-        const float* row_depth = depth_buffer + (size_t)y * screen_width;
+        size_t row_base = (size_t)y * screen_width;
+        const float* row_depth = depth_buffer + row_base;
         for (int x = x_tile_min; x <= x_tile_max; x++) {
+            size_t center_idx = row_base + x;
             float center_z = row_depth[x];
             if (center_z >= 0.999f) continue;
             float cx, cy, cz;
@@ -1331,8 +1358,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             int yd = std::min(screen_height - 1, y + 1);
             float zl = row_depth[xl];
             float zr = row_depth[xr];
-            float zu = depth_buffer[(size_t)yu * screen_width + x];
-            float zd = depth_buffer[(size_t)yd * screen_width + x];
+            float zu = depth_buffer[center_idx - (y > 0 ? screen_width : 0)];
+            float zd = depth_buffer[center_idx + (y + 1 < screen_height ? screen_width : 0)];
             if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
             
             float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
@@ -1355,12 +1382,13 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             }
             
             float occlusion = 0.0f;
-            for (const auto& offset : sample_offsets) {
-                int sx = x + offset[0];
-                int sy = y + offset[1];
+            for (int i = 0; i < 16; i++) {
+                int sx = x + sample_offsets[i][0];
+                int sy = y + sample_offsets[i][1];
                 if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
                 
-                float sample_z = depth_buffer[(size_t)sy * screen_width + sx];
+                size_t sample_idx = (size_t)((ptrdiff_t)center_idx + sample_linear_offsets[i]);
+                float sample_z = depth_buffer[sample_idx];
                 if (sample_z >= 0.999f) continue;
                 
                 float spx, spy, spz;
@@ -1384,11 +1412,11 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             if (ao >= 0.999f) continue;
             
             uint8_t r, g, b;
-            SDL_GetRGB(row_pixels[x], format, &r, &g, &b);
-            row_pixels[x] = SDL_MapRGB(format,
-                                       (uint8_t)(r * ao),
-                                       (uint8_t)(g * ao),
-                                       (uint8_t)(b * ao));
+            unpack_rgb_fast(row_pixels[x], format, r, g, b);
+            row_pixels[x] = pack_rgb_fast(format,
+                                          (uint8_t)(r * ao),
+                                          (uint8_t)(g * ao),
+                                          (uint8_t)(b * ao));
         }
     }
 }
@@ -2927,7 +2955,7 @@ int main() {
             // We reset it AFTER T&L finishes.
             
             // Setup Raster Shared Data
-            uint32_t clear_color = SDL_MapRGB(fb->format, 45, 45, 45);
+            uint32_t clear_color = pack_rgb_fast(fb->format, 45, 45, 45);
             raster_shared[raster_buf_idx].opaque_triangles = &opaque_buffers[raster_buf_idx].triangles;
             raster_shared[raster_buf_idx].trans_triangles = &trans_buffers[raster_buf_idx].triangles;
             raster_shared[raster_buf_idx].shadow_triangles = &shadow_buffers[raster_buf_idx].triangles;
@@ -3062,7 +3090,7 @@ int main() {
                                                      raster_shared[raster_buf_idx].spot_outer_cos,
                                                      shadow_matrix_buffers[raster_buf_idx]);
                     } else {
-                        uint32_t wire_color = SDL_MapRGB(fb->format, 255, 255, 0);
+                        uint32_t wire_color = pack_rgb_fast(fb->format, 255, 255, 0);
                         draw_line_depth(pixels, pitch, depth_buffer.data(),
                                         sx[a], sy[a], sz[a], sx[b], sy[b], sz[b],
                                         wire_color, screen_width, screen_height);
