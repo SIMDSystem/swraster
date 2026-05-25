@@ -64,10 +64,13 @@ constexpr int TILE_X_SPLITS = 4;
 static void init_thread_counts() {
     int hw = (int)std::thread::hardware_concurrency();
     if (hw < 2) hw = 2;
-    // Reserve 1 core for main thread + physics, split the rest ~40/60 T&L vs raster
+    // Reserve 1 core for main thread + physics, bias slightly toward raster work,
+    // then oversubscribe both render worker groups to keep cores fed during stalls.
     int pool = hw - 1;
-    NUM_TL_THREADS  = std::max(2, pool * 2 / 5);
-    NUM_RASTER_THREADS = std::max(2, pool - NUM_TL_THREADS);
+    int base_tl_threads = std::max(2, pool * 9 / 20);
+    int base_raster_threads = std::max(2, pool - base_tl_threads);
+    NUM_TL_THREADS = (base_tl_threads * 13 + 9) / 10;
+    NUM_RASTER_THREADS = (base_raster_threads * 13 + 9) / 10;
     NUM_STRIPS = 8;
     NUM_TILE_BINS = NUM_STRIPS * TILE_X_SPLITS;
     printf("Threads: %d T&L, %d raster, %d strips, %d tiles (hw_concurrency=%d)\n",
