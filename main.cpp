@@ -293,7 +293,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
         float dy = (float)y + 0.5f - ly;
         for (int x = x_min; x <= x_max; x++) {
-            size_t idx = tile_index(x, y, screen_width, screen_height);
+            size_t idx = (size_t)y * screen_width + x;
             if (lz > depth_buffer[idx] + 0.002f) continue;
             float dx = (float)x + 0.5f - lx;
             float d2 = dx * dx + dy * dy;
@@ -722,7 +722,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
     
     while (true) {
         if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
-            size_t idx = tile_index(x0, y0, w, h);
+            size_t idx = (size_t)y0 * w + x0;
             if (z < depth_buffer[idx]) {
                 float t = step * inv_steps;
                 float a = 1.0f - t;
@@ -993,19 +993,12 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         tex_pixels = (uint8_t*)texture->pixels;
         tex_fmt = texture->format;
     }
-    int tile_col = tile_column_for_x(screen_width, x_tile_min);
-    int tile_x0, tile_x1;
-    tile_column_range(screen_width, tile_col, tile_x0, tile_x1);
-    int tile_width = tile_x1 - tile_x0 + 1;
-    size_t tile_base = tile_column_base(screen_width, screen_height, tile_col);
-    
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
-        float* row_depth = depth_buffer + tile_base + (size_t)y * tile_width;
+        float* row_depth = depth_buffer + (size_t)y * screen_width;
         
         for (int x = x_min; x <= x_max; x++) {
-            int lx = x - tile_x0;
             // Inside test (handle both CW and CCW winding)
             if (__builtin_expect((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0), 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
@@ -1018,7 +1011,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
             
             // Depth test - early reject
-            if (__builtin_expect(z >= row_depth[lx], 0)) {
+            if (__builtin_expect(z >= row_depth[x], 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
                 continue;
             }
@@ -1220,7 +1213,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             
             // Write pixel directly (bounds guaranteed by bbox clamp)
             row_pixels[x] = SDL_MapRGB(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
-            if (depth_write) row_depth[lx] = z;
+            if (depth_write) row_depth[x] = z;
             
             w0 += A0; w1 += A1; w2 += A2;
         }
@@ -1325,8 +1318,9 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     
     for (int y = y_strip_min; y <= y_strip_max; y++) {
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
+        const float* row_depth = depth_buffer + (size_t)y * screen_width;
         for (int x = x_tile_min; x <= x_tile_max; x++) {
-            float center_z = depth_buffer[tile_index(x, y, screen_width, screen_height)];
+            float center_z = row_depth[x];
             if (center_z >= 0.999f) continue;
             float cx, cy, cz;
             reconstruct_position(x, y, center_z, cx, cy, cz);
@@ -1335,10 +1329,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             int xr = std::min(screen_width - 1, x + 1);
             int yu = std::max(0, y - 1);
             int yd = std::min(screen_height - 1, y + 1);
-            float zl = depth_buffer[tile_index(xl, y, screen_width, screen_height)];
-            float zr = depth_buffer[tile_index(xr, y, screen_width, screen_height)];
-            float zu = depth_buffer[tile_index(x, yu, screen_width, screen_height)];
-            float zd = depth_buffer[tile_index(x, yd, screen_width, screen_height)];
+            float zl = row_depth[xl];
+            float zr = row_depth[xr];
+            float zu = depth_buffer[(size_t)yu * screen_width + x];
+            float zd = depth_buffer[(size_t)yd * screen_width + x];
             if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
             
             float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
@@ -1366,7 +1360,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
                 int sy = y + offset[1];
                 if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
                 
-                float sample_z = depth_buffer[tile_index(sx, sy, screen_width, screen_height)];
+                float sample_z = depth_buffer[(size_t)sy * screen_width + sx];
                 if (sample_z >= 0.999f) continue;
                 
                 float spx, spy, spz;
@@ -2543,17 +2537,13 @@ int main() {
                 } else if (job_mode == RasterJobMode::Color) {
                     // Clear strip (vectorizable by compiler with -O3)
                     uint32_t* pixel_buffer = (uint32_t*)rs.pixels;
-                    int tile_x0, tile_x1;
-                    tile_column_range(rs.screen_width, tile_col, tile_x0, tile_x1);
                     int pixels_per_row = rs.pitch / 4;
-                    int depth_pixels_per_row = tile_x1 - tile_x0 + 1;
-                    size_t tile_base = tile_column_base(rs.screen_width, rs.screen_height, tile_col);
                     for (int y = y_min; y <= y_max; y++) {
                         std::fill(pixel_buffer + (size_t)y * pixels_per_row + x_min,
                                   pixel_buffer + (size_t)y * pixels_per_row + x_max + 1,
                                   rs.clear_color);
-                        std::fill(rs.depth_buffer + tile_base + (size_t)y * depth_pixels_per_row + (x_min - tile_x0),
-                                  rs.depth_buffer + tile_base + (size_t)y * depth_pixels_per_row + (x_max - tile_x0) + 1,
+                        std::fill(rs.depth_buffer + (size_t)y * rs.screen_width + x_min,
+                                  rs.depth_buffer + (size_t)y * rs.screen_width + x_max + 1,
                                   1.0f);
                     }
                     
@@ -2650,7 +2640,6 @@ int main() {
     int screen_width = fb->w;
     int screen_height = fb->h;
     std::vector<float> depth_buffer(screen_width * screen_height);
-    std::vector<float> tiled_depth_buffer(screen_width * screen_height);
     std::vector<float> shadow_depth_buffers[2];
     shadow_depth_buffers[0].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     shadow_depth_buffers[1].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
@@ -2950,7 +2939,7 @@ int main() {
             raster_shared[raster_buf_idx].shadow_count = shadow_buffers[raster_buf_idx].count;
             raster_shared[raster_buf_idx].pixels = pixels;
             raster_shared[raster_buf_idx].pitch = pitch;
-            raster_shared[raster_buf_idx].depth_buffer = tiled_depth_buffer.data();
+            raster_shared[raster_buf_idx].depth_buffer = depth_buffer.data();
             raster_shared[raster_buf_idx].screen_width = screen_width;
             raster_shared[raster_buf_idx].screen_height = screen_height;
             raster_shared[raster_buf_idx].format = fb->format;
@@ -3006,7 +2995,7 @@ int main() {
         }
         
         if (do_raster && raster_shared[raster_buf_idx].use_spotlight) {
-            draw_spotlight_luminaire(pixels, pitch, tiled_depth_buffer.data(),
+            draw_spotlight_luminaire(pixels, pitch, depth_buffer.data(),
                                      screen_width, screen_height, fb->format,
                                      projection_buffers[raster_buf_idx],
                                      raster_shared[raster_buf_idx].light_pos);
@@ -3060,7 +3049,7 @@ int main() {
                 int a = edges[i][0], b = edges[i][1];
                 if (visible[a] && visible[b]) {
                     if (do_raster) {
-                        draw_lit_shadowed_line_depth(pixels, pitch, tiled_depth_buffer.data(),
+                        draw_lit_shadowed_line_depth(pixels, pitch, depth_buffer.data(),
                                                      sx[a], sy[a], sz[a], eye_corners[a], invw[a],
                                                      sx[b], sy[b], sz[b], eye_corners[b], invw[b],
                                                      screen_width, screen_height, fb->format,
