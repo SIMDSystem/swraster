@@ -57,6 +57,8 @@ using namespace Eigen;
 static int NUM_TL_THREADS;
 static int NUM_RASTER_THREADS;
 static int NUM_STRIPS;
+static int NUM_TILE_BINS;
+constexpr int TILE_X_SPLITS = 4;
 
 static void init_thread_counts() {
     int hw = (int)std::thread::hardware_concurrency();
@@ -65,10 +67,39 @@ static void init_thread_counts() {
     int pool = hw - 1;
     NUM_TL_THREADS  = std::max(2, pool * 2 / 5);
     NUM_RASTER_THREADS = std::max(2, pool - NUM_TL_THREADS);
-    // Strips should be >> raster threads for good load balancing
-    NUM_STRIPS = NUM_RASTER_THREADS * 6;
-    printf("Threads: %d T&L, %d raster, %d strips (hw_concurrency=%d)\n",
-           NUM_TL_THREADS, NUM_RASTER_THREADS, NUM_STRIPS, hw);
+    NUM_STRIPS = 8;
+    NUM_TILE_BINS = NUM_STRIPS * TILE_X_SPLITS;
+    printf("Threads: %d T&L, %d raster, %d strips, %d tiles (hw_concurrency=%d)\n",
+           NUM_TL_THREADS, NUM_RASTER_THREADS, NUM_STRIPS, NUM_TILE_BINS, hw);
+}
+
+static inline void tile_column_range(int width, int col, int& x_min, int& x_max) {
+    x_min = (col * width) / TILE_X_SPLITS;
+    x_max = (((col + 1) * width) / TILE_X_SPLITS) - 1;
+}
+
+static inline int tile_column_for_x(int width, int x) {
+    int col = (x * TILE_X_SPLITS) / width;
+    if (col < 0) return 0;
+    if (col >= TILE_X_SPLITS) return TILE_X_SPLITS - 1;
+    return col;
+}
+
+static inline size_t tile_column_base(int width, int height, int col) {
+    int base = 0;
+    for (int c = 0; c < col; c++) {
+        int x0, x1;
+        tile_column_range(width, c, x0, x1);
+        base += (x1 - x0 + 1) * height;
+    }
+    return (size_t)base;
+}
+
+static inline size_t tile_index(int x, int y, int width, int height) {
+    int col = tile_column_for_x(width, x);
+    int x0, x1;
+    tile_column_range(width, col, x0, x1);
+    return tile_column_base(width, height, col) + (size_t)y * (size_t)(x1 - x0 + 1) + (size_t)(x - x0);
 }
 
 // Jolt Physics constants
@@ -80,7 +111,7 @@ constexpr bool ENABLE_PHONG_SHADING = true;
 constexpr bool USE_SPOTLIGHT = true;
 constexpr bool ENABLE_SSAO = true;
 constexpr bool ENABLE_RGB_TRIANGLE_SORT = true;
-constexpr bool ENABLE_SHADOW_TRIANGLE_SORT = true;
+constexpr bool ENABLE_SHADOW_TRIANGLE_SORT = false;
 constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
 constexpr int SHADOW_MAP_SIZE = 1024;
 constexpr float SHADOW_DEPTH_BIAS = 0.0025f;
@@ -251,8 +282,6 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     float lx, ly, lz;
     if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
     
-    const int pixels_per_row = pitch / 4;
-    
     // Depth-tested additive Gaussian lamp disk.
     const float disk_radius = 14.0f;
     int x_min = std::max(0, (int)floorf(lx - disk_radius));
@@ -261,11 +290,11 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     int y_max = std::min(screen_height - 1, (int)ceilf(ly + disk_radius));
     float inv_sigma2 = 1.0f / (disk_radius * disk_radius * 0.35f);
     for (int y = y_min; y <= y_max; y++) {
-        uint32_t* row_pixels = (uint32_t*)pixels + y * pixels_per_row;
-        float* row_depth = depth_buffer + y * screen_width;
+        uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
         float dy = (float)y + 0.5f - ly;
         for (int x = x_min; x <= x_max; x++) {
-            if (lz > row_depth[x] + 0.002f) continue;
+            size_t idx = tile_index(x, y, screen_width, screen_height);
+            if (lz > depth_buffer[idx] + 0.002f) continue;
             float dx = (float)x + 0.5f - lx;
             float d2 = dx * dx + dy * dy;
             if (d2 > disk_radius * disk_radius) continue;
@@ -286,6 +315,71 @@ struct VertexVaryings {
     float ex, ey, ez;   // Eye-space position for local-viewer specular
     float ss, st, sr, sq; // Homogeneous shadow-map texcoords
 };
+
+struct RasterTriangleSetup {
+    bool valid = false;
+    int x_min = 0, x_max = -1, y_min = 0, y_max = -1;
+    float area = 0.0f;
+    float A0 = 0.0f, B0 = 0.0f, A1 = 0.0f, B1 = 0.0f, A2 = 0.0f, B2 = 0.0f;
+    float u0_w = 0.0f, u1_w = 0.0f, u2_w = 0.0f;
+    float v0_w = 0.0f, v1_w = 0.0f, v2_w = 0.0f;
+    float nx0_w = 0.0f, nx1_w = 0.0f, nx2_w = 0.0f;
+    float ny0_w = 0.0f, ny1_w = 0.0f, ny2_w = 0.0f;
+    float nz0_w = 0.0f, nz1_w = 0.0f, nz2_w = 0.0f;
+    float ex0_w = 0.0f, ex1_w = 0.0f, ex2_w = 0.0f;
+    float ey0_w = 0.0f, ey1_w = 0.0f, ey2_w = 0.0f;
+    float ez0_w = 0.0f, ez1_w = 0.0f, ez2_w = 0.0f;
+    float ss0_w = 0.0f, ss1_w = 0.0f, ss2_w = 0.0f;
+    float st0_w = 0.0f, st1_w = 0.0f, st2_w = 0.0f;
+    float sr0_w = 0.0f, sr1_w = 0.0f, sr2_w = 0.0f;
+    float sq0_w = 0.0f, sq1_w = 0.0f, sq2_w = 0.0f;
+    bool perspective_correct_normals = false;
+};
+
+static RasterTriangleSetup build_raster_triangle_setup(const VertexVaryings& v0,
+                                                       const VertexVaryings& v1,
+                                                       const VertexVaryings& v2,
+                                                       int screen_width, int screen_height) {
+    RasterTriangleSetup setup;
+    setup.x_min = (int)fminf(v0.x, fminf(v1.x, v2.x));
+    setup.x_max = (int)fmaxf(v0.x, fmaxf(v1.x, v2.x));
+    setup.y_min = (int)fminf(v0.y, fminf(v1.y, v2.y));
+    setup.y_max = (int)fmaxf(v0.y, fmaxf(v1.y, v2.y));
+    
+    if (setup.x_min < 0) setup.x_min = 0;
+    if (setup.x_max >= screen_width) setup.x_max = screen_width - 1;
+    if (setup.y_min < 0) setup.y_min = 0;
+    if (setup.y_max >= screen_height) setup.y_max = screen_height - 1;
+    if (setup.x_min > setup.x_max || setup.y_min > setup.y_max) return setup;
+    
+    setup.area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
+    if (fabsf(setup.area) < 0.0001f) return setup;
+    
+    setup.A0 = v2.y - v1.y; setup.B0 = v1.x - v2.x;
+    setup.A1 = v0.y - v2.y; setup.B1 = v2.x - v0.x;
+    setup.A2 = v1.y - v0.y; setup.B2 = v0.x - v1.x;
+    
+    setup.u0_w = v0.u * v0.inv_w; setup.u1_w = v1.u * v1.inv_w; setup.u2_w = v2.u * v2.inv_w;
+    setup.v0_w = v0.v * v0.inv_w; setup.v1_w = v1.v * v1.inv_w; setup.v2_w = v2.v * v2.inv_w;
+    setup.nx0_w = v0.nx * v0.inv_w; setup.nx1_w = v1.nx * v1.inv_w; setup.nx2_w = v2.nx * v2.inv_w;
+    setup.ny0_w = v0.ny * v0.inv_w; setup.ny1_w = v1.ny * v1.inv_w; setup.ny2_w = v2.ny * v2.inv_w;
+    setup.nz0_w = v0.nz * v0.inv_w; setup.nz1_w = v1.nz * v1.inv_w; setup.nz2_w = v2.nz * v2.inv_w;
+    setup.ex0_w = v0.ex * v0.inv_w; setup.ex1_w = v1.ex * v1.inv_w; setup.ex2_w = v2.ex * v2.inv_w;
+    setup.ey0_w = v0.ey * v0.inv_w; setup.ey1_w = v1.ey * v1.inv_w; setup.ey2_w = v2.ey * v2.inv_w;
+    setup.ez0_w = v0.ez * v0.inv_w; setup.ez1_w = v1.ez * v1.inv_w; setup.ez2_w = v2.ez * v2.inv_w;
+    setup.ss0_w = v0.ss * v0.inv_w; setup.ss1_w = v1.ss * v1.inv_w; setup.ss2_w = v2.ss * v2.inv_w;
+    setup.st0_w = v0.st * v0.inv_w; setup.st1_w = v1.st * v1.inv_w; setup.st2_w = v2.st * v2.inv_w;
+    setup.sr0_w = v0.sr * v0.inv_w; setup.sr1_w = v1.sr * v1.inv_w; setup.sr2_w = v2.sr * v2.inv_w;
+    setup.sq0_w = v0.sq * v0.inv_w; setup.sq1_w = v1.sq * v1.inv_w; setup.sq2_w = v2.sq * v2.inv_w;
+    
+    float invw_min = fminf(v0.inv_w, fminf(v1.inv_w, v2.inv_w));
+    float invw_max = fmaxf(v0.inv_w, fmaxf(v1.inv_w, v2.inv_w));
+    float invw_rel_span = (invw_max - invw_min) / fmaxf(invw_max, 0.000001f);
+    float screen_extent = fmaxf((float)(setup.x_max - setup.x_min), (float)(setup.y_max - setup.y_min));
+    setup.perspective_correct_normals = (invw_rel_span * screen_extent) > NORMAL_PERSPECTIVE_THRESHOLD;
+    setup.valid = true;
+    return setup;
+}
 
 // Build perspective projection matrix
 Matrix4f build_projection_matrix(float fov_degrees, float aspect, float near, float far) {
@@ -628,7 +722,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
     
     while (true) {
         if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
-            int idx = y0 * w + x0;
+            size_t idx = tile_index(x0, y0, w, h);
             if (z < depth_buffer[idx]) {
                 float t = step * inv_steps;
                 float a = 1.0f - t;
@@ -651,8 +745,8 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                     }
                 }
                 float illum = fminf(1.0f, 0.35f + direct * visibility);
-                uint32_t color = SDL_MapRGB(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
-                draw_pixel(pixels, pitch, x0, y0, color, w, h);
+                uint32_t* row_pixels = (uint32_t*)(pixels + y0 * pitch);
+                row_pixels[x0] = SDL_MapRGB(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
                 depth_buffer[idx] = z;
             }
         }
@@ -715,6 +809,7 @@ void draw_shadow_triangle(float* shadow_depth, int shadow_size,
 
 void draw_shadow_triangle_strip(float* shadow_depth, int shadow_size,
                                 const ShadowVertex& v0, const ShadowVertex& v1, const ShadowVertex& v2,
+                                int x_tile_min, int x_tile_max,
                                 int y_strip_min, int y_strip_max, int screendoor_mask) {
     int x_min = (int)floorf(fminf(v0.x, fminf(v1.x, v2.x)));
     int x_max = (int)ceilf(fmaxf(v0.x, fmaxf(v1.x, v2.x)));
@@ -723,6 +818,8 @@ void draw_shadow_triangle_strip(float* shadow_depth, int shadow_size,
     
     if (x_min < 0) x_min = 0;
     if (x_max >= shadow_size) x_max = shadow_size - 1;
+    if (x_min < x_tile_min) x_min = x_tile_min;
+    if (x_max > x_tile_max) x_max = x_tile_max;
     if (y_min < y_strip_min) y_min = y_strip_min;
     if (y_max > y_strip_max) y_max = y_strip_max;
     if (x_min > x_max || y_min > y_max) return;
@@ -797,6 +894,7 @@ void draw_shadow_line(float* shadow_depth, int shadow_size,
 
 void draw_shadow_line_strip(float* shadow_depth, int shadow_size,
                             const ShadowVertex& v0, const ShadowVertex& v1,
+                            int x_tile_min, int x_tile_max,
                             int y_strip_min, int y_strip_max) {
     int x0 = (int)(v0.x + 0.5f), y0 = (int)(v0.y + 0.5f);
     int x1 = (int)(v1.x + 0.5f), y1 = (int)(v1.y + 0.5f);
@@ -808,7 +906,8 @@ void draw_shadow_line_strip(float* shadow_depth, int shadow_size,
     float dz = (steps > 0) ? (v1.z - v0.z) / steps : 0.0f;
     
     while (true) {
-        if (x0 >= 0 && x0 < shadow_size && y0 >= y_strip_min && y0 <= y_strip_max &&
+        if (x0 >= x_tile_min && x0 <= x_tile_max &&
+            x0 >= 0 && x0 < shadow_size && y0 >= y_strip_min && y0 <= y_strip_max &&
             y0 >= 0 && y0 < shadow_size && z >= 0.0f && z <= 1.0f) {
             float& dst = shadow_depth[y0 * shadow_size + x0];
             if (z < dst) dst = z;
@@ -828,31 +927,38 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                                       const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
                                       bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                       const float* shadow_depth, int shadow_size,
-                                      int y_strip_min, int y_strip_max, bool depth_write,
-                                      TriangleShader shader = TriangleShader::Lit) {
+                                      int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max, bool depth_write,
+                                      TriangleShader shader = TriangleShader::Lit,
+                                      const RasterTriangleSetup* precomputed_setup = nullptr) {
     // Compute bounding box and clamp to screen + strip
-    int x_min = (int)fminf(v0.x, fminf(v1.x, v2.x));
-    int x_max = (int)fmaxf(v0.x, fmaxf(v1.x, v2.x));
-    int y_min = (int)fminf(v0.y, fminf(v1.y, v2.y));
-    int y_max = (int)fmaxf(v0.y, fmaxf(v1.y, v2.y));
+    RasterTriangleSetup fallback_setup;
+    const RasterTriangleSetup* setup = precomputed_setup;
+    if (!setup || !setup->valid) {
+        fallback_setup = build_raster_triangle_setup(v0, v1, v2, screen_width, screen_height);
+        setup = &fallback_setup;
+    }
+    if (!setup->valid) return;
+    
+    int x_min = setup->x_min;
+    int x_max = setup->x_max;
+    int y_min = setup->y_min;
+    int y_max = setup->y_max;
     
     if (x_min < 0) x_min = 0;
     if (x_max >= screen_width) x_max = screen_width - 1;
+    if (x_min < x_tile_min) x_min = x_tile_min;
+    if (x_max > x_tile_max) x_max = x_tile_max;
     if (y_min < y_strip_min) y_min = y_strip_min;
     if (y_max > y_strip_max) y_max = y_strip_max;
     
     if (y_min > y_max || x_min > x_max) return;
     
-    // Degenerate triangle check
-    float area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
-    if (fabsf(area) < 0.0001f) return;
-    
     // Edge function incremental coefficients
     // w0 corresponds to edge v1->v2, w1 to v2->v0, w2 to v0->v1
     // A = dw/dx (per x-step), B = dw/dy (per y-step)
-    float A0 = v2.y - v1.y, B0 = v1.x - v2.x;
-    float A1 = v0.y - v2.y, B1 = v2.x - v0.x;
-    float A2 = v1.y - v0.y, B2 = v0.x - v1.x;
+    float A0 = setup->A0, B0 = setup->B0;
+    float A1 = setup->A1, B1 = setup->B1;
+    float A2 = setup->A2, B2 = setup->B2;
     
     // Evaluate edge functions at starting pixel center
     float px0 = (float)x_min + 0.5f;
@@ -862,24 +968,19 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     float w2_row = A2 * (px0 - v1.x) + B2 * (py0 - v1.y);
     
     // Pre-multiply attributes by 1/w for perspective-correct interpolation
-    float u0_w = v0.u * v0.inv_w, u1_w = v1.u * v1.inv_w, u2_w = v2.u * v2.inv_w;
-    float v0_w = v0.v * v0.inv_w, v1_w = v1.v * v1.inv_w, v2_w = v2.v * v2.inv_w;
-    float nx0_w = v0.nx * v0.inv_w, nx1_w = v1.nx * v1.inv_w, nx2_w = v2.nx * v2.inv_w;
-    float ny0_w = v0.ny * v0.inv_w, ny1_w = v1.ny * v1.inv_w, ny2_w = v2.ny * v2.inv_w;
-    float nz0_w = v0.nz * v0.inv_w, nz1_w = v1.nz * v1.inv_w, nz2_w = v2.nz * v2.inv_w;
-    float ex0_w = v0.ex * v0.inv_w, ex1_w = v1.ex * v1.inv_w, ex2_w = v2.ex * v2.inv_w;
-    float ey0_w = v0.ey * v0.inv_w, ey1_w = v1.ey * v1.inv_w, ey2_w = v2.ey * v2.inv_w;
-    float ez0_w = v0.ez * v0.inv_w, ez1_w = v1.ez * v1.inv_w, ez2_w = v2.ez * v2.inv_w;
-    float ss0_w = v0.ss * v0.inv_w, ss1_w = v1.ss * v1.inv_w, ss2_w = v2.ss * v2.inv_w;
-    float st0_w = v0.st * v0.inv_w, st1_w = v1.st * v1.inv_w, st2_w = v2.st * v2.inv_w;
-    float sr0_w = v0.sr * v0.inv_w, sr1_w = v1.sr * v1.inv_w, sr2_w = v2.sr * v2.inv_w;
-    float sq0_w = v0.sq * v0.inv_w, sq1_w = v1.sq * v1.inv_w, sq2_w = v2.sq * v2.inv_w;
-    
-    float invw_min = fminf(v0.inv_w, fminf(v1.inv_w, v2.inv_w));
-    float invw_max = fmaxf(v0.inv_w, fmaxf(v1.inv_w, v2.inv_w));
-    float invw_rel_span = (invw_max - invw_min) / fmaxf(invw_max, 0.000001f);
-    float screen_extent = fmaxf((float)(x_max - x_min), (float)(y_max - y_min));
-    bool perspective_correct_normals = (invw_rel_span * screen_extent) > NORMAL_PERSPECTIVE_THRESHOLD;
+    float u0_w = setup->u0_w, u1_w = setup->u1_w, u2_w = setup->u2_w;
+    float v0_w = setup->v0_w, v1_w = setup->v1_w, v2_w = setup->v2_w;
+    float nx0_w = setup->nx0_w, nx1_w = setup->nx1_w, nx2_w = setup->nx2_w;
+    float ny0_w = setup->ny0_w, ny1_w = setup->ny1_w, ny2_w = setup->ny2_w;
+    float nz0_w = setup->nz0_w, nz1_w = setup->nz1_w, nz2_w = setup->nz2_w;
+    float ex0_w = setup->ex0_w, ex1_w = setup->ex1_w, ex2_w = setup->ex2_w;
+    float ey0_w = setup->ey0_w, ey1_w = setup->ey1_w, ey2_w = setup->ey2_w;
+    float ez0_w = setup->ez0_w, ez1_w = setup->ez1_w, ez2_w = setup->ez2_w;
+    float ss0_w = setup->ss0_w, ss1_w = setup->ss1_w, ss2_w = setup->ss2_w;
+    float st0_w = setup->st0_w, st1_w = setup->st1_w, st2_w = setup->st2_w;
+    float sr0_w = setup->sr0_w, sr1_w = setup->sr1_w, sr2_w = setup->sr2_w;
+    float sq0_w = setup->sq0_w, sq1_w = setup->sq1_w, sq2_w = setup->sq2_w;
+    bool perspective_correct_normals = setup->perspective_correct_normals;
     
     // Cache texture info outside the loop
     bool has_texture = (texture && texture->pixels);
@@ -892,13 +993,19 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         tex_pixels = (uint8_t*)texture->pixels;
         tex_fmt = texture->format;
     }
+    int tile_col = tile_column_for_x(screen_width, x_tile_min);
+    int tile_x0, tile_x1;
+    tile_column_range(screen_width, tile_col, tile_x0, tile_x1);
+    int tile_width = tile_x1 - tile_x0 + 1;
+    size_t tile_base = tile_column_base(screen_width, screen_height, tile_col);
     
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
-        float* row_depth = depth_buffer + y * screen_width;
+        float* row_depth = depth_buffer + tile_base + (size_t)y * tile_width;
         
         for (int x = x_min; x <= x_max; x++) {
+            int lx = x - tile_x0;
             // Inside test (handle both CW and CCW winding)
             if (__builtin_expect((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0), 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
@@ -911,7 +1018,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
             
             // Depth test - early reject
-            if (__builtin_expect(z >= row_depth[x], 0)) {
+            if (__builtin_expect(z >= row_depth[lx], 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
                 continue;
             }
@@ -1113,7 +1220,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             
             // Write pixel directly (bounds guaranteed by bbox clamp)
             row_pixels[x] = SDL_MapRGB(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
-            if (depth_write) row_depth[x] = z;
+            if (depth_write) row_depth[lx] = z;
             
             w0 += A0; w1 += A1; w2 += A2;
         }
@@ -1125,7 +1232,7 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                int screen_width, int screen_height, SDL_PixelFormat* format,
                                const Matrix4f& projection, const Vector3f& light_pos,
                                const Vector3f& spot_dir, float spot_outer_cos,
-                               int y_strip_min, int y_strip_max) {
+                               int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
     Vector3f axis = spot_dir.normalized();
     float outer_angle = acosf(fmaxf(-1.0f, fminf(1.0f, spot_outer_cos)));
     constexpr float cone_len = 4.5f;
@@ -1172,14 +1279,14 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                         Vector3f::Zero(), light_pos, axis,
                                         true, 1.0f, spot_outer_cos,
                                         nullptr, 0,
-                                        y_strip_min, y_strip_max, false,
+                                        x_tile_min, x_tile_max, y_strip_min, y_strip_max, false,
                                         TriangleShader::LuminaireCone);
     }
 }
 
 void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
                       int screen_width, int screen_height, SDL_PixelFormat* format,
-                      int y_strip_min, int y_strip_max) {
+                      int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
     static constexpr int sample_offsets[16][2] = {
         { 2,  0}, {-2,  0}, { 0,  2}, { 0, -2},
         { 4,  3}, {-4,  3}, { 4, -3}, {-4, -3},
@@ -1218,8 +1325,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     
     for (int y = y_strip_min; y <= y_strip_max; y++) {
         uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
-        for (int x = 0; x < screen_width; x++) {
-            float center_z = depth_buffer[y * screen_width + x];
+        for (int x = x_tile_min; x <= x_tile_max; x++) {
+            float center_z = depth_buffer[tile_index(x, y, screen_width, screen_height)];
             if (center_z >= 0.999f) continue;
             float cx, cy, cz;
             reconstruct_position(x, y, center_z, cx, cy, cz);
@@ -1228,10 +1335,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             int xr = std::min(screen_width - 1, x + 1);
             int yu = std::max(0, y - 1);
             int yd = std::min(screen_height - 1, y + 1);
-            float zl = depth_buffer[y * screen_width + xl];
-            float zr = depth_buffer[y * screen_width + xr];
-            float zu = depth_buffer[yu * screen_width + x];
-            float zd = depth_buffer[yd * screen_width + x];
+            float zl = depth_buffer[tile_index(xl, y, screen_width, screen_height)];
+            float zr = depth_buffer[tile_index(xr, y, screen_width, screen_height)];
+            float zu = depth_buffer[tile_index(x, yu, screen_width, screen_height)];
+            float zd = depth_buffer[tile_index(x, yd, screen_width, screen_height)];
             if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
             
             float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
@@ -1259,7 +1366,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
                 int sy = y + offset[1];
                 if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
                 
-                float sample_z = depth_buffer[sy * screen_width + sx];
+                float sample_z = depth_buffer[tile_index(sx, sy, screen_width, screen_height)];
                 if (sample_z >= 0.999f) continue;
                 
                 float spx, spy, spz;
@@ -1295,8 +1402,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
 // Generate a UV sphere
 int main() {
     init_thread_counts();
-    buffer_strips_complete[0].store(NUM_STRIPS);
-    buffer_strips_complete[1].store(NUM_STRIPS);
+    buffer_strips_complete[0].store(NUM_TILE_BINS);
+    buffer_strips_complete[1].store(NUM_TILE_BINS);
     
     if (SDL_Init(SDL_INIT_VIDEO) < 0) {
         return 1;
@@ -1790,6 +1897,7 @@ int main() {
     // Structure for collected triangles (for threaded rendering)
     struct RenderTriangle {
         VertexVaryings v0, v1, v2;
+        RasterTriangleSetup rgb_setup;
         SDL_Surface* texture;
         float sort_z;
         bool shadow_backface;
@@ -1803,7 +1911,7 @@ int main() {
         size_t count;  // Valid triangle count, immutable once T&L completes
     };
     struct StripTriangleBuffer {
-        std::vector<std::vector<RenderTriangle>> strips;
+        std::vector<std::vector<RenderTriangle>> bins;
     };
     TriangleBuffer opaque_buffers[2];
     TriangleBuffer trans_buffers[2];
@@ -1822,9 +1930,9 @@ int main() {
     trans_buffers[0].count = trans_buffers[1].count = 0;
     shadow_buffers[0].count = shadow_buffers[1].count = 0;
     for (int b = 0; b < 2; b++) {
-        opaque_strip_buffers[b].strips.resize(NUM_STRIPS);
-        trans_strip_buffers[b].strips.resize(NUM_STRIPS);
-        shadow_strip_buffers[b].strips.resize(NUM_STRIPS);
+        opaque_strip_buffers[b].bins.resize(NUM_TILE_BINS);
+        trans_strip_buffers[b].bins.resize(NUM_TILE_BINS);
+        shadow_strip_buffers[b].bins.resize(NUM_TILE_BINS);
     }
     // Double-buffer indices managed by frame_num % 2 in the render loop
     
@@ -1887,7 +1995,23 @@ int main() {
         SDL_PixelFormat* format;
     };
     TLSharedData tl_shared;
-    std::mutex mtx_strip_bins;
+    struct TLThreadOutput {
+        std::vector<RenderTriangle> opaque;
+        std::vector<RenderTriangle> trans;
+        std::vector<RenderTriangle> shadow;
+        std::vector<std::vector<RenderTriangle>> opaque_bins;
+        std::vector<std::vector<RenderTriangle>> trans_bins;
+        std::vector<std::vector<RenderTriangle>> shadow_bins;
+    };
+    std::vector<TLThreadOutput> tl_thread_outputs(NUM_TL_THREADS);
+    for (auto& out : tl_thread_outputs) {
+        out.opaque.reserve(1000);
+        out.trans.reserve(1000);
+        out.shadow.reserve(1000);
+        out.opaque_bins.resize(NUM_TILE_BINS);
+        out.trans_bins.resize(NUM_TILE_BINS);
+        out.shadow_bins.resize(NUM_TILE_BINS);
+    }
     
     // Shared data for raster threads
     struct RasterSharedData {
@@ -1924,16 +2048,15 @@ int main() {
     
     // T&L worker function (persistent)
     auto tl_worker_func = [&](int thread_id) {
-        // Each thread has its own local triangle collection
-        std::vector<RenderTriangle> local_opaque;
-        std::vector<RenderTriangle> local_trans;
-        std::vector<RenderTriangle> local_shadow;
-        std::vector<std::vector<RenderTriangle>> local_opaque_strips(NUM_STRIPS);
-        std::vector<std::vector<RenderTriangle>> local_trans_strips(NUM_STRIPS);
-        std::vector<std::vector<RenderTriangle>> local_shadow_strips(NUM_STRIPS);
-        local_opaque.reserve(1000);
-        local_trans.reserve(1000);
-        local_shadow.reserve(1000);
+        // Each thread writes to a private output slot. Main concatenates slots in
+        // thread-id order to preserve the sorted instance traversal approximately.
+        auto& output = tl_thread_outputs[thread_id];
+        auto& local_opaque = output.opaque;
+        auto& local_trans = output.trans;
+        auto& local_shadow = output.shadow;
+        auto& local_opaque_bins = output.opaque_bins;
+        auto& local_trans_bins = output.trans_bins;
+        auto& local_shadow_bins = output.shadow_bins;
         
         int last_frame_processed = 0;
         
@@ -1964,10 +2087,10 @@ int main() {
             local_opaque.clear();
             local_trans.clear();
             local_shadow.clear();
-            for (int s = 0; s < NUM_STRIPS; s++) {
-                local_opaque_strips[s].clear();
-                local_trans_strips[s].clear();
-                local_shadow_strips[s].clear();
+            for (int s = 0; s < NUM_TILE_BINS; s++) {
+                local_opaque_bins[s].clear();
+                local_trans_bins[s].clear();
+                local_shadow_bins[s].clear();
             }
             
             // Process assigned instances
@@ -1975,31 +2098,42 @@ int main() {
             int instances_per_thread = (num_instances + NUM_TL_THREADS - 1) / NUM_TL_THREADS;
             int start_idx = thread_id * instances_per_thread;
             int end_idx = std::min(start_idx + instances_per_thread, num_instances);
-            auto screen_strip_range = [&](float y0, float y1, float y2, int height, int& first_strip, int& last_strip) {
+            auto screen_tile_range = [&](float x0, float x1, float x2, float y0, float y1, float y2,
+                                         int width, int height,
+                                         int& first_col, int& last_col, int& first_strip, int& last_strip) {
+                int x_min = (int)floorf(fminf(x0, fminf(x1, x2)));
+                int x_max = (int)ceilf(fmaxf(x0, fmaxf(x1, x2)));
                 int y_min = (int)floorf(fminf(y0, fminf(y1, y2)));
                 int y_max = (int)ceilf(fmaxf(y0, fmaxf(y1, y2)));
-                if (y_max < 0 || y_min >= height) return false;
+                if (x_max < 0 || x_min >= width || y_max < 0 || y_min >= height) return false;
+                if (x_min < 0) x_min = 0;
+                if (x_max >= width) x_max = width - 1;
                 if (y_min < 0) y_min = 0;
                 if (y_max >= height) y_max = height - 1;
+                first_col = tile_column_for_x(width, x_min);
+                last_col = tile_column_for_x(width, x_max);
                 first_strip = (y_min * NUM_STRIPS) / height;
                 last_strip = (y_max * NUM_STRIPS) / height;
                 if (first_strip < 0) first_strip = 0;
                 if (last_strip >= NUM_STRIPS) last_strip = NUM_STRIPS - 1;
-                return first_strip <= last_strip;
+                return first_col <= last_col && first_strip <= last_strip;
             };
-            auto rgb_strip_range = [&](const RenderTriangle& tri, int& first_strip, int& last_strip) {
-                return screen_strip_range(tri.v0.y, tri.v1.y, tri.v2.y,
-                                          tl_shared.screen_height, first_strip, last_strip);
+            auto rgb_tile_range = [&](const RenderTriangle& tri, int& first_col, int& last_col, int& first_strip, int& last_strip) {
+                return screen_tile_range(tri.v0.x, tri.v1.x, tri.v2.x,
+                                         tri.v0.y, tri.v1.y, tri.v2.y,
+                                         tl_shared.screen_width, tl_shared.screen_height,
+                                         first_col, last_col, first_strip, last_strip);
             };
-            auto shadow_strip_range = [&](const RenderTriangle& tri, int& first_strip, int& last_strip) {
+            auto shadow_tile_range = [&](const RenderTriangle& tri, int& first_col, int& last_col, int& first_strip, int& last_strip) {
                 ShadowVertex sv0, sv1, sv2;
                 if (!shadow_vertex_from_varying(tri.v0, sv0) ||
                     !shadow_vertex_from_varying(tri.v1, sv1) ||
                     !shadow_vertex_from_varying(tri.v2, sv2)) {
                     return false;
                 }
-                return screen_strip_range(sv0.y, sv1.y, sv2.y,
-                                          SHADOW_MAP_SIZE, first_strip, last_strip);
+                return screen_tile_range(sv0.x, sv1.x, sv2.x, sv0.y, sv1.y, sv2.y,
+                                         SHADOW_MAP_SIZE, SHADOW_MAP_SIZE,
+                                         first_col, last_col, first_strip, last_strip);
             };
             
             // Pre-allocated thread-local vertex buffers (reused across instances)
@@ -2153,11 +2287,13 @@ int main() {
                             } else {
                                 shadow_tri.sort_z = 1.0f;
                             }
-                            int first_strip = 0, last_strip = -1;
-                            if (shadow_strip_range(shadow_tri, first_strip, last_strip) &&
-                                (last_strip - first_strip + 1) <= 2) {
-                                for (int s = first_strip; s <= last_strip; s++) {
-                                    local_shadow_strips[s].push_back(shadow_tri);
+                            int first_col = 0, last_col = -1, first_strip = 0, last_strip = -1;
+                            if (shadow_tile_range(shadow_tri, first_col, last_col, first_strip, last_strip) &&
+                                ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4) {
+                                for (int c = first_col; c <= last_col; c++) {
+                                    for (int s = first_strip; s <= last_strip; s++) {
+                                        local_shadow_bins[c * NUM_STRIPS + s].push_back(shadow_tri);
+                                    }
                                 }
                             } else {
                                 local_shadow.push_back(shadow_tri);
@@ -2196,22 +2332,30 @@ int main() {
                         tri.sort_z = (v0.z + v1.z + v2.z) / 3.0f;
                         tri.shadow_backface = shadow_backface;
                         tri.shadow_screendoor_mask = -1;
-                        int first_strip = 0, last_strip = -1;
-                        bool use_strip_bins = rgb_strip_range(tri, first_strip, last_strip) &&
-                            (last_strip - first_strip + 1) <= 2;
+                        tri.rgb_setup = build_raster_triangle_setup(v0, v1, v2,
+                                                                    tl_shared.screen_width,
+                                                                    tl_shared.screen_height);
+                        if (!tri.rgb_setup.valid) return;
+                        int first_col = 0, last_col = -1, first_strip = 0, last_strip = -1;
+                        bool use_strip_bins = rgb_tile_range(tri, first_col, last_col, first_strip, last_strip) &&
+                            ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4;
                         
                         if (inst.type == 2) {
                             if (use_strip_bins) {
-                                for (int s = first_strip; s <= last_strip; s++) {
-                                    local_trans_strips[s].push_back(tri);
+                                for (int c = first_col; c <= last_col; c++) {
+                                    for (int s = first_strip; s <= last_strip; s++) {
+                                        local_trans_bins[c * NUM_STRIPS + s].push_back(tri);
+                                    }
                                 }
                             } else {
                                 local_trans.push_back(tri);
                             }
                         } else {
                             if (use_strip_bins) {
-                                for (int s = first_strip; s <= last_strip; s++) {
-                                    local_opaque_strips[s].push_back(tri);
+                                for (int c = first_col; c <= last_col; c++) {
+                                    for (int s = first_strip; s <= last_strip; s++) {
+                                        local_opaque_bins[c * NUM_STRIPS + s].push_back(tri);
+                                    }
                                 }
                             } else {
                                 local_opaque.push_back(tri);
@@ -2271,74 +2415,48 @@ int main() {
                 }
             }
             
-            // Merge local opaque triangles (relaxed: disjoint ranges, no ordering needed)
-            if (!local_opaque.empty()) {
-                size_t my_start = tl_shared.opaque_count->fetch_add(local_opaque.size(), std::memory_order_relaxed);
-                size_t buffer_size = tl_shared.opaque_triangles->size();
-                size_t write_count = local_opaque.size();
-                if (my_start + write_count > buffer_size) {
-                    write_count = (buffer_size > my_start) ? (buffer_size - my_start) : 0;
+            if (ENABLE_RGB_TRIANGLE_SORT) {
+                std::sort(local_opaque.begin(), local_opaque.end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
+                std::sort(local_trans.begin(), local_trans.end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; });
+                for (int s = 0; s < NUM_TILE_BINS; s++) {
+                    std::sort(local_opaque_bins[s].begin(), local_opaque_bins[s].end(),
+                              [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
+                    std::sort(local_trans_bins[s].begin(), local_trans_bins[s].end(),
+                              [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; });
                 }
-                for (size_t i = 0; i < write_count; i++) {
-                    (*tl_shared.opaque_triangles)[my_start + i] = local_opaque[i];
+            }
+            if (ENABLE_SHADOW_TRIANGLE_SORT) {
+                std::sort(local_shadow.begin(), local_shadow.end(),
+                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
+                for (int s = 0; s < NUM_TILE_BINS; s++) {
+                    std::sort(local_shadow_bins[s].begin(), local_shadow_bins[s].end(),
+                              [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
                 }
             }
             
-            // Merge local transparent triangles
-            if (!local_trans.empty()) {
-                size_t my_start = tl_shared.trans_count->fetch_add(local_trans.size(), std::memory_order_relaxed);
-                size_t buffer_size = tl_shared.trans_triangles->size();
-                size_t write_count = local_trans.size();
-                if (my_start + write_count > buffer_size) {
-                    write_count = (buffer_size > my_start) ? (buffer_size - my_start) : 0;
-                }
-                for (size_t i = 0; i < write_count; i++) {
-                    (*tl_shared.trans_triangles)[my_start + i] = local_trans[i];
-                }
+            // Signal completion; the wait predicate reads this atomic.
+            if (tl_done_counter.fetch_add(1, std::memory_order_release) + 1 >= NUM_TL_THREADS) {
+                cv_main.notify_one();
             }
-            
-            // Merge local shadow triangles into a separate depth-only stream.
-            if (!local_shadow.empty()) {
-                size_t my_start = tl_shared.shadow_count->fetch_add(local_shadow.size(), std::memory_order_relaxed);
-                size_t buffer_size = tl_shared.shadow_triangles->size();
-                size_t write_count = local_shadow.size();
-                if (my_start + write_count > buffer_size) {
-                    write_count = (buffer_size > my_start) ? (buffer_size - my_start) : 0;
-                }
-                for (size_t i = 0; i < write_count; i++) {
-                    (*tl_shared.shadow_triangles)[my_start + i] = local_shadow[i];
-                }
-            }
-            
-            {
-                std::lock_guard<std::mutex> lock(mtx_strip_bins);
-                for (int s = 0; s < NUM_STRIPS; s++) {
-                    auto& opaque_dst = tl_shared.opaque_strip_triangles->strips[s];
-                    auto& trans_dst = tl_shared.trans_strip_triangles->strips[s];
-                    auto& shadow_dst = tl_shared.shadow_strip_triangles->strips[s];
-                    opaque_dst.insert(opaque_dst.end(), local_opaque_strips[s].begin(), local_opaque_strips[s].end());
-                    trans_dst.insert(trans_dst.end(), local_trans_strips[s].begin(), local_trans_strips[s].end());
-                    shadow_dst.insert(shadow_dst.end(), local_shadow_strips[s].begin(), local_shadow_strips[s].end());
-                }
-            }
-            
-            // Signal completion (relaxed: mutex provides ordering)
-            {
-                std::lock_guard<std::mutex> lock(mtx_main);
-                tl_done_counter.fetch_add(1, std::memory_order_relaxed);
-            }
-            cv_main.notify_one();
         }
     };
     
     // Raster worker function (persistent)
     auto raster_worker_func = [&]([[maybe_unused]] int thread_id) {
-        // Strip processing order: evens then odds (computed automatically)
-        static const std::vector<int> strip_order = [](){
+        // Column-major tiles: process odd columns, then even columns, strip-minor within each column.
+        static const std::vector<int> tile_order = [](){
             std::vector<int> v;
-            v.reserve(NUM_STRIPS);
-            for (int i = 0; i < NUM_STRIPS; i += 2) v.push_back(i); // Evens
-            for (int i = 1; i < NUM_STRIPS; i += 2) v.push_back(i); // Odds
+            v.reserve(NUM_TILE_BINS);
+            for (int c = 1; c < TILE_X_SPLITS; c += 2) {
+                for (int i = 0; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
+                for (int i = 1; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
+            }
+            for (int c = 0; c < TILE_X_SPLITS; c += 2) {
+                for (int i = 0; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
+                for (int i = 1; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
+            }
             return v;
         }();
         
@@ -2367,12 +2485,17 @@ int main() {
             // Dynamic strip assignment - grab next ticket (relaxed: pure counter)
             while (true) {
                 int ticket = next_strip_ticket.fetch_add(1, std::memory_order_relaxed);
-                if (ticket >= NUM_STRIPS) break;
+                if (ticket >= NUM_TILE_BINS) break;
                 
-                int strip_idx = strip_order[ticket];
+                int tile_idx = tile_order[ticket];
+                int tile_col = tile_idx / NUM_STRIPS;
+                int strip_idx = tile_idx % NUM_STRIPS;
                 
                 // Robust strip height calculation to handle non-divisible target heights
                 int h = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_height;
+                int w = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_width;
+                int x_min, x_max;
+                tile_column_range(w, tile_col, x_min, x_max);
                 int y_min = (strip_idx * h) / NUM_STRIPS;
                 int y_max = ((strip_idx + 1) * h) / NUM_STRIPS - 1;
                 
@@ -2381,8 +2504,8 @@ int main() {
                 
                 if (job_mode == RasterJobMode::ShadowDepth) {
                     for (int y = y_min; y <= y_max; y++) {
-                        std::fill(rs.shadow_depth_write + y * rs.shadow_size,
-                                  rs.shadow_depth_write + (y + 1) * rs.shadow_size, 1.0f);
+                        std::fill(rs.shadow_depth_write + y * rs.shadow_size + x_min,
+                                  rs.shadow_depth_write + y * rs.shadow_size + x_max + 1, 1.0f);
                     }
                     
                     auto draw_shadow_tri = [&](const RenderTriangle& tri) {
@@ -2391,11 +2514,11 @@ int main() {
                             shadow_vertex_from_varying(tri.v1, sv1) &&
                             shadow_vertex_from_varying(tri.v2, sv2)) {
                             draw_shadow_triangle_strip(rs.shadow_depth_write, rs.shadow_size,
-                                                       sv0, sv1, sv2, y_min, y_max,
+                                                       sv0, sv1, sv2, x_min, x_max, y_min, y_max,
                                                        tri.shadow_screendoor_mask);
                         }
                     };
-                    const auto& shadow_strip = rs.shadow_strip_triangles->strips[strip_idx];
+                    const auto& shadow_strip = rs.shadow_strip_triangles->bins[tile_idx];
                     if (ENABLE_SHADOW_TRIANGLE_SORT) {
                         size_t gi = 0, si = 0;
                         while (gi < rs.shadow_count || si < shadow_strip.size()) {
@@ -2414,16 +2537,24 @@ int main() {
                         if (rs.shadow_box->visible[a] && rs.shadow_box->visible[b]) {
                             draw_shadow_line_strip(rs.shadow_depth_write, rs.shadow_size,
                                                    rs.shadow_box->vertices[a], rs.shadow_box->vertices[b],
-                                                   y_min, y_max);
+                                                   x_min, x_max, y_min, y_max);
                         }
                     }
                 } else if (job_mode == RasterJobMode::Color) {
                     // Clear strip (vectorizable by compiler with -O3)
                     uint32_t* pixel_buffer = (uint32_t*)rs.pixels;
+                    int tile_x0, tile_x1;
+                    tile_column_range(rs.screen_width, tile_col, tile_x0, tile_x1);
                     int pixels_per_row = rs.pitch / 4;
+                    int depth_pixels_per_row = tile_x1 - tile_x0 + 1;
+                    size_t tile_base = tile_column_base(rs.screen_width, rs.screen_height, tile_col);
                     for (int y = y_min; y <= y_max; y++) {
-                        std::fill(pixel_buffer + y * pixels_per_row, pixel_buffer + y * pixels_per_row + rs.screen_width, rs.clear_color);
-                        std::fill(rs.depth_buffer + y * rs.screen_width, rs.depth_buffer + (y + 1) * rs.screen_width, 1.0f);
+                        std::fill(pixel_buffer + (size_t)y * pixels_per_row + x_min,
+                                  pixel_buffer + (size_t)y * pixels_per_row + x_max + 1,
+                                  rs.clear_color);
+                        std::fill(rs.depth_buffer + tile_base + (size_t)y * depth_pixels_per_row + (x_min - tile_x0),
+                                  rs.depth_buffer + tile_base + (size_t)y * depth_pixels_per_row + (x_max - tile_x0) + 1,
+                                  1.0f);
                     }
                     
                     auto draw_color_tri = [&](const RenderTriangle& tri, bool depth_write) {
@@ -2435,12 +2566,13 @@ int main() {
                                                         rs.light_dir, rs.light_pos, rs.spot_dir,
                                                         rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos,
                                                         rs.shadow_depth, rs.shadow_size,
-                                                        y_min, y_max, depth_write);
+                                                        x_min, x_max, y_min, y_max, depth_write,
+                                                        TriangleShader::Lit, &tri.rgb_setup);
                     };
                     
                     // Render strip: large global triangles plus small triangles binned to this strip.
                     // Opaque first, merged front-to-back with the per-strip bin.
-                    const auto& opaque_strip = rs.opaque_strip_triangles->strips[strip_idx];
+                    const auto& opaque_strip = rs.opaque_strip_triangles->bins[tile_idx];
                     if (ENABLE_RGB_TRIANGLE_SORT) {
                         size_t og = 0, os = 0;
                         while (og < rs.opaque_count || os < opaque_strip.size()) {
@@ -2455,7 +2587,7 @@ int main() {
                     }
                     
                     // Transparent second, merged back-to-front with depth writes disabled.
-                    const auto& trans_strip = rs.trans_strip_triangles->strips[strip_idx];
+                    const auto& trans_strip = rs.trans_strip_triangles->bins[tile_idx];
                     if (ENABLE_RGB_TRIANGLE_SORT) {
                         size_t tg = 0, ts = 0;
                         while (tg < rs.trans_count || ts < trans_strip.size()) {
@@ -2472,7 +2604,7 @@ int main() {
                     if (ENABLE_SSAO) {
                         apply_ssao_strip(rs.pixels, rs.pitch, rs.depth_buffer,
                                          rs.screen_width, rs.screen_height, rs.format,
-                                         y_min, y_max);
+                                         x_min, x_max, y_min, y_max);
                     }
                 } else {
                     if (rs.use_spotlight) {
@@ -2480,26 +2612,16 @@ int main() {
                                                   rs.screen_width, rs.screen_height,
                                                   rs.format, rs.projection,
                                                   rs.light_pos, rs.spot_dir, rs.spot_outer_cos,
-                                                  y_min, y_max);
+                                                  x_min, x_max, y_min, y_max);
                     }
                 }
                 
-                // Mark strip complete and notify main (relaxed: mutex provides ordering)
-                {
-                    std::lock_guard<std::mutex> lock(mtx_main);
-                    if (job_mode == RasterJobMode::Color) {
-                        buffer_strips_complete[buf_id].fetch_add(1, std::memory_order_relaxed);
-                    }
-                    raster_strips_done.fetch_add(1, std::memory_order_relaxed);
-                }
-                cv_main.notify_one();
+                raster_strips_done.fetch_add(1, std::memory_order_relaxed);
             }
             
-            {
-                std::lock_guard<std::mutex> lock(mtx_main);
-                raster_workers_done.fetch_add(1, std::memory_order_relaxed);
+            if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= NUM_RASTER_THREADS) {
+                cv_main.notify_one();
             }
-            cv_main.notify_one();
             
             // No wait at end - go back to sleep
         }
@@ -2528,6 +2650,7 @@ int main() {
     int screen_width = fb->w;
     int screen_height = fb->h;
     std::vector<float> depth_buffer(screen_width * screen_height);
+    std::vector<float> tiled_depth_buffer(screen_width * screen_height);
     std::vector<float> shadow_depth_buffers[2];
     shadow_depth_buffers[0].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     shadow_depth_buffers[1].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
@@ -2713,19 +2836,19 @@ int main() {
         int raster_buf_idx = (frame_num + 1) % 2; // Buffer we will RASTERIZE (filled previous frame)
         
         // 1. Wait for T&L Target Buffer to be FREE (Rasterizer finished with it)
-        // 'buffer_strips_complete == NUM_STRIPS' means it's fully rasterized and free
+        // 'buffer_strips_complete == NUM_TILE_BINS' means it's fully rasterized and free
         {
             std::unique_lock<std::mutex> lock(mtx_main);
-            cv_main.wait(lock, [&]{ return buffer_strips_complete[tl_buf_idx].load() >= NUM_STRIPS; });
+            cv_main.wait(lock, [&]{ return buffer_strips_complete[tl_buf_idx].load() >= NUM_TILE_BINS; });
         }
         // 2. Setup T&L for Frame N - just reset counters, buffers are pre-allocated
         opaque_counter.store(0);
         trans_counter.store(0);
         shadow_counter.store(0);
-        for (int s = 0; s < NUM_STRIPS; s++) {
-            opaque_strip_buffers[tl_buf_idx].strips[s].clear();
-            trans_strip_buffers[tl_buf_idx].strips[s].clear();
-            shadow_strip_buffers[tl_buf_idx].strips[s].clear();
+        for (int s = 0; s < NUM_TILE_BINS; s++) {
+            opaque_strip_buffers[tl_buf_idx].bins[s].clear();
+            trans_strip_buffers[tl_buf_idx].bins[s].clear();
+            shadow_strip_buffers[tl_buf_idx].bins[s].clear();
         }
         
         tl_shared.instances = &instances;
@@ -2827,7 +2950,7 @@ int main() {
             raster_shared[raster_buf_idx].shadow_count = shadow_buffers[raster_buf_idx].count;
             raster_shared[raster_buf_idx].pixels = pixels;
             raster_shared[raster_buf_idx].pitch = pitch;
-            raster_shared[raster_buf_idx].depth_buffer = depth_buffer.data();
+            raster_shared[raster_buf_idx].depth_buffer = tiled_depth_buffer.data();
             raster_shared[raster_buf_idx].screen_width = screen_width;
             raster_shared[raster_buf_idx].screen_height = screen_height;
             raster_shared[raster_buf_idx].format = fb->format;
@@ -2869,6 +2992,9 @@ int main() {
             
             std::unique_lock<std::mutex> lock(mtx_main);
             cv_main.wait(lock, []{ return raster_workers_done.load() >= NUM_RASTER_THREADS; });
+            if (job_mode == RasterJobMode::Color) {
+                buffer_strips_complete[buf_idx].store(NUM_TILE_BINS, std::memory_order_release);
+            }
         };
         
         // Shadow depth must complete before RGB samples it.
@@ -2880,7 +3006,7 @@ int main() {
         }
         
         if (do_raster && raster_shared[raster_buf_idx].use_spotlight) {
-            draw_spotlight_luminaire(pixels, pitch, depth_buffer.data(),
+            draw_spotlight_luminaire(pixels, pitch, tiled_depth_buffer.data(),
                                      screen_width, screen_height, fb->format,
                                      projection_buffers[raster_buf_idx],
                                      raster_shared[raster_buf_idx].light_pos);
@@ -2934,7 +3060,7 @@ int main() {
                 int a = edges[i][0], b = edges[i][1];
                 if (visible[a] && visible[b]) {
                     if (do_raster) {
-                        draw_lit_shadowed_line_depth(pixels, pitch, depth_buffer.data(),
+                        draw_lit_shadowed_line_depth(pixels, pitch, tiled_depth_buffer.data(),
                                                      sx[a], sy[a], sz[a], eye_corners[a], invw[a],
                                                      sx[b], sy[b], sz[b], eye_corners[b], invw[b],
                                                      screen_width, screen_height, fb->format,
@@ -2971,63 +3097,88 @@ int main() {
             cv_main.wait(lock, []{ return tl_done_counter.load() >= NUM_TL_THREADS; });
         }
         
+        // Concatenate per-worker outputs in sorted instance-slice order. This preserves
+        // most object traversal ordering without contended append locks in T&L workers.
+        size_t count_opaque = 0;
+        size_t count_trans = 0;
+        size_t count_shadow = 0;
+        auto append_limited = [](std::vector<RenderTriangle>& dst, size_t& dst_count,
+                                 const std::vector<RenderTriangle>& src) {
+            size_t room = (dst_count < dst.size()) ? (dst.size() - dst_count) : 0;
+            size_t write_count = std::min(room, src.size());
+            for (size_t i = 0; i < write_count; i++) {
+                dst[dst_count + i] = src[i];
+            }
+            dst_count += write_count;
+        };
+        auto append_sorted_limited = [](std::vector<RenderTriangle>& dst, size_t& dst_count,
+                                        const std::vector<RenderTriangle>& src, auto less_than) {
+            size_t room = (dst_count < dst.size()) ? (dst.size() - dst_count) : 0;
+            size_t write_count = std::min(room, src.size());
+            auto begin = dst.begin();
+            auto mid = begin + dst_count;
+            for (size_t i = 0; i < write_count; i++) {
+                dst[dst_count + i] = src[i];
+            }
+            dst_count += write_count;
+            if (write_count > 0 && mid != begin) {
+                std::inplace_merge(begin, mid, begin + dst_count, less_than);
+            }
+        };
+        auto append_bin = [](std::vector<RenderTriangle>& dst,
+                             const std::vector<RenderTriangle>& src,
+                             bool keep_sorted, auto less_than) {
+            if (src.empty()) return;
+            size_t old_size = dst.size();
+            dst.insert(dst.end(), src.begin(), src.end());
+            if (keep_sorted && old_size > 0) {
+                std::inplace_merge(dst.begin(), dst.begin() + old_size, dst.end(), less_than);
+            }
+        };
+        auto front_to_back = [](const RenderTriangle& a, const RenderTriangle& b) {
+            return a.sort_z < b.sort_z;
+        };
+        auto back_to_front = [](const RenderTriangle& a, const RenderTriangle& b) {
+            return a.sort_z > b.sort_z;
+        };
+        for (int tid = 0; tid < NUM_TL_THREADS; tid++) {
+            const auto& out = tl_thread_outputs[tid];
+            if (ENABLE_RGB_TRIANGLE_SORT) {
+                append_sorted_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque, front_to_back);
+                append_sorted_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans, back_to_front);
+            } else {
+                append_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque);
+                append_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans);
+            }
+            if (ENABLE_SHADOW_TRIANGLE_SORT) {
+                append_sorted_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow, front_to_back);
+            } else {
+                append_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow);
+            }
+            for (int s = 0; s < NUM_TILE_BINS; s++) {
+                auto& opaque_dst = opaque_strip_buffers[tl_buf_idx].bins[s];
+                auto& trans_dst = trans_strip_buffers[tl_buf_idx].bins[s];
+                auto& shadow_dst = shadow_strip_buffers[tl_buf_idx].bins[s];
+                append_bin(opaque_dst, out.opaque_bins[s], ENABLE_RGB_TRIANGLE_SORT, front_to_back);
+                append_bin(trans_dst, out.trans_bins[s], ENABLE_RGB_TRIANGLE_SORT, back_to_front);
+                append_bin(shadow_dst, out.shadow_bins[s], ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
+            }
+        }
+        opaque_counter.store(count_opaque, std::memory_order_relaxed);
+        trans_counter.store(count_trans, std::memory_order_relaxed);
+        shadow_counter.store(count_shadow, std::memory_order_relaxed);
+        
         // Finalize T&L Buffers and optional sort
         // Block T&L from racing ahead to next use of this buffer
         buffer_tl_ready[tl_buf_idx].store(false);
-        
-        size_t count_opaque = opaque_counter.load();
-        size_t count_trans = trans_counter.load();
-        size_t count_shadow = shadow_counter.load();
         
         // Clamp to buffer size
         if (count_opaque > 100000) count_opaque = 100000;
         if (count_trans > 100000) count_trans = 100000;
         if (count_shadow > 200000) count_shadow = 200000;
         
-        if (ENABLE_RGB_TRIANGLE_SORT) {
-            // Sort only the valid portion - don't resize the buffer
-            std::sort(opaque_buffers[tl_buf_idx].triangles.begin(), 
-                      opaque_buffers[tl_buf_idx].triangles.begin() + count_opaque,
-                      [](const RenderTriangle& a, const RenderTriangle& b) {
-                          return a.sort_z < b.sort_z;
-                      });
-                      
-            std::sort(trans_buffers[tl_buf_idx].triangles.begin(), 
-                      trans_buffers[tl_buf_idx].triangles.begin() + count_trans,
-                      [](const RenderTriangle& a, const RenderTriangle& b) {
-                          return a.sort_z > b.sort_z;
-                      });
-                      
-            for (int s = 0; s < NUM_STRIPS; s++) {
-                std::sort(opaque_strip_buffers[tl_buf_idx].strips[s].begin(),
-                          opaque_strip_buffers[tl_buf_idx].strips[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) {
-                              return a.sort_z < b.sort_z;
-                          });
-                std::sort(trans_strip_buffers[tl_buf_idx].strips[s].begin(),
-                          trans_strip_buffers[tl_buf_idx].strips[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) {
-                              return a.sort_z > b.sort_z;
-                          });
-            }
-        }
-        
-        if (ENABLE_SHADOW_TRIANGLE_SORT) {
-            // Sort the reduced global shadow stream and each strip-local stream separately;
-            // raster workers merge the two sorted streams for their strip.
-            std::sort(shadow_buffers[tl_buf_idx].triangles.begin(),
-                      shadow_buffers[tl_buf_idx].triangles.begin() + count_shadow,
-                      [](const RenderTriangle& a, const RenderTriangle& b) {
-                          return a.sort_z < b.sort_z;
-                      });
-            for (int s = 0; s < NUM_STRIPS; s++) {
-                std::sort(shadow_strip_buffers[tl_buf_idx].strips[s].begin(),
-                          shadow_strip_buffers[tl_buf_idx].strips[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) {
-                              return a.sort_z < b.sort_z;
-                          });
-            }
-        }
+        // Per-worker T&L outputs were sorted while private, then merged above in
+        // worker-slice order. Avoid re-sorting the full global/tile streams here.
         
         // Store counts with buffer (immutable until next T&L pass on this buffer)
         opaque_buffers[tl_buf_idx].count = count_opaque;
