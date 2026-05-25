@@ -113,6 +113,7 @@ constexpr bool USE_SPOTLIGHT = true;
 constexpr bool ENABLE_SSAO = true;
 constexpr bool ENABLE_RGB_TRIANGLE_SORT = true;
 constexpr bool ENABLE_SHADOW_TRIANGLE_SORT = false;
+constexpr bool DEBUG_DRAW_CAMERA_OCCLUDED_RED = false;
 constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
 constexpr int SHADOW_MAP_SIZE = 1024;
 constexpr float SHADOW_DEPTH_BIAS = 0.0025f;
@@ -234,6 +235,7 @@ static inline bool project_eye_point(const Matrix4f& projection, const Vector3f&
 
 enum class TriangleShader {
     Lit,
+    DebugUnlitRed,
     LuminaireCone
 };
 
@@ -1076,6 +1078,12 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             
             // Perspective-correct UV
             float inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
+            if (shader == TriangleShader::DebugUnlitRed) {
+                row_pixels[x] = pack_rgb_fast(format, 255, 0, 0);
+                if (depth_write) row_depth[x] = z;
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
             if (shader == TriangleShader::LuminaireCone) {
                 float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
                 float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
@@ -1959,6 +1967,7 @@ int main() {
         RasterTriangleSetup rgb_setup;
         const PackedTexture* texture;
         float sort_z;
+        bool debug_unlit_red;
         bool shadow_backface;
         int shadow_screendoor_mask; // -1 = solid, 0..7 = 4x4 50% mask
     };
@@ -2052,6 +2061,7 @@ int main() {
         int screen_width;
         int screen_height;
         SDL_PixelFormat* format;
+        const std::vector<uint8_t>* instance_occlusion_flags;
     };
     TLSharedData tl_shared;
     struct TLThreadOutput {
@@ -2201,6 +2211,7 @@ int main() {
             
             for (int i = start_idx; i < end_idx; i++) {
                 const auto& depth_pair = (*tl_shared.sorted_instances)[i];
+                size_t instance_idx = depth_pair.second;
                 const auto& inst = (*tl_shared.instances)[depth_pair.second];
                 
                 // Select geometry based on instance type
@@ -2249,6 +2260,12 @@ int main() {
                                                            tl_shared.spot_outer_cos,
                                                            tl_shared.shadow_near,
                                                            tl_shared.shadow_far);
+                if (inst.type == 4 && tl_shared.instance_occlusion_flags &&
+                    instance_idx < tl_shared.instance_occlusion_flags->size()) {
+                    uint8_t flags = (*tl_shared.instance_occlusion_flags)[instance_idx];
+                    if (!DEBUG_DRAW_CAMERA_OCCLUDED_RED && (flags & 1)) camera_visible = false;
+                    if (flags & 2) shadow_visible = false;
+                }
                 if (!camera_visible && !shadow_visible) {
                     continue;
                 }
@@ -2330,6 +2347,7 @@ int main() {
                     if (shadow_visible && shadow_backface) {
                         auto emit_shadow_triangle = [&](const ClipVertex& a, const ClipVertex& b, const ClipVertex& c) {
                             RenderTriangle shadow_tri{};
+                            shadow_tri.debug_unlit_red = false;
                             Vector4f sh0 = tl_shared.shadow_matrix * a.position;
                             Vector4f sh1 = tl_shared.shadow_matrix * b.position;
                             Vector4f sh2 = tl_shared.shadow_matrix * c.position;
@@ -2383,12 +2401,17 @@ int main() {
                     if (!camera_visible) {
                         continue;
                     }
+                    bool debug_unlit_red = DEBUG_DRAW_CAMERA_OCCLUDED_RED &&
+                        inst.type == 4 && tl_shared.instance_occlusion_flags &&
+                        instance_idx < tl_shared.instance_occlusion_flags->size() &&
+                        (((*tl_shared.instance_occlusion_flags)[instance_idx] & 1) != 0);
                     
                     auto add_triangle = [&](VertexVaryings v0, VertexVaryings v1, VertexVaryings v2) {
                         RenderTriangle tri;
                         tri.v0 = v0; tri.v1 = v1; tri.v2 = v2;
                         tri.texture = inst.texture;
                         tri.sort_z = (v0.z + v1.z + v2.z) / 3.0f;
+                        tri.debug_unlit_red = debug_unlit_red;
                         tri.shadow_backface = shadow_backface;
                         tri.shadow_screendoor_mask = -1;
                         tri.rgb_setup = build_raster_triangle_setup(v0, v1, v2,
@@ -2622,7 +2645,8 @@ int main() {
                                                         rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos,
                                                         rs.shadow_depth, rs.shadow_size,
                                                         x_min, x_max, y_min, y_max, depth_write,
-                                                        TriangleShader::Lit, &tri.rgb_setup);
+                                                        tri.debug_unlit_red ? TriangleShader::DebugUnlitRed : TriangleShader::Lit,
+                                                        &tri.rgb_setup);
                     };
                     
                     // Render strip: large global triangles plus small triangles binned to this strip.
@@ -2716,13 +2740,44 @@ int main() {
     
     // Pre-allocate instance_depths outside loop
     std::vector<std::pair<float, size_t>> instance_depths;
-    instance_depths.resize(instances.size());
+    instance_depths.reserve(instances.size());
+    std::vector<uint8_t> instance_occlusion_flags(instances.size(), 0);
+    bool instance_occlusion_flags_valid = false;
+    Uint64 last_physics_time = SDL_GetTicks64();
+    auto window_can_render = [&]() {
+        Uint32 flags = SDL_GetWindowFlags(win);
+        return (flags & SDL_WINDOW_SHOWN) &&
+               (flags & SDL_WINDOW_INPUT_FOCUS) &&
+               !(flags & SDL_WINDOW_HIDDEN) &&
+               !(flags & SDL_WINDOW_MINIMIZED);
+    };
+    bool window_renderable = window_can_render();
     
     while (running) {
         // Handle events
         while (SDL_PollEvent(&event)) {
             if (event.type == SDL_QUIT) {
                 running = false;
+            } else if (event.type == SDL_WINDOWEVENT) {
+                switch (event.window.event) {
+                    case SDL_WINDOWEVENT_HIDDEN:
+                    case SDL_WINDOWEVENT_MINIMIZED:
+                    case SDL_WINDOWEVENT_FOCUS_LOST:
+                        window_renderable = false;
+                        camera_orbiting = false;
+                        SDL_FlushEvents(SDL_MOUSEMOTION, SDL_MULTIGESTURE);
+                        break;
+                    case SDL_WINDOWEVENT_SHOWN:
+                    case SDL_WINDOWEVENT_RESTORED:
+                    case SDL_WINDOWEVENT_EXPOSED:
+                    case SDL_WINDOWEVENT_FOCUS_GAINED:
+                        window_renderable = window_can_render();
+                        last_physics_time = SDL_GetTicks64();
+                        SDL_FlushEvents(SDL_MOUSEMOTION, SDL_MULTIGESTURE);
+                        break;
+                    default:
+                        break;
+                }
             } else if (event.type == SDL_KEYDOWN && !event.key.repeat && event.key.keysym.sym == SDLK_SPACE) {
                 paused = !paused;
             } else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
@@ -2746,13 +2801,23 @@ int main() {
             }
         }
 
+        if (!running) {
+            break;
+        }
+        window_renderable = window_can_render();
+        if (!window_renderable) {
+            camera_orbiting = false;
+            last_physics_time = SDL_GetTicks64();
+            SDL_Delay(16);
+            continue;
+        }
+
         SDL_LockSurface(fb);
         
         uint8_t* pixels = (uint8_t*)fb->pixels;       // raw pointer
         int pitch = fb->pitch;                        // bytes per row
 
         // Get current time and compute delta
-        static Uint64 last_physics_time = SDL_GetTicks64();
         Uint64 now = SDL_GetTicks64();
         float delta_time = (now - last_physics_time) / 1000.0f;
         last_physics_time = now;
@@ -2854,12 +2919,100 @@ int main() {
             shadow_matrix = build_shadow_tex_matrix(view_matrix, light_dir, shadow_scene_min, shadow_scene_max);
         }
         
-        // Sort instances front-to-back by Z position for better depth buffer efficiency
-        // Compute view-space Z for each instance - reuse pre-allocated buffer
+        // Sort instances front-to-back by Z position for better depth buffer efficiency.
+        // Also cheaply cull small balls hidden behind conservative inner spheres of
+        // large opaque occluders from the camera and spotlight views.
+        instance_depths.clear();
+        bool update_occlusion_flags = !paused || !instance_occlusion_flags_valid;
+        if (instance_occlusion_flags.size() != instances.size()) {
+            instance_occlusion_flags.resize(instances.size(), 0);
+            update_occlusion_flags = true;
+        }
+        if (update_occlusion_flags) {
+            std::fill(instance_occlusion_flags.begin(), instance_occlusion_flags.end(), 0);
+        }
+        auto point_occluded_by_sphere = [](const Vector3f& viewer, const Vector3f& p,
+                                           const Vector3f& occ, float occ_inner_radius,
+                                           float p_radius) {
+            Vector3f to_occ = occ - viewer;
+            float occ_dist2 = to_occ.squaredNorm();
+            if (occ_dist2 <= 0.000001f) return false;
+            Vector3f to_p = p - viewer;
+            float p_dist2 = to_p.squaredNorm();
+            if (p_dist2 <= occ_dist2) return false;
+            
+            float occ_dist = sqrtf(occ_dist2);
+            float p_dist = sqrtf(p_dist2);
+            float occ_half_angle = asinf(fminf(0.999f, occ_inner_radius / occ_dist));
+            float p_half_angle = asinf(fminf(0.999f, p_radius / p_dist));
+            float fully_occluded_angle = occ_half_angle - 2.0f * p_half_angle;
+            if (fully_occluded_angle <= 0.0f) return false;
+            float cos_limit = cosf(fully_occluded_angle);
+            float cos_to_center = to_occ.dot(to_p) * (1.0f / (occ_dist * p_dist));
+            return cos_to_center >= cos_limit;
+        };
+        auto directional_occluded_by_sphere = [](const Vector3f& light_axis, const Vector3f& p,
+                                                 const Vector3f& occ, float occ_inner_radius,
+                                                 float p_radius) {
+            Vector3f delta = p - occ;
+            float p_behind_occ = delta.dot(-light_axis);
+            if (p_behind_occ <= p_radius) return false;
+            float perp2 = delta.squaredNorm() - p_behind_occ * p_behind_occ;
+            float expanded_radius = occ_inner_radius + p_radius;
+            return perp2 <= expanded_radius * expanded_radius;
+        };
+        constexpr uint8_t OCCLUDED_CAMERA = 1;
+        constexpr uint8_t OCCLUDED_SHADOW = 2;
+        constexpr float cube_inner_occluder_radius = 1.0f;
+        float sphere_inner_occluder_radius = sphere_bound_radius;
+        
         for (size_t i = 0; i < instances.size(); i++) {
             Vector4f center_world(instances[i].tx, instances[i].ty, instances[i].tz, 1.0f);
             Vector4f center_view = view_matrix * center_world;
-            instance_depths[i] = {center_view.z(), i};
+            uint8_t occlusion_flags = instance_occlusion_flags[i];
+            if (update_occlusion_flags && instances[i].type == 4) {
+                occlusion_flags = 0;
+                Vector3f small_eye = center_view.head<3>();
+                for (const CubeInstance& occ_inst : instances) {
+                    float occ_inner_radius;
+                    if (occ_inst.type == 0) {
+                        occ_inner_radius = cube_inner_occluder_radius;
+                    } else if (occ_inst.type == 1) {
+                        occ_inner_radius = sphere_inner_occluder_radius;
+                    } else {
+                        continue;
+                    }
+                    Vector4f occ_world(occ_inst.tx, occ_inst.ty, occ_inst.tz, 1.0f);
+                    Vector3f occ_eye = (view_matrix * occ_world).head<3>();
+                    if ((occlusion_flags & OCCLUDED_CAMERA) == 0 &&
+                        point_occluded_by_sphere(Vector3f::Zero(), small_eye, occ_eye,
+                                                 occ_inner_radius, smallball_bound_radius)) {
+                        occlusion_flags |= OCCLUDED_CAMERA;
+                    }
+                    if ((occlusion_flags & OCCLUDED_SHADOW) == 0) {
+                        bool shadow_occluded = false;
+                        if (USE_SPOTLIGHT) {
+                            shadow_occluded = point_occluded_by_sphere(light_pos_eye, small_eye, occ_eye,
+                                                                       occ_inner_radius, smallball_bound_radius);
+                        } else {
+                            shadow_occluded = directional_occluded_by_sphere(light_dir, small_eye, occ_eye,
+                                                                             occ_inner_radius, smallball_bound_radius);
+                        }
+                        if (shadow_occluded) {
+                            occlusion_flags |= OCCLUDED_SHADOW;
+                        }
+                    }
+                    if ((occlusion_flags & (OCCLUDED_CAMERA | OCCLUDED_SHADOW)) ==
+                        (OCCLUDED_CAMERA | OCCLUDED_SHADOW)) {
+                        break;
+                    }
+                }
+                instance_occlusion_flags[i] = occlusion_flags;
+            }
+            instance_depths.push_back({center_view.z(), i});
+        }
+        if (update_occlusion_flags) {
+            instance_occlusion_flags_valid = true;
         }
         
         // Sort instances: Opaque (Front-to-Back), then Transparent (Back-to-Front)
@@ -2889,13 +3042,10 @@ int main() {
         int tl_buf_idx = frame_num % 2;       // Buffer we will FILL
         int raster_buf_idx = (frame_num + 1) % 2; // Buffer we will RASTERIZE (filled previous frame)
         
-        // 1. Wait for T&L Target Buffer to be FREE (Rasterizer finished with it)
-        // 'buffer_strips_complete == NUM_TILE_BINS' means it's fully rasterized and free
-        {
-            std::unique_lock<std::mutex> lock(mtx_main);
-            cv_main.wait(lock, [&]{ return buffer_strips_complete[tl_buf_idx].load() >= NUM_TILE_BINS; });
-        }
-        // 2. Setup T&L for Frame N - just reset counters, buffers are pre-allocated
+        // 1. Setup T&L for Frame N - just reset counters, buffers are pre-allocated.
+        // Raster jobs are joined before the next frame advances, so the alternating
+        // T&L target buffer is already free here. Waiting on a stale buffer flag can
+        // deadlock the main thread with all workers asleep.
         opaque_counter.store(0);
         trans_counter.store(0);
         shadow_counter.store(0);
@@ -2948,6 +3098,7 @@ int main() {
         tl_shared.screen_width = screen_width;
         tl_shared.screen_height = screen_height;
         tl_shared.format = fb->format;
+        tl_shared.instance_occlusion_flags = &instance_occlusion_flags;
         light_dir_buffers[tl_buf_idx] = light_dir;
         light_pos_buffers[tl_buf_idx] = light_pos_eye;
         spot_dir_buffers[tl_buf_idx] = spot_dir_eye;
@@ -3156,17 +3307,22 @@ int main() {
         size_t count_opaque = 0;
         size_t count_trans = 0;
         size_t count_shadow = 0;
+        size_t dropped_opaque = 0;
+        size_t dropped_trans = 0;
+        size_t dropped_shadow = 0;
         auto append_limited = [](std::vector<RenderTriangle>& dst, size_t& dst_count,
-                                 const std::vector<RenderTriangle>& src) {
+                                 const std::vector<RenderTriangle>& src, size_t& dropped_count) {
             size_t room = (dst_count < dst.size()) ? (dst.size() - dst_count) : 0;
             size_t write_count = std::min(room, src.size());
             for (size_t i = 0; i < write_count; i++) {
                 dst[dst_count + i] = src[i];
             }
             dst_count += write_count;
+            dropped_count += src.size() - write_count;
         };
         auto append_sorted_limited = [](std::vector<RenderTriangle>& dst, size_t& dst_count,
-                                        const std::vector<RenderTriangle>& src, auto less_than) {
+                                        const std::vector<RenderTriangle>& src, size_t& dropped_count,
+                                        auto less_than) {
             size_t room = (dst_count < dst.size()) ? (dst.size() - dst_count) : 0;
             size_t write_count = std::min(room, src.size());
             auto begin = dst.begin();
@@ -3178,6 +3334,7 @@ int main() {
             if (write_count > 0 && mid != begin) {
                 std::inplace_merge(begin, mid, begin + dst_count, less_than);
             }
+            dropped_count += src.size() - write_count;
         };
         auto append_bin = [](std::vector<RenderTriangle>& dst,
                              const std::vector<RenderTriangle>& src,
@@ -3198,16 +3355,16 @@ int main() {
         for (int tid = 0; tid < NUM_TL_THREADS; tid++) {
             const auto& out = tl_thread_outputs[tid];
             if (ENABLE_RGB_TRIANGLE_SORT) {
-                append_sorted_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque, front_to_back);
-                append_sorted_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans, back_to_front);
+                append_sorted_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque, dropped_opaque, front_to_back);
+                append_sorted_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans, dropped_trans, back_to_front);
             } else {
-                append_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque);
-                append_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans);
+                append_limited(opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque, dropped_opaque);
+                append_limited(trans_buffers[tl_buf_idx].triangles, count_trans, out.trans, dropped_trans);
             }
             if (ENABLE_SHADOW_TRIANGLE_SORT) {
-                append_sorted_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow, front_to_back);
+                append_sorted_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow, dropped_shadow, front_to_back);
             } else {
-                append_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow);
+                append_limited(shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow, dropped_shadow);
             }
             for (int s = 0; s < NUM_TILE_BINS; s++) {
                 auto& opaque_dst = opaque_strip_buffers[tl_buf_idx].bins[s];
@@ -3218,18 +3375,22 @@ int main() {
                 append_bin(shadow_dst, out.shadow_bins[s], ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
             }
         }
-        opaque_counter.store(count_opaque, std::memory_order_relaxed);
-        trans_counter.store(count_trans, std::memory_order_relaxed);
-        shadow_counter.store(count_shadow, std::memory_order_relaxed);
         
         // Finalize T&L Buffers and optional sort
         // Block T&L from racing ahead to next use of this buffer
         buffer_tl_ready[tl_buf_idx].store(false);
         
-        // Clamp to buffer size
-        if (count_opaque > 100000) count_opaque = 100000;
-        if (count_trans > 100000) count_trans = 100000;
-        if (count_shadow > 200000) count_shadow = 200000;
+        if (dropped_opaque || dropped_trans || dropped_shadow) {
+            static bool warned_triangle_overflow = false;
+            if (!warned_triangle_overflow) {
+                printf("Warning: dropped triangles: opaque=%zu trans=%zu shadow=%zu\n",
+                       dropped_opaque, dropped_trans, dropped_shadow);
+                warned_triangle_overflow = true;
+            }
+        }
+        opaque_counter.store(count_opaque, std::memory_order_relaxed);
+        trans_counter.store(count_trans, std::memory_order_relaxed);
+        shadow_counter.store(count_shadow, std::memory_order_relaxed);
         
         // Per-worker T&L outputs were sorted while private, then merged above in
         // worker-slice order. Avoid re-sorting the full global/tile streams here.
