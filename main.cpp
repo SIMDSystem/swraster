@@ -11,6 +11,9 @@
 #include <memory>
 #include <Eigen/Dense>
 #include "geometry.h"
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #include <limits.h>
@@ -121,6 +124,14 @@ constexpr bool DEBUG_DRAW_CAMERA_OCCLUDED_RED = false;
 constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
 constexpr int SHADOW_MAP_SIZE = 1024;
 constexpr float SHADOW_DEPTH_BIAS = 0.0025f;
+using ShadowDepth = uint16_t;
+constexpr ShadowDepth SHADOW_DEPTH_CLEAR = 0xffff;
+constexpr ShadowDepth SHADOW_DEPTH_BIAS_U16 = (ShadowDepth)(SHADOW_DEPTH_BIAS * 65535.0f + 1.0f);
+
+static inline ShadowDepth shadow_depth_to_u16(float z) {
+    z = fminf(1.0f, fmaxf(0.0f, z));
+    return (ShadowDepth)(z * 65535.0f + 0.5f);
+}
 
 // Physics layers
 struct PhysicsLayers {
@@ -416,7 +427,7 @@ static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* f
                                   (uint8_t)std::min(b, 255));
 }
 
-static inline float sample_shadow_compare_bilinear(const float* shadow_depth, int shadow_size,
+static inline float sample_shadow_compare_bilinear(const ShadowDepth* shadow_depth, int shadow_size,
                                                    float s, float t, float r) {
     if (!shadow_depth || shadow_size <= 0) return 1.0f;
     if (s < 0.0f || s > 1.0f || t < 0.0f || t > 1.0f || r < 0.0f || r > 1.0f) {
@@ -429,26 +440,104 @@ static inline float sample_shadow_compare_bilinear(const float* shadow_depth, in
     int y0 = (int)floorf(fy);
     float tx = fx - x0;
     float ty = fy - y0;
+    ShadowDepth r16 = shadow_depth_to_u16(r);
 
-    auto compare = [&](int x, int y) {
-        if (x < 0 || x >= shadow_size || y < 0 || y >= shadow_size) return 1.0f;
-        float fetched = shadow_depth[(size_t)y * shadow_size + x];
-        return (r <= fetched + SHADOW_DEPTH_BIAS) ? 1.0f : 0.0f;
-    };
-
-    float c00 = compare(x0, y0);
-    float c10 = compare(x0 + 1, y0);
-    float c01 = compare(x0, y0 + 1);
-    float c11 = compare(x0 + 1, y0 + 1);
+    float c00, c10, c01, c11;
+#if defined(__ARM_NEON)
+    if (x0 >= 0 && y0 >= 0 && x0 + 1 < shadow_size && y0 + 1 < shadow_size) {
+        uint16_t d[4] = {
+            shadow_depth[(size_t)y0 * shadow_size + x0],
+            shadow_depth[(size_t)y0 * shadow_size + x0 + 1],
+            shadow_depth[(size_t)(y0 + 1) * shadow_size + x0],
+            shadow_depth[(size_t)(y0 + 1) * shadow_size + x0 + 1]
+        };
+        uint16x4_t depths = vld1_u16(d);
+        uint16x4_t biased = vqadd_u16(depths, vdup_n_u16(SHADOW_DEPTH_BIAS_U16));
+        uint16x4_t visible = vcge_u16(biased, vdup_n_u16(r16));
+        uint16_t mask[4];
+        vst1_u16(mask, visible);
+        c00 = mask[0] ? 1.0f : 0.0f;
+        c10 = mask[1] ? 1.0f : 0.0f;
+        c01 = mask[2] ? 1.0f : 0.0f;
+        c11 = mask[3] ? 1.0f : 0.0f;
+    } else
+#endif
+    {
+        auto compare = [&](int x, int y) {
+            if (x < 0 || x >= shadow_size || y < 0 || y >= shadow_size) return 1.0f;
+            ShadowDepth fetched = shadow_depth[(size_t)y * shadow_size + x];
+            ShadowDepth biased = (ShadowDepth)std::min(0xffffu, (uint32_t)fetched + SHADOW_DEPTH_BIAS_U16);
+            return (r16 <= biased) ? 1.0f : 0.0f;
+        };
+        c00 = compare(x0, y0);
+        c10 = compare(x0 + 1, y0);
+        c01 = compare(x0, y0 + 1);
+        c11 = compare(x0 + 1, y0 + 1);
+    }
     float cx0 = c00 + (c10 - c00) * tx;
     float cx1 = c01 + (c11 - c01) * tx;
     return cx0 + (cx1 - cx0) * ty;
 }
 
-static inline float sample_shadow_compare_bilinear_2x2(const float* shadow_depth, int shadow_size,
+static inline float sample_shadow_compare_bilinear_2x2(const ShadowDepth* shadow_depth, int shadow_size,
                                                        float s, float t, float r) {
     if (!shadow_depth || shadow_size <= 0) return 1.0f;
     float texel = 1.0f / (float)(shadow_size - 1);
+#if defined(__ARM_NEON)
+    if (s >= texel && s <= 1.0f - 2.0f * texel &&
+        t >= texel && t <= 1.0f - 2.0f * texel &&
+        r >= 0.0f && r <= 1.0f) {
+        ShadowDepth r16 = shadow_depth_to_u16(r);
+        float visibility[16];
+        int idx = 0;
+        for (int oy = 0; oy <= 1; oy++) {
+            for (int ox = 0; ox <= 1; ox++) {
+                float ps = s + (ox - 0.5f) * texel;
+                float pt = t + (oy - 0.5f) * texel;
+                float fx = ps * (shadow_size - 1);
+                float fy = pt * (shadow_size - 1);
+                int x0 = (int)floorf(fx);
+                int y0 = (int)floorf(fy);
+                uint16_t d[4] = {
+                    shadow_depth[(size_t)y0 * shadow_size + x0],
+                    shadow_depth[(size_t)y0 * shadow_size + x0 + 1],
+                    shadow_depth[(size_t)(y0 + 1) * shadow_size + x0],
+                    shadow_depth[(size_t)(y0 + 1) * shadow_size + x0 + 1]
+                };
+                uint16x4_t depths = vld1_u16(d);
+                uint16x4_t biased = vqadd_u16(depths, vdup_n_u16(SHADOW_DEPTH_BIAS_U16));
+                uint16x4_t visible = vcge_u16(biased, vdup_n_u16(r16));
+                uint16_t mask[4];
+                vst1_u16(mask, visible);
+                visibility[idx++] = mask[0] ? 1.0f : 0.0f;
+                visibility[idx++] = mask[1] ? 1.0f : 0.0f;
+                visibility[idx++] = mask[2] ? 1.0f : 0.0f;
+                visibility[idx++] = mask[3] ? 1.0f : 0.0f;
+            }
+        }
+
+        idx = 0;
+        float sum = 0.0f;
+        for (int oy = 0; oy <= 1; oy++) {
+            for (int ox = 0; ox <= 1; ox++) {
+                float ps = s + (ox - 0.5f) * texel;
+                float pt = t + (oy - 0.5f) * texel;
+                float fx = ps * (shadow_size - 1);
+                float fy = pt * (shadow_size - 1);
+                float tx = fx - floorf(fx);
+                float ty = fy - floorf(fy);
+                float c00 = visibility[idx++];
+                float c10 = visibility[idx++];
+                float c01 = visibility[idx++];
+                float c11 = visibility[idx++];
+                float cx0 = c00 + (c10 - c00) * tx;
+                float cx1 = c01 + (c11 - c01) * tx;
+                sum += cx0 + (cx1 - cx0) * ty;
+            }
+        }
+        return sum * 0.25f;
+    }
+#endif
     float sum = 0.0f;
     for (int oy = 0; oy <= 1; oy++) {
         for (int ox = 0; ox <= 1; ox++) {
@@ -460,7 +549,7 @@ static inline float sample_shadow_compare_bilinear_2x2(const float* shadow_depth
     return sum * 0.25f;
 }
 
-static inline float sample_shadow_pcf(const float* shadow_depth, int shadow_size, const Vector4f& shadow) {
+static inline float sample_shadow_pcf(const ShadowDepth* shadow_depth, int shadow_size, const Vector4f& shadow) {
     if (!shadow_depth || shadow_size <= 0 || shadow.w() == 0.0f) return 1.0f;
     
     float inv_w = 1.0f / shadow.w();
@@ -905,7 +994,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                                   int x0, int y0, float z0, const Vector3f& p0_eye, float inv_w0,
                                   int x1, int y1, float z1, const Vector3f& p1_eye, float inv_w1,
                                   int w, int h, SDL_PixelFormat* format,
-                                  const float* shadow_depth, int shadow_size,
+                                  const ShadowDepth* shadow_depth, int shadow_size,
                                   const Vector3f& light_pos, const Vector3f& spot_dir,
                                   bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                   const Matrix4f& shadow_matrix) {
@@ -960,7 +1049,7 @@ struct ShadowVertex {
     float x, y, z;
 };
 
-void draw_shadow_triangle(float* shadow_depth, int shadow_size,
+void draw_shadow_triangle(ShadowDepth* shadow_depth, int shadow_size,
                           const ShadowVertex& v0, const ShadowVertex& v1, const ShadowVertex& v2) {
     int x_min = (int)floorf(fminf(v0.x, fminf(v1.x, v2.x)));
     int x_max = (int)ceilf(fmaxf(v0.x, fmaxf(v1.x, v2.x)));
@@ -988,14 +1077,15 @@ void draw_shadow_triangle(float* shadow_depth, int shadow_size,
     
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
-        float* row = shadow_depth + y * shadow_size;
+        ShadowDepth* row = shadow_depth + y * shadow_size;
         for (int x = x_min; x <= x_max; x++) {
             if (!((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0))) {
                 float aw0 = fabsf(w0), aw1 = fabsf(w1), aw2 = fabsf(w2);
                 float inv_sum = 1.0f / (aw0 + aw1 + aw2);
                 float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) * inv_sum;
-                if (z >= 0.0f && z <= 1.0f && z < row[x]) {
-                    row[x] = z;
+                ShadowDepth z16 = shadow_depth_to_u16(z);
+                if (z >= 0.0f && z <= 1.0f && z16 < row[x]) {
+                    row[x] = z16;
                 }
             }
             w0 += A0; w1 += A1; w2 += A2;
@@ -1004,7 +1094,7 @@ void draw_shadow_triangle(float* shadow_depth, int shadow_size,
     }
 }
 
-void draw_shadow_triangle_strip(float* shadow_depth, int shadow_size,
+void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
                                 const ShadowVertex& v0, const ShadowVertex& v1, const ShadowVertex& v2,
                                 int x_tile_min, int x_tile_max,
                                 int y_strip_min, int y_strip_max, int screendoor_mask) {
@@ -1040,14 +1130,15 @@ void draw_shadow_triangle_strip(float* shadow_depth, int shadow_size,
     
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
-        float* row = shadow_depth + y * shadow_size;
+        ShadowDepth* row = shadow_depth + y * shadow_size;
         for (int x = x_min; x <= x_max; x++) {
             if (!((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0))) {
                 int mask_bit = ((y & 3) << 2) | (x & 3);
                 if (screendoor_mask < 0 || (masks[screendoor_mask & 7] & (1u << mask_bit))) {
                     float aw0 = fabsf(w0), aw1 = fabsf(w1), aw2 = fabsf(w2);
                     float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / (aw0 + aw1 + aw2);
-                    if (z >= 0.0f && z <= 1.0f && z < row[x]) row[x] = z;
+                    ShadowDepth z16 = shadow_depth_to_u16(z);
+                    if (z >= 0.0f && z <= 1.0f && z16 < row[x]) row[x] = z16;
                 }
             }
             w0 += A0; w1 += A1; w2 += A2;
@@ -1065,7 +1156,7 @@ static inline bool shadow_vertex_from_varying(const VertexVaryings& v, ShadowVer
     return true;
 }
 
-void draw_shadow_line(float* shadow_depth, int shadow_size,
+void draw_shadow_line(ShadowDepth* shadow_depth, int shadow_size,
                       const ShadowVertex& v0, const ShadowVertex& v1) {
     int x0 = (int)(v0.x + 0.5f), y0 = (int)(v0.y + 0.5f);
     int x1 = (int)(v1.x + 0.5f), y1 = (int)(v1.y + 0.5f);
@@ -1078,8 +1169,9 @@ void draw_shadow_line(float* shadow_depth, int shadow_size,
     
     while (true) {
         if (x0 >= 0 && x0 < shadow_size && y0 >= 0 && y0 < shadow_size && z >= 0.0f && z <= 1.0f) {
-            float& dst = shadow_depth[y0 * shadow_size + x0];
-            if (z < dst) dst = z;
+            ShadowDepth& dst = shadow_depth[y0 * shadow_size + x0];
+            ShadowDepth z16 = shadow_depth_to_u16(z);
+            if (z16 < dst) dst = z16;
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -1089,7 +1181,7 @@ void draw_shadow_line(float* shadow_depth, int shadow_size,
     }
 }
 
-void draw_shadow_line_strip(float* shadow_depth, int shadow_size,
+void draw_shadow_line_strip(ShadowDepth* shadow_depth, int shadow_size,
                             const ShadowVertex& v0, const ShadowVertex& v1,
                             int x_tile_min, int x_tile_max,
                             int y_strip_min, int y_strip_max) {
@@ -1106,8 +1198,9 @@ void draw_shadow_line_strip(float* shadow_depth, int shadow_size,
         if (x0 >= x_tile_min && x0 <= x_tile_max &&
             x0 >= 0 && x0 < shadow_size && y0 >= y_strip_min && y0 <= y_strip_max &&
             y0 >= 0 && y0 < shadow_size && z >= 0.0f && z <= 1.0f) {
-            float& dst = shadow_depth[y0 * shadow_size + x0];
-            if (z < dst) dst = z;
+            ShadowDepth& dst = shadow_depth[y0 * shadow_size + x0];
+            ShadowDepth z16 = shadow_depth_to_u16(z);
+            if (z16 < dst) dst = z16;
         }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
@@ -1123,7 +1216,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                                       VertexVaryings v0, VertexVaryings v1, VertexVaryings v2, SDL_PixelFormat* format, const PackedTexture* texture,
                                       const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
                                       bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
-                                      const float* shadow_depth, int shadow_size,
+                                      const ShadowDepth* shadow_depth, int shadow_size,
                                       int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max, bool depth_write,
                                       TriangleShader shader = TriangleShader::Lit,
                                       const RasterTriangleSetup* precomputed_setup = nullptr) {
@@ -2285,8 +2378,8 @@ int main() {
         bool use_spotlight;
         float spot_inner_cos;
         float spot_outer_cos;
-        const float* shadow_depth;
-        float* shadow_depth_write;
+        const ShadowDepth* shadow_depth;
+        ShadowDepth* shadow_depth_write;
         int shadow_size;
         const ShadowBoxBuffer* shadow_box;
         bool depth_write_enabled;
@@ -2765,7 +2858,7 @@ int main() {
                 if (job_mode == RasterJobMode::ShadowDepth) {
                     for (int y = y_min; y <= y_max; y++) {
                         std::fill(rs.shadow_depth_write + y * rs.shadow_size + x_min,
-                                  rs.shadow_depth_write + y * rs.shadow_size + x_max + 1, 1.0f);
+                                  rs.shadow_depth_write + y * rs.shadow_size + x_max + 1, SHADOW_DEPTH_CLEAR);
                     }
                     
                     auto draw_shadow_tri = [&](const RenderTriangle& tri) {
@@ -2907,7 +3000,7 @@ int main() {
     int screen_width = fb->w;
     int screen_height = fb->h;
     std::vector<float> depth_buffer(screen_width * screen_height);
-    std::vector<float> shadow_depth_buffers[2];
+    std::vector<ShadowDepth> shadow_depth_buffers[2];
     shadow_depth_buffers[0].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     shadow_depth_buffers[1].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     

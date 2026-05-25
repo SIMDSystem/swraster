@@ -79,6 +79,7 @@ $(APP_NAME): $(TARGET) Info.plist icon.icns baboon.bmp lenna.bmp tiles.bmp
 		exit 1; \
 	fi
 	@echo "APPL????" > $(APP_NAME)/Contents/PkgInfo
+	@codesign --force --deep --sign - $(APP_NAME) >/dev/null 2>&1
 
 app: $(APP_NAME)
 
