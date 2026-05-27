@@ -16,6 +16,7 @@
 #include "cull.h"
 #include "shadow.h"
 #include "draw.h"
+#include "thread_profiler.h"
 
 using namespace Eigen;
 
@@ -53,6 +54,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
                 continue;
             }
         }
+        Uint64 work_start_ts = Platform::PerfCounter();
 
         // Clear local buffers (re-uses capacity).
         local_opaque.clear();
@@ -412,6 +414,8 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
                           [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
             }
         }
+
+        profiler_record_tl(*ctx.profiler, thread_id, work_start_ts, Platform::PerfCounter());
 
         // Signal completion. The last worker through the gate triggers the
         // deferred physics step, then notifies main.

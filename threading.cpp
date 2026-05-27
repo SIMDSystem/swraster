@@ -29,9 +29,8 @@ std::mutex              mtx_main;
 std::condition_variable cv_main;
 
 std::atomic<int> tl_done_counter{0};
-std::atomic<int> raster_strips_done{0};
 std::atomic<int> raster_workers_done{0};
-std::atomic<int> next_strip_ticket{0};
+std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS] = {};
 
 // ---- Thread-count config (definitions; declared extern in render_config.h) ----
 int NUM_TL_THREADS;

@@ -13,6 +13,7 @@
 
 #include "platform.h"
 #include "threading.h" // perf_ms, process_cpu_ms
+#include "thread_profiler.h"
 
 using namespace JPH;
 
@@ -194,8 +195,12 @@ void physics_worker_thread(PhysicsPipeline& pp) {
             pp.next_snapshot = (pp.next_snapshot + 1) % 3;
         }
 
+        Uint64 work_start_ts = Platform::PerfCounter();
         physics_step_to_snapshot(pp, delta_time, target_time, sequence,
                                  pp.pose_snapshots[snapshot_idx]);
+        if (pp.profiler) {
+            profiler_record_physics(*pp.profiler, work_start_ts, Platform::PerfCounter());
+        }
 
         {
             std::lock_guard<std::mutex> lock(pp.pose_mtx);

@@ -26,6 +26,7 @@
 #include "clip.h"
 #include "shadow.h"
 #include "draw.h"
+#include "thread_profiler.h"
 
 using namespace Eigen;
 using namespace JPH;
@@ -90,8 +91,9 @@ static void reset_animation(RendererContext& ctx,
     }
     tl_done_counter.store(0, std::memory_order_relaxed);
     raster_workers_done.store(0, std::memory_order_relaxed);
-    raster_strips_done.store(0, std::memory_order_relaxed);
-    next_strip_ticket.store(0, std::memory_order_relaxed);
+    for (int r = 0; r < NUM_STRIPS; r++) {
+        raster_row_next_col[r].store(0, std::memory_order_relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +237,10 @@ static void run_raster_job(RendererContext& ctx,
     int expected_raster_workers = NUM_RASTER_THREADS;
     {
         std::lock_guard<std::mutex> lock(mtx_raster);
-        next_strip_ticket   .store(0, std::memory_order_relaxed);
-        raster_strips_done  .store(0, std::memory_order_relaxed);
-        raster_workers_done .store(0, std::memory_order_relaxed);
+        for (int r = 0; r < NUM_STRIPS; r++) {
+            raster_row_next_col[r].store(0, std::memory_order_relaxed);
+        }
+        raster_workers_done.store(0, std::memory_order_relaxed);
         active_raster_buf_id           = buf_idx;
         active_raster_job              = job_mode;
         active_raster_job_thread_count = expected_raster_workers;
@@ -387,6 +390,16 @@ void run_render_loop(RendererContext& ctx) {
 
     ctx.fps_counter->start(Platform::TicksMs());
 
+    // Seed the profiler's swap history so the first frame's overlay has
+    // a sane left anchor before any Platform::Present() has returned.
+    {
+        Uint64 now_ts = Platform::PerfCounter();
+        ctx.profiler->present_history[0].start_ts = now_ts;
+        ctx.profiler->present_history[0].end_ts   = now_ts;
+        ctx.profiler->present_history[1].start_ts = now_ts;
+        ctx.profiler->present_history[1].end_ts   = now_ts;
+    }
+
     if (tp.enabled) {
         reset_animation(ctx, sim_time, frame_num, last_physics_time);
         tp.search_start_ticks  = Platform::TicksMs();
@@ -409,6 +422,10 @@ void run_render_loop(RendererContext& ctx) {
                     break;
                 case Platform::Event::KeyDown:
                     if (event.key == ' ') paused = !paused;
+                    if (event.key == 'p' || event.key == 'P') {
+                        bool was = ctx.profiler->enabled.load(std::memory_order_relaxed);
+                        ctx.profiler->enabled.store(!was, std::memory_order_relaxed);
+                    }
                     break;
                 case Platform::Event::MouseButton:
                     if (event.button == 1) camera_orbiting = event.pressed;
@@ -752,6 +769,26 @@ void run_render_loop(RendererContext& ctx) {
             rs.depth_write_enabled     = true;
         }
 
+        // Mirror pause into the profiler so the live snapshot freezes on pause.
+        // The intervals still in the per-worker vectors at this point belong
+        // to the *previous* frame (because begin_frame is about to be called
+        // but is a no-op while frozen). The blit window that brackets the
+        // start of that frame's work is present_history[1]; the orange
+        // draw-end marker is the start of present_history[0] (since the
+        // current Present() happens immediately after the orange capture).
+        {
+            ThreadProfiler& prof = *ctx.profiler;
+            bool was_frozen = prof.frozen.load(std::memory_order_relaxed);
+            if (paused && !was_frozen) {
+                prof.frozen_blit_start_ts = prof.present_history[1].start_ts;
+                prof.frozen_blit_end_ts   = prof.present_history[1].end_ts;
+                prof.frozen_draw_end_ts   = prof.present_history[0].start_ts;
+            }
+            prof.frozen.store(paused, std::memory_order_relaxed);
+        }
+        // Clear last frame's per-worker profiler logs (safe: workers asleep).
+        thread_profiler_begin_frame(*ctx.profiler);
+
         // Kick T&L for frame N.
         {
             std::lock_guard<std::mutex> lock(mtx_tl);
@@ -841,7 +878,27 @@ void run_render_loop(RendererContext& ctx) {
         // FPS counter in the top-right corner (safe now: raster is fully drained).
         ctx.fps_counter->draw(pixels, pitch, fb->w, fb->format);
 
+        // Concurrency timeline overlay (toggle with 'P'). The orange line
+        // it paints sits exactly at draw_end_ts (captured here, just
+        // before drawing the overlay itself).
+        Uint64 draw_end_ts = Platform::PerfCounter();
+        thread_profiler_draw(*ctx.profiler, pixels, pitch,
+                             ctx.screen_width, ctx.screen_height, fb->format,
+                             draw_end_ts);
+
+        // Bracket the blit so the profiler can show both its start and
+        // end as two purple lines on the next frame's overlay.
+        Uint64 present_start_ts = Platform::PerfCounter();
         Platform::Present();
+        Uint64 present_end_ts   = Platform::PerfCounter();
+        {
+            ThreadProfiler& prof = *ctx.profiler;
+            if (!prof.frozen.load(std::memory_order_relaxed)) {
+                prof.present_history[1] = prof.present_history[0];
+                prof.present_history[0].start_ts = present_start_ts;
+                prof.present_history[0].end_ts   = present_end_ts;
+            }
+        }
 #ifdef __EMSCRIPTEN__
         if (frame_num <= 3 || (frame_num % 60) == 0) {
             printf("frame %d presented (fps=%d, sim_t=%.2f)\n",

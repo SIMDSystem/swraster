@@ -24,6 +24,7 @@
 #include "fps.h"
 
 struct PhysicsPipeline;
+struct ThreadProfiler;
 
 struct RendererContext {
     // ----- Window / framebuffer -----
@@ -100,4 +101,5 @@ struct RendererContext {
     PhysicsPipeline*  physics      = nullptr;
     ThreadPerfSearch* thread_perf  = nullptr;
     FpsCounter*       fps_counter  = nullptr;
+    ThreadProfiler*   profiler     = nullptr;
 };

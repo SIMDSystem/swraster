@@ -10,25 +10,16 @@
 #include "render_buffers.h"
 #include "shadow.h"
 #include "draw.h"
+#include "thread_profiler.h"
 
+// Each persistent raster thread sleeps on cv_raster until main publishes
+// a new job (shadow depth / color / SSAO / luminaire). Workers are
+// row-sticky: each starts on a row chosen by its thread id, drains the
+// row column-by-column via a per-row atomic claim counter, and only
+// advances to a new row when its current row is exhausted. This keeps
+// each core's L1/L2 hot on the same set of scanlines across the four
+// raster passes. Workers count down raster_workers_done when they exit.
 void raster_worker_main(int thread_id, RendererContext& ctx) {
-    // Column-major tile order: process odd columns first then even columns,
-    // strip-minor within each column. Spreads memory pages of the per-tile
-    // bins across threads and avoids cache-line ping-pong on the framebuffer.
-    static const std::vector<int> tile_order = [] {
-        std::vector<int> v;
-        v.reserve(NUM_TILE_BINS);
-        for (int c = 1; c < TILE_X_SPLITS; c += 2) {
-            for (int i = 0; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
-            for (int i = 1; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
-        }
-        for (int c = 0; c < TILE_X_SPLITS; c += 2) {
-            for (int i = 0; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
-            for (int i = 1; i < NUM_STRIPS; i += 2) v.push_back(c * NUM_STRIPS + i);
-        }
-        return v;
-    }();
-
     int last_frame_processed = 0;
 
     while (raster_threads_running.load()) {
@@ -50,19 +41,30 @@ void raster_worker_main(int thread_id, RendererContext& ctx) {
             last_frame_processed  = current_frame;
             if (thread_id >= active_raster_threads) continue;
         }
+        Uint64 work_start_ts = Platform::PerfCounter();
 
         auto& rs = ctx.raster_shared[buf_id];
 
-        // Dynamic strip assignment - each worker grabs unique tile tickets
-        // under a strong acq_rel order so the resulting tile_idx is fully
-        // serialised with the per-tile reads/writes that follow.
+        // Row-sticky dynamic tile assignment. Each worker starts on a row
+        // chosen by its thread id (spread across all NUM_STRIPS rows) and
+        // drains that row's columns left-to-right via a per-row fetch_add.
+        // When its current row is exhausted it advances to the next row;
+        // termination is detected by scanning all rows without finding a
+        // claim. The sticky-row behaviour keeps each core's L1/L2 hot on
+        // the same set of framebuffer scanlines across consecutive tiles.
+        int current_row = thread_id % NUM_STRIPS;
+        int rows_scanned = 0;
         while (true) {
-            int ticket = next_strip_ticket.fetch_add(1, std::memory_order_acq_rel);
-            if (ticket >= NUM_TILE_BINS) break;
-
-            int tile_idx  = tile_order[ticket];
-            int tile_col  = tile_idx / NUM_STRIPS;
-            int strip_idx = tile_idx % NUM_STRIPS;
+            int tile_col = raster_row_next_col[current_row].fetch_add(1, std::memory_order_acq_rel);
+            if (tile_col >= TILE_X_SPLITS) {
+                // Row exhausted; advance and try the next one.
+                current_row = (current_row + 1) % NUM_STRIPS;
+                if (++rows_scanned >= NUM_STRIPS) break;
+                continue;
+            }
+            rows_scanned = 0;
+            int strip_idx = current_row;
+            int tile_idx  = tile_col * NUM_STRIPS + strip_idx;
 
             int h = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_height;
             int w = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_width;
@@ -184,8 +186,10 @@ void raster_worker_main(int thread_id, RendererContext& ctx) {
                 }
             }
 
-            raster_strips_done.fetch_add(1, std::memory_order_relaxed);
         }
+
+        profiler_record_raster(*ctx.profiler, thread_id, work_start_ts, Platform::PerfCounter(),
+                               (uint8_t)job_mode);
 
         if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= active_raster_threads) {
             // See matching comment in tl_worker_main: empty critical section

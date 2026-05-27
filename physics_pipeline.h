@@ -30,6 +30,8 @@ class JobSystem;
 class TempAllocator;
 }
 
+struct ThreadProfiler;
+
 struct PhysicsPipeline {
     // Borrowed references (set by main after construction).
     JPH::PhysicsSystem*           system         = nullptr;
@@ -38,6 +40,7 @@ struct PhysicsPipeline {
     JPH::JobSystem*               job_system     = nullptr;
     std::vector<CubeInstance>*    instances      = nullptr;
     const std::vector<WallData>*  walls          = nullptr;
+    ThreadProfiler*               profiler       = nullptr;
 
     // Pose triple buffer + publication.
     PoseSnapshot          pose_snapshots[3];

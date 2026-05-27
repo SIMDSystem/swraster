@@ -84,9 +84,18 @@
       }, { passive: false });
       window.addEventListener('keydown', function(e) {
         if (e.repeat) return;
+        if (!Module || !Module._swr_push_key) return;
         if (e.code === 'Space') {
           e.preventDefault();
-          if (Module && Module._swr_push_key) Module._swr_push_key(32);
+          Module._swr_push_key(32);
+          return;
+        }
+        // Forward printable letters as their lowercase ASCII code.
+        if (e.key && e.key.length === 1) {
+          var c = e.key.toLowerCase().charCodeAt(0);
+          if (c >= 97 && c <= 122) {
+            Module._swr_push_key(c);
+          }
         }
       });
       document.addEventListener('visibilitychange', function() {

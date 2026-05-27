@@ -57,6 +57,7 @@
 #include "renderer_context.h"
 #include "scene.h"
 #include "fps.h"
+#include "thread_profiler.h"
 #include "tl_worker.h"
 #include "raster_worker.h"
 #include "render_loop.h"
@@ -219,6 +220,9 @@ int main(int argc, char** argv) {
         write_instance_pose_snapshot(snapshot, instances, 0.0f, 0);
     }
 
+    ThreadProfiler profiler;
+    physics.profiler = &profiler;
+
     // ----- 7. IPC double-buffers and per-frame staging ring -----
     TriangleBuffer       opaque_buffers[2];
     TriangleBuffer       trans_buffers[2];
@@ -331,6 +335,9 @@ int main(int argc, char** argv) {
     ctx.physics      = &physics;
     ctx.thread_perf  = &thread_perf;
     ctx.fps_counter  = &fps_counter;
+    ctx.profiler     = &profiler;
+
+    thread_profiler_init(profiler, launched_tl_threads, launched_raster_threads);
 
     // ----- 9. Spawn workers -----
     std::vector<std::thread> tl_workers;

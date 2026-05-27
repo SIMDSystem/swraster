@@ -49,9 +49,17 @@ extern std::mutex             mtx_main;
 extern std::condition_variable cv_main;
 
 extern std::atomic<int> tl_done_counter;
-extern std::atomic<int> raster_strips_done;   // strips completed in the current raster job
 extern std::atomic<int> raster_workers_done;  // workers fully out of the current raster job
-extern std::atomic<int> next_strip_ticket;    // dynamic strip assignment (acq_rel)
+
+// Per-row dynamic claim counters. Each row's counter walks 0..TILE_X_SPLITS;
+// when it reaches TILE_X_SPLITS the row is exhausted. Workers stay sticky on
+// a row until it's drained, then advance, so each core keeps the same set of
+// framebuffer + depth-buffer + shadow-map scanlines hot in L1/L2 across the
+// per-frame shadow / color / SSAO / luminaire passes. Sized to a fixed upper
+// bound so we don't pay a heap allocation. The renderer resets these to zero
+// inside mtx_raster before each raster job is published.
+constexpr int MAX_RASTER_STRIPS = 32;
+extern std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS];
 
 // Wait for a predicate that worker threads will eventually set true. On native
 // we use a plain condition variable. On Emscripten's PROXY_TO_PTHREAD build,

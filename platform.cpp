@@ -221,10 +221,15 @@ bool PollEvent(Event& out) {
     switch (e.type) {
         case SDL_QUIT: out.type = Event::Quit; return true;
         case SDL_KEYDOWN:
-            if (!e.key.repeat && e.key.keysym.sym == SDLK_SPACE) {
-                out.type = Event::KeyDown;
-                out.key  = ' ';
-                return true;
+            if (!e.key.repeat) {
+                int sym = e.key.keysym.sym;
+                // Forward space and printable ASCII letters as their lowercase
+                // character. The renderer's input handler is case-insensitive.
+                if (sym == SDLK_SPACE || (sym >= SDLK_a && sym <= SDLK_z)) {
+                    out.type = Event::KeyDown;
+                    out.key  = sym;
+                    return true;
+                }
             }
             return PollEvent(out);
         case SDL_MOUSEBUTTONDOWN:
