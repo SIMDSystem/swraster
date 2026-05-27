@@ -1,0 +1,682 @@
+#include "draw.h"
+
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <algorithm>
+
+#include "pixel.h"
+#include "shadow.h"
+
+using namespace Eigen;
+
+RasterTriangleSetup build_raster_triangle_setup(const VertexVaryings& v0,
+                                                const VertexVaryings& v1,
+                                                const VertexVaryings& v2,
+                                                int screen_width, int screen_height) {
+    RasterTriangleSetup setup;
+    setup.x_min = (int)fminf(v0.x, fminf(v1.x, v2.x));
+    setup.x_max = (int)fmaxf(v0.x, fmaxf(v1.x, v2.x));
+    setup.y_min = (int)fminf(v0.y, fminf(v1.y, v2.y));
+    setup.y_max = (int)fmaxf(v0.y, fmaxf(v1.y, v2.y));
+
+    if (setup.x_min < 0) setup.x_min = 0;
+    if (setup.x_max >= screen_width)  setup.x_max = screen_width - 1;
+    if (setup.y_min < 0) setup.y_min = 0;
+    if (setup.y_max >= screen_height) setup.y_max = screen_height - 1;
+    if (setup.x_min > setup.x_max || setup.y_min > setup.y_max) return setup;
+
+    setup.area = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
+    if (fabsf(setup.area) < 0.0001f) return setup;
+
+    setup.A0 = v2.y - v1.y; setup.B0 = v1.x - v2.x;
+    setup.A1 = v0.y - v2.y; setup.B1 = v2.x - v0.x;
+    setup.A2 = v1.y - v0.y; setup.B2 = v0.x - v1.x;
+
+    setup.u0_w  = v0.u  * v0.inv_w; setup.u1_w  = v1.u  * v1.inv_w; setup.u2_w  = v2.u  * v2.inv_w;
+    setup.v0_w  = v0.v  * v0.inv_w; setup.v1_w  = v1.v  * v1.inv_w; setup.v2_w  = v2.v  * v2.inv_w;
+    setup.nx0_w = v0.nx * v0.inv_w; setup.nx1_w = v1.nx * v1.inv_w; setup.nx2_w = v2.nx * v2.inv_w;
+    setup.ny0_w = v0.ny * v0.inv_w; setup.ny1_w = v1.ny * v1.inv_w; setup.ny2_w = v2.ny * v2.inv_w;
+    setup.nz0_w = v0.nz * v0.inv_w; setup.nz1_w = v1.nz * v1.inv_w; setup.nz2_w = v2.nz * v2.inv_w;
+    setup.ex0_w = v0.ex * v0.inv_w; setup.ex1_w = v1.ex * v1.inv_w; setup.ex2_w = v2.ex * v2.inv_w;
+    setup.ey0_w = v0.ey * v0.inv_w; setup.ey1_w = v1.ey * v1.inv_w; setup.ey2_w = v2.ey * v2.inv_w;
+    setup.ez0_w = v0.ez * v0.inv_w; setup.ez1_w = v1.ez * v1.inv_w; setup.ez2_w = v2.ez * v2.inv_w;
+    setup.ss0_w = v0.ss * v0.inv_w; setup.ss1_w = v1.ss * v1.inv_w; setup.ss2_w = v2.ss * v2.inv_w;
+    setup.st0_w = v0.st * v0.inv_w; setup.st1_w = v1.st * v1.inv_w; setup.st2_w = v2.st * v2.inv_w;
+    setup.sr0_w = v0.sr * v0.inv_w; setup.sr1_w = v1.sr * v1.inv_w; setup.sr2_w = v2.sr * v2.inv_w;
+    setup.sq0_w = v0.sq * v0.inv_w; setup.sq1_w = v1.sq * v1.inv_w; setup.sq2_w = v2.sq * v2.inv_w;
+
+    float invw_min      = fminf(v0.inv_w, fminf(v1.inv_w, v2.inv_w));
+    float invw_max      = fmaxf(v0.inv_w, fmaxf(v1.inv_w, v2.inv_w));
+    float invw_rel_span = (invw_max - invw_min) / fmaxf(invw_max, 0.000001f);
+    float screen_extent = fmaxf((float)(setup.x_max - setup.x_min), (float)(setup.y_max - setup.y_min));
+    setup.perspective_correct_normals = (invw_rel_span * screen_extent) > NORMAL_PERSPECTIVE_THRESHOLD;
+    setup.valid = true;
+    return setup;
+}
+
+void draw_pixel(uint8_t* pixels, int pitch, int x, int y, uint32_t color, int w, int h) {
+    if (x < 0 || x >= w || y < 0 || y >= h) return;
+    uint32_t* row = (uint32_t*)((uint8_t*)pixels + (y * pitch));
+    row[x] = color;
+}
+
+void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
+                     int x0, int y0, float z0, int x1, int y1, float z1,
+                     uint32_t color, int w, int h) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+    int steps = std::max(abs(x1 - x0), abs(y1 - y0));
+    float z = z0, dz = (steps > 0) ? (z1 - z0) / steps : 0;
+    while (true) {
+        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+            int idx = y0 * w + x0;
+            if (z < depth_buffer[idx]) {
+                draw_pixel(pixels, pitch, x0, y0, color, w, h);
+                depth_buffer[idx] = z;
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+        z += dz;
+    }
+}
+
+void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
+                                  int x0, int y0, float z0, const Vector3f& p0_eye, float inv_w0,
+                                  int x1, int y1, float z1, const Vector3f& p1_eye, float inv_w1,
+                                  int w, int h, SDL_PixelFormat* format,
+                                  const ShadowDepth* shadow_depth, int shadow_size,
+                                  const Vector3f& light_pos, const Vector3f& spot_dir,
+                                  bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
+                                  const Matrix4f& shadow_matrix) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy, e2;
+    int steps = std::max(abs(x1 - x0), abs(y1 - y0));
+    float z  = z0;
+    float dz = (steps > 0) ? (z1 - z0) / steps : 0.0f;
+    float inv_steps = (steps > 0) ? (1.0f / steps) : 0.0f;
+    int step = 0;
+
+    while (true) {
+        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
+            size_t idx = (size_t)y0 * w + x0;
+            if (z < depth_buffer[idx]) {
+                float t      = step * inv_steps;
+                float a      = 1.0f - t;
+                float inv_w  = inv_w0 * a + inv_w1 * t;
+                Vector3f p_eye = (p0_eye * inv_w0 * a + p1_eye * inv_w1 * t) / inv_w;
+                float visibility = sample_shadow_pcf(shadow_depth, shadow_size,
+                                                     shadow_matrix * Vector4f(p_eye.x(), p_eye.y(), p_eye.z(), 1.0f));
+                float direct = 0.8f;
+                if (use_spotlight) {
+                    Vector3f L = light_pos - p_eye;
+                    float l_len2 = L.squaredNorm();
+                    if (l_len2 > 0.000001f) {
+                        L *= 1.0f / sqrtf(l_len2);
+                        float cone_cos = (-L).dot(spot_dir);
+                        float cone = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) /
+                                                       (spot_inner_cos - spot_outer_cos)));
+                        direct *= cone * (3.5f / (1.0f + 0.004f * l_len2));
+                    } else {
+                        direct = 0.0f;
+                    }
+                }
+                float illum = fminf(1.0f, 0.35f + direct * visibility);
+                Pixel32* row_pixels = (Pixel32*)(pixels + y0 * pitch);
+                row_pixels[x0] = pack_rgb_fast(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
+                depth_buffer[idx] = z;
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+        z += dz;
+        step++;
+    }
+}
+
+void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
+                              int screen_width, int screen_height, SDL_PixelFormat* format,
+                              const Matrix4f& projection, const Vector3f& light_pos) {
+    float lx, ly, lz;
+    if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
+
+    // Depth-tested additive Gaussian lamp disk.
+    const float disk_radius = 14.0f;
+    int x_min = std::max(0, (int)floorf(lx - disk_radius));
+    int x_max = std::min(screen_width  - 1, (int)ceilf(lx + disk_radius));
+    int y_min = std::max(0, (int)floorf(ly - disk_radius));
+    int y_max = std::min(screen_height - 1, (int)ceilf(ly + disk_radius));
+    float inv_sigma2 = 1.0f / (disk_radius * disk_radius * 0.35f);
+    for (int y = y_min; y <= y_max; y++) {
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
+        float dy = (float)y + 0.5f - ly;
+        for (int x = x_min; x <= x_max; x++) {
+            size_t idx = (size_t)y * screen_width + x;
+            if (lz > depth_buffer[idx] + 0.002f) continue;
+            float dx = (float)x + 0.5f - lx;
+            float d2 = dx * dx + dy * dy;
+            if (d2 > disk_radius * disk_radius) continue;
+            float a = expf(-d2 * inv_sigma2);
+            add_pixel_rgb(row_pixels, x, format, 255.0f * a, 255.0f * a, 255.0f * a);
+        }
+    }
+}
+
+// Strip-clipped barycentric rasterizer with optional Phong shading and PCF shadows.
+// This is the renderer's main pixel shader; it's kept in one flat function
+// so the inner loop stays predictable to the optimizer.
+void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                                     int screen_width, int screen_height,
+                                     VertexVaryings v0, VertexVaryings v1, VertexVaryings v2,
+                                     SDL_PixelFormat* format, const PackedTexture* texture,
+                                     const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
+                                     bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
+                                     const ShadowDepth* shadow_depth, int shadow_size,
+                                     int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max, bool depth_write,
+                                     TriangleShader shader,
+                                     const RasterTriangleSetup* precomputed_setup) {
+    RasterTriangleSetup fallback_setup;
+    const RasterTriangleSetup* setup = precomputed_setup;
+    if (!setup || !setup->valid) {
+        fallback_setup = build_raster_triangle_setup(v0, v1, v2, screen_width, screen_height);
+        setup = &fallback_setup;
+    }
+    if (!setup->valid) return;
+
+    int x_min = setup->x_min;
+    int x_max = setup->x_max;
+    int y_min = setup->y_min;
+    int y_max = setup->y_max;
+
+    if (x_min < 0) x_min = 0;
+    if (x_max >= screen_width)  x_max = screen_width  - 1;
+    if (x_min < x_tile_min)     x_min = x_tile_min;
+    if (x_max > x_tile_max)     x_max = x_tile_max;
+    if (y_min < y_strip_min)    y_min = y_strip_min;
+    if (y_max > y_strip_max)    y_max = y_strip_max;
+
+    if (y_min > y_max || x_min > x_max) return;
+
+    // Edge function incremental coefficients
+    // w0 corresponds to edge v1->v2, w1 to v2->v0, w2 to v0->v1
+    // A = dw/dx (per x-step), B = dw/dy (per y-step)
+    float A0 = setup->A0, B0 = setup->B0;
+    float A1 = setup->A1, B1 = setup->B1;
+    float A2 = setup->A2, B2 = setup->B2;
+
+    float px0 = (float)x_min + 0.5f;
+    float py0 = (float)y_min + 0.5f;
+    float w0_row = A0 * (px0 - v2.x) + B0 * (py0 - v2.y);
+    float w1_row = A1 * (px0 - v0.x) + B1 * (py0 - v0.y);
+    float w2_row = A2 * (px0 - v1.x) + B2 * (py0 - v1.y);
+
+    // Per-vertex attributes pre-multiplied by 1/w for perspective-correct interpolation.
+    float u0_w  = setup->u0_w,  u1_w  = setup->u1_w,  u2_w  = setup->u2_w;
+    float v0_w  = setup->v0_w,  v1_w  = setup->v1_w,  v2_w  = setup->v2_w;
+    float nx0_w = setup->nx0_w, nx1_w = setup->nx1_w, nx2_w = setup->nx2_w;
+    float ny0_w = setup->ny0_w, ny1_w = setup->ny1_w, ny2_w = setup->ny2_w;
+    float nz0_w = setup->nz0_w, nz1_w = setup->nz1_w, nz2_w = setup->nz2_w;
+    float ex0_w = setup->ex0_w, ex1_w = setup->ex1_w, ex2_w = setup->ex2_w;
+    float ey0_w = setup->ey0_w, ey1_w = setup->ey1_w, ey2_w = setup->ey2_w;
+    float ez0_w = setup->ez0_w, ez1_w = setup->ez1_w, ez2_w = setup->ez2_w;
+    float ss0_w = setup->ss0_w, ss1_w = setup->ss1_w, ss2_w = setup->ss2_w;
+    float st0_w = setup->st0_w, st1_w = setup->st1_w, st2_w = setup->st2_w;
+    float sr0_w = setup->sr0_w, sr1_w = setup->sr1_w, sr2_w = setup->sr2_w;
+    float sq0_w = setup->sq0_w, sq1_w = setup->sq1_w, sq2_w = setup->sq2_w;
+    bool  perspective_correct_normals = setup->perspective_correct_normals;
+
+    bool has_texture = (texture && !texture->levels.empty() && !texture->levels[0].rgb.empty());
+    const PackedTextureLevel* tex_level = nullptr;
+    float aniso_axis_u = 0.0f;
+    float aniso_axis_v = 0.0f;
+    int   aniso_taps   = 1;
+    if (has_texture) {
+        const PackedTextureLevel& base = texture->levels[0];
+        int mip_level = 0;
+        float dx1 = v1.x - v0.x, dy1 = v1.y - v0.y;
+        float dx2 = v2.x - v0.x, dy2 = v2.y - v0.y;
+        float den = dx1 * dy2 - dy1 * dx2;
+        float major = 1.0f;
+        float minor = 1.0f;
+        float major_vec_u = 0.0f;
+        float major_vec_v = 0.0f;
+        if (fabsf(den) > 0.0001f) {
+            float inv_den = 1.0f / den;
+            float du1 = v1.u - v0.u, du2 = v2.u - v0.u;
+            float dv1 = v1.v - v0.v, dv2 = v2.v - v0.v;
+            float du_dx = (du1 * dy2 - du2 * dy1) * inv_den * base.w;
+            float du_dy = (dx1 * du2 - dx2 * du1) * inv_den * base.w;
+            float dv_dx = (dv1 * dy2 - dv2 * dy1) * inv_den * base.h;
+            float dv_dy = (dx1 * dv2 - dx2 * dv1) * inv_den * base.h;
+
+            float a = du_dx * du_dx + du_dy * du_dy;
+            float b = du_dx * dv_dx + du_dy * dv_dy;
+            float c = dv_dx * dv_dx + dv_dy * dv_dy;
+            float trace        = a + c;
+            float disc         = sqrtf(fmaxf(0.0f, (a - c) * (a - c) + 4.0f * b * b));
+            float lambda_major = fmaxf(0.0f, 0.5f * (trace + disc));
+            float lambda_minor = fmaxf(0.0f, 0.5f * (trace - disc));
+            major = sqrtf(lambda_major);
+            minor = sqrtf(lambda_minor);
+
+            if (fabsf(b) > 0.000001f) {
+                major_vec_u = b;
+                major_vec_v = lambda_major - a;
+            } else if (a >= c) {
+                major_vec_u = 1.0f;
+                major_vec_v = 0.0f;
+            } else {
+                major_vec_u = 0.0f;
+                major_vec_v = 1.0f;
+            }
+            float vec_len = sqrtf(major_vec_u * major_vec_u + major_vec_v * major_vec_v);
+            if (vec_len > 0.000001f) {
+                major_vec_u /= vec_len;
+                major_vec_v /= vec_len;
+            }
+        }
+
+        float lod_footprint = major;
+        if (major > 1.0f && minor > 0.0f) {
+            float aniso = major / fmaxf(minor, 0.0001f);
+            if (aniso > 1.5f) {
+                float filtered_major = fminf(major, fmaxf(minor, 1.0f) * 4.0f);
+                lod_footprint = fmaxf(minor, 1.0f);
+                aniso_taps   = std::min(4, std::max(2, (int)ceilf(filtered_major / lod_footprint)));
+                aniso_axis_u = major_vec_u * filtered_major / (float)base.w;
+                aniso_axis_v = major_vec_v * filtered_major / (float)base.h;
+            }
+        }
+        if (lod_footprint > 1.0f) {
+            mip_level = (int)(log2f(lod_footprint) + 0.5f);
+            if (mip_level >= (int)texture->levels.size()) mip_level = (int)texture->levels.size() - 1;
+        }
+        const PackedTextureLevel& level = texture->levels[mip_level];
+        tex_level = &level;
+    }
+    for (int y = y_min; y <= y_max; y++) {
+        float w0 = w0_row, w1 = w1_row, w2 = w2_row;
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
+        float*   row_depth  = depth_buffer + (size_t)y * screen_width;
+
+        for (int x = x_min; x <= x_max; x++) {
+            // Inside test (handles both CW and CCW winding).
+            if (__builtin_expect((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0), 0)) {
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
+
+            // Depth interpolation with unnormalized barycentrics.
+            float aw0 = fabsf(w0), aw1 = fabsf(w1), aw2 = fabsf(w2);
+            float w_sum = aw0 + aw1 + aw2;
+            float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
+
+            if (__builtin_expect(z >= row_depth[x], 0)) {
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
+
+            float inv_w_sum = 1.0f / w_sum;
+            float b0 = aw0 * inv_w_sum, b1 = aw1 * inv_w_sum, b2 = aw2 * inv_w_sum;
+
+            float inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
+            if (shader == TriangleShader::DebugUnlitRed) {
+                row_pixels[x] = pack_rgb_fast(format, 255, 0, 0);
+                if (depth_write) row_depth[x] = z;
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
+            if (shader == TriangleShader::LuminaireCone) {
+                float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
+                float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
+                float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
+                float nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
+                float ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
+                float nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+
+                float px = ex - light_pos.x();
+                float py = ey - light_pos.y();
+                float pz = ez - light_pos.z();
+                constexpr float cone_len = 4.5f;
+                float cone_t = (px * spot_dir.x() + py * spot_dir.y() + pz * spot_dir.z()) / cone_len;
+                cone_t = fminf(1.0f, fmaxf(0.0f, cone_t));
+                float distal_fade = 0.5f + 0.5f * cosf((float)M_PI * cone_t);
+
+                float n_len2 = nx * nx + ny * ny + nz * nz;
+                float p_len2 = ex * ex + ey * ey + ez * ez;
+                if (n_len2 > 0.000001f && p_len2 > 0.000001f) {
+                    float inv_n_len = 1.0f / sqrtf(n_len2);
+                    float inv_p_len = -1.0f / sqrtf(p_len2);
+                    nx *= inv_n_len; ny *= inv_n_len; nz *= inv_n_len;
+                    ex *= inv_p_len; ey *= inv_p_len; ez *= inv_p_len;
+
+                    float vdotn = fabsf(ex * nx + ey * ny + ez * nz);
+                    float silhouette_t    = fminf(1.0f, fmaxf(0.0f, vdotn / 0.45f));
+                    float silhouette_fade = silhouette_t * silhouette_t * (3.0f - 2.0f * silhouette_t);
+                    float a_add = 0.22f * distal_fade * silhouette_fade;
+                    add_pixel_rgb(row_pixels, x, format, 255.0f * a_add, 255.0f * a_add, 255.0f * a_add);
+                }
+
+                w0 += A0; w1 += A1; w2 += A2;
+                continue;
+            }
+
+            float u = (u0_w * b0 + u1_w * b1 + u2_w * b2) / inv_w;
+            float v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w;
+
+            float r_attr = v0.r * b0 + v1.r * b1 + v2.r * b2;
+            float g_attr = v0.g * b0 + v1.g * b1 + v2.g * b2;
+            float b_attr = v0.b * b0 + v1.b * b1 + v2.b * b2;
+            float alpha  = v0.a * b0 + v1.a * b1 + v2.a * b2;
+
+            u = u - floorf(u);
+            v = v - floorf(v);
+
+            float final_r, final_g, final_b;
+            if (has_texture) {
+                uint32_t tc = sample_texture_anisotropic(*tex_level, u, v,
+                                                         aniso_axis_u, aniso_axis_v, aniso_taps);
+                uint8_t tr = (uint8_t)(tc >> 16);
+                uint8_t tg = (uint8_t)(tc >> 8);
+                uint8_t tb = (uint8_t)tc;
+                final_r = tr * r_attr;
+                final_g = tg * g_attr;
+                final_b = tb * b_attr;
+            } else {
+                final_r = 255.0f * r_attr;
+                final_g = 255.0f * g_attr;
+                final_b = 255.0f * b_attr;
+            }
+
+            if (ENABLE_PHONG_SHADING) {
+                float light_visibility = 1.0f;
+                if (shadow_depth && shadow_size > 0) {
+                    float ss = (ss0_w * b0 + ss1_w * b1 + ss2_w * b2) / inv_w;
+                    float st = (st0_w * b0 + st1_w * b1 + st2_w * b2) / inv_w;
+                    float sr = (sr0_w * b0 + sr1_w * b1 + sr2_w * b2) / inv_w;
+                    float sq = (sq0_w * b0 + sq1_w * b1 + sq2_w * b2) / inv_w;
+                    float inv_sq   = 1.0f / sq;
+                    float shadow_s = ss * inv_sq;
+                    float shadow_t = st * inv_sq;
+                    float shadow_r = sr * inv_sq;
+                    light_visibility = sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size,
+                                                                          shadow_s, shadow_t, shadow_r);
+                }
+
+                float diffuse = 0.35f;
+                float spec    = 0.0f;
+                if (light_visibility > 0.0f) {
+                    float nx, ny, nz;
+                    if (perspective_correct_normals) {
+                        nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
+                        ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
+                        nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+                    } else {
+                        nx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
+                        ny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
+                        nz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
+                    }
+                    float n_len2 = nx * nx + ny * ny + nz * nz;
+                    if (n_len2 > 0.000001f) {
+                        float inv_n_len = 1.0f / sqrtf(n_len2);
+                        nx *= inv_n_len; ny *= inv_n_len; nz *= inv_n_len;
+                    }
+
+                    float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
+                    float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
+                    float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
+
+                    float lx = light_dir.x(), ly = light_dir.y(), lz = light_dir.z();
+                    float light_scale = 1.0f;
+                    if (use_spotlight) {
+                        lx = light_pos.x() - ex;
+                        ly = light_pos.y() - ey;
+                        lz = light_pos.z() - ez;
+                        float l_len2 = lx * lx + ly * ly + lz * lz;
+                        if (l_len2 > 0.000001f) {
+                            float inv_l_len = 1.0f / sqrtf(l_len2);
+                            lx *= inv_l_len; ly *= inv_l_len; lz *= inv_l_len;
+                            float cone_cos = -(lx * spot_dir.x() + ly * spot_dir.y() + lz * spot_dir.z());
+                            light_scale = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) / (spot_inner_cos - spot_outer_cos)));
+                            light_scale *= 3.5f / (1.0f + 0.004f * l_len2);
+                        } else {
+                            light_scale = 0.0f;
+                        }
+                    }
+
+                    float ndotl = fmaxf(0.0f, nx * lx + ny * ly + nz * lz);
+                    diffuse += 0.8f * ndotl * light_visibility * light_scale;
+
+                    if (ndotl > 0.0f && light_scale > 0.0f) {
+                        float v_len2 = ex * ex + ey * ey + ez * ez;
+                        if (v_len2 > 0.000001f) {
+                            float inv_v_len = -1.0f / sqrtf(v_len2); // eye-space point -> eye at origin
+                            ex *= inv_v_len; ey *= inv_v_len; ez *= inv_v_len;
+                        }
+
+                        float hx = lx + ex;
+                        float hy = ly + ey;
+                        float hz = lz + ez;
+                        float h_len2 = hx * hx + hy * hy + hz * hz;
+                        if (h_len2 > 0.000001f) {
+                            float inv_h_len = 1.0f / sqrtf(h_len2);
+                            hx *= inv_h_len; hy *= inv_h_len; hz *= inv_h_len;
+                            spec = powf(fmaxf(0.0f, nx * hx + ny * hy + nz * hz), 48.0f) * 150.0f * light_visibility * light_scale;
+                        }
+                    }
+                }
+
+                final_r = final_r * diffuse + spec;
+                final_g = final_g * diffuse + spec;
+                final_b = final_b * diffuse + spec;
+            }
+
+            if (final_r > 255.0f) final_r = 255.0f;
+            if (final_g > 255.0f) final_g = 255.0f;
+            if (final_b > 255.0f) final_b = 255.0f;
+
+            if (alpha < 0.995f && alpha > 0.005f) {
+                uint8_t dst_r, dst_g, dst_b;
+                unpack_rgb_fast(row_pixels[x], format, dst_r, dst_g, dst_b);
+                float inv_alpha = 1.0f - alpha;
+                final_r = final_r * alpha + dst_r * inv_alpha;
+                final_g = final_g * alpha + dst_g * inv_alpha;
+                final_b = final_b * alpha + dst_b * inv_alpha;
+            }
+
+            row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
+            if (depth_write) row_depth[x] = z;
+
+            w0 += A0; w1 += A1; w2 += A2;
+        }
+        w0_row += B0; w1_row += B1; w2_row += B2;
+    }
+}
+
+void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                               int screen_width, int screen_height, SDL_PixelFormat* format,
+                               const Matrix4f& projection, const Vector3f& light_pos,
+                               const Vector3f& spot_dir, float spot_outer_cos,
+                               int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
+    Vector3f axis = spot_dir.normalized();
+    float outer_angle = acosf(fmaxf(-1.0f, fminf(1.0f, spot_outer_cos)));
+    constexpr float cone_len = 4.5f;
+    Vector3f base_center = light_pos + axis * cone_len;
+
+    Vector3f u = axis.cross(Vector3f(0.0f, 1.0f, 0.0f));
+    if (u.squaredNorm() < 0.0001f) u = axis.cross(Vector3f(1.0f, 0.0f, 0.0f));
+    u.normalize();
+    Vector3f v = axis.cross(u).normalized();
+    float radius = tanf(outer_angle) * cone_len;
+
+    auto make_vertex = [&](const Vector3f& p, const Vector3f& n, VertexVaryings& out) {
+        if (!project_eye_point(projection, p, screen_width, screen_height, out.x, out.y, out.z, out.inv_w)) {
+            return false;
+        }
+        out.r = out.g = out.b = out.a = 1.0f;
+        out.u = out.v = 0.0f;
+        out.nx = n.x(); out.ny = n.y(); out.nz = n.z();
+        out.ex = p.x(); out.ey = p.y(); out.ez = p.z();
+        out.ss = out.st = out.sr = 0.0f;
+        out.sq = 1.0f;
+        return true;
+    };
+
+    constexpr int cone_segments = 64;
+    for (int i = 0; i < cone_segments; i++) {
+        float a0 = (2.0f * (float)M_PI * i) / cone_segments;
+        float a1 = (2.0f * (float)M_PI * (i + 1)) / cone_segments;
+        Vector3f radial0 = cosf(a0) * u + sinf(a0) * v;
+        Vector3f radial1 = cosf(a1) * u + sinf(a1) * v;
+        Vector3f n0      = (cone_len * radial0 - radius * axis).normalized();
+        Vector3f n1      = (cone_len * radial1 - radius * axis).normalized();
+        Vector3f apex_n  = (n0 + n1).normalized();
+
+        VertexVaryings apex, p0, p1;
+        if (!make_vertex(light_pos, apex_n, apex)) continue;
+        if (!make_vertex(base_center + radius * radial0, n0, p0)) continue;
+        if (!make_vertex(base_center + radius * radial1, n1, p1)) continue;
+
+        draw_triangle_barycentric_strip(pixels, pitch, depth_buffer,
+                                        screen_width, screen_height,
+                                        apex, p0, p1,
+                                        format, nullptr,
+                                        Vector3f::Zero(), light_pos, axis,
+                                        true, 1.0f, spot_outer_cos,
+                                        nullptr, 0,
+                                        x_tile_min, x_tile_max, y_strip_min, y_strip_max, false,
+                                        TriangleShader::LuminaireCone);
+    }
+}
+
+void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
+                      int screen_width, int screen_height, SDL_PixelFormat* format,
+                      int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
+    static constexpr int sample_offsets[16][2] = {
+        { 2,  0}, {-2,  0}, { 0,  2}, { 0, -2},
+        { 4,  3}, {-4,  3}, { 4, -3}, {-4, -3},
+        { 7,  1}, {-7,  1}, { 1,  7}, { 1, -7},
+        { 8,  6}, {-8,  6}, { 8, -6}, {-8, -6}
+    };
+    constexpr float near_plane = 0.1f;
+    constexpr float far_plane  = CAMERA_FAR_PLANE;
+    constexpr float proj_a = (far_plane + near_plane) / (near_plane - far_plane);
+    constexpr float proj_b = (2.0f * far_plane * near_plane) / (near_plane - far_plane);
+    constexpr float angle_bias        = 0.12f;
+    constexpr float sample_radius     = 3.25f;
+    constexpr float sample_radius2    = sample_radius * sample_radius;
+    constexpr float max_occlusion     = 0.9f;
+    constexpr float inv_sample_radius = 1.0f / sample_radius;
+    constexpr float inv_sample_count  = 1.0f / 16.0f;
+    constexpr float inv_angle_range   = 1.0f / (1.0f - angle_bias);
+    int sample_linear_offsets[16];
+    for (int i = 0; i < 16; i++) {
+        sample_linear_offsets[i] = sample_offsets[i][1] * screen_width + sample_offsets[i][0];
+    }
+    float f      = 1.0f / tanf(60.0f * (float)M_PI / 360.0f);
+    float aspect = (float)screen_width / (float)screen_height;
+    float x_scale = aspect / f;
+    float y_scale = 1.0f / f;
+    float inv_screen_width  = 1.0f / (float)screen_width;
+    float inv_screen_height = 1.0f / (float)screen_height;
+
+    auto linear_eye_depth = [](float ndc_z) {
+        return proj_b / (ndc_z + proj_a);
+    };
+    auto reconstruct_position = [&](int x, int y, float ndc_z, float& px, float& py, float& pz) {
+        float depth = linear_eye_depth(ndc_z);
+        float ndc_x = (((float)x + 0.5f) * inv_screen_width)  * 2.0f - 1.0f;
+        float ndc_y = 1.0f - (((float)y + 0.5f) * inv_screen_height) * 2.0f;
+        px = ndc_x * depth * x_scale;
+        py = ndc_y * depth * y_scale;
+        pz = -depth;
+    };
+
+    for (int y = y_strip_min; y <= y_strip_max; y++) {
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
+        size_t   row_base   = (size_t)y * screen_width;
+        const float* row_depth = depth_buffer + row_base;
+        for (int x = x_tile_min; x <= x_tile_max; x++) {
+            size_t center_idx = row_base + x;
+            float  center_z   = row_depth[x];
+            if (center_z >= 0.999f) continue;
+            float cx, cy, cz;
+            reconstruct_position(x, y, center_z, cx, cy, cz);
+
+            int xl = std::max(0, x - 1);
+            int xr = std::min(screen_width  - 1, x + 1);
+            int yu = std::max(0, y - 1);
+            int yd = std::min(screen_height - 1, y + 1);
+            float zl = row_depth[xl];
+            float zr = row_depth[xr];
+            float zu = depth_buffer[center_idx - (y > 0 ? screen_width : 0)];
+            float zd = depth_buffer[center_idx + (y + 1 < screen_height ? screen_width : 0)];
+            if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
+
+            float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
+            reconstruct_position(xl, y,  zl, plx, ply, plz);
+            reconstruct_position(xr, y,  zr, prx, pry, prz);
+            reconstruct_position(x,  yu, zu, pux, puy, puz);
+            reconstruct_position(x,  yd, zd, pdx, pdy, pdz);
+
+            float dx_x = prx - plx, dx_y = pry - ply, dx_z = prz - plz;
+            float dy_x = pdx - pux, dy_y = pdy - puy, dy_z = pdz - puz;
+            float nx = dy_y * dx_z - dy_z * dx_y;
+            float ny = dy_z * dx_x - dy_x * dx_z;
+            float nz = dy_x * dx_y - dy_y * dx_x;
+            float normal_len2 = nx * nx + ny * ny + nz * nz;
+            if (normal_len2 <= 0.000001f) continue;
+            float inv_normal_len = 1.0f / sqrtf(normal_len2);
+            nx *= inv_normal_len; ny *= inv_normal_len; nz *= inv_normal_len;
+            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) {
+                nx = -nx; ny = -ny; nz = -nz;
+            }
+
+            float occlusion = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                int sx = x + sample_offsets[i][0];
+                int sy = y + sample_offsets[i][1];
+                if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
+
+                size_t sample_idx = (size_t)((ptrdiff_t)center_idx + sample_linear_offsets[i]);
+                float  sample_z   = depth_buffer[sample_idx];
+                if (sample_z >= 0.999f) continue;
+
+                float spx, spy, spz;
+                reconstruct_position(sx, sy, sample_z, spx, spy, spz);
+                float dx = spx - cx;
+                float dy = spy - cy;
+                float dz = spz - cz;
+                float dist2 = dx * dx + dy * dy + dz * dz;
+                if (dist2 > 0.000001f && dist2 < sample_radius2) {
+                    float dist     = sqrtf(dist2);
+                    float inv_dist = 1.0f / dist;
+                    float hemisphere = (nx * dx + ny * dy + nz * dz) * inv_dist;
+                    if (hemisphere > angle_bias) {
+                        float normal_weight = (hemisphere - angle_bias) * inv_angle_range;
+                        occlusion += normal_weight * (1.0f - dist * inv_sample_radius);
+                    }
+                }
+            }
+
+            float ao = 1.0f - fminf(max_occlusion, (occlusion * inv_sample_count) * max_occlusion * 1.8f);
+            if (ao >= 0.999f) continue;
+
+            uint8_t r, g, b;
+            unpack_rgb_fast(row_pixels[x], format, r, g, b);
+            int ao8 = (int)(ao * 256.0f);
+            if (ao8 < 0) ao8 = 0; else if (ao8 > 256) ao8 = 256;
+            row_pixels[x] = pack_rgb_fast(format,
+                                          (uint8_t)((r * ao8) >> 8),
+                                          (uint8_t)((g * ao8) >> 8),
+                                          (uint8_t)((b * ao8) >> 8));
+        }
+    }
+}

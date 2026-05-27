@@ -8,7 +8,7 @@ CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -fl
 LDFLAGS = -flto=thin
 TARGET = raster
 APP_NAME = Raster.app
-SOURCES = main.cpp geometry.cpp
+SOURCES = main.cpp geometry.cpp platform.cpp pixel.cpp texture.cpp clip.cpp shadow.cpp draw.cpp threading.cpp physics_setup.cpp physics_pipeline.cpp scene.cpp tl_worker.cpp raster_worker.cpp render_loop.cpp
 SDL2_CFLAGS = $(shell sdl2-config --cflags)
 SDL2_LIBS = $(shell sdl2-config --libs)
 ICON_PNG = icon.png
@@ -127,6 +127,12 @@ $(APP_NAME): $(TARGET) Info.plist icon.icns baboon.bmp lenna.bmp tiles.bmp
 		exit 1; \
 	fi
 	@echo "APPL????" > $(APP_NAME)/Contents/PkgInfo
+	@# Strip com.apple.quarantine from every file in the bundle BEFORE
+	@# code-signing. Asset BMPs are often downloaded with a browser, which
+	@# tags them with com.apple.quarantine; if those tags survive into the
+	@# signed bundle, Launch Services refuses to register the process and
+	@# AppKit aborts in _RegisterApplication when launched from Finder.
+	@xattr -dr com.apple.quarantine $(APP_NAME) 2>/dev/null || true
 	@codesign --force --deep --sign - $(APP_NAME) >/dev/null 2>&1
 
 app: $(APP_NAME)
