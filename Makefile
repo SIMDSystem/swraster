@@ -1,8 +1,10 @@
 CXX = clang++
+EMCXX ?= em++
+EMCMAKE ?= emcmake
 JOLT_DIR = JoltPhysics
 JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
-CXXFLAGS = -std=c++17 -Wall -Wextra -Ofast -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_ENABLE_ASSERTS
+CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_ENABLE_ASSERTS
 LDFLAGS = -flto=thin
 TARGET = raster
 APP_NAME = Raster.app
@@ -10,6 +12,36 @@ SOURCES = main.cpp geometry.cpp
 SDL2_CFLAGS = $(shell sdl2-config --cflags)
 SDL2_LIBS = $(shell sdl2-config --libs)
 ICON_PNG = icon.png
+WEB_BUILD_DIR = web_build
+JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/jolt_release
+JOLT_WEB_LIB = $(JOLT_WEB_BUILD_DIR)/libJolt.a
+WEB_TARGET = $(WEB_BUILD_DIR)/raster.html
+WEB_ASSETS = baboon.bmp lenna.bmp tiles.bmp
+WEB_JOBS ?= 8
+WEB_TL_THREADS ?= 2
+WEB_RASTER_THREADS ?= 14
+WEB_JOLT_WORKER_THREADS ?= 1
+WEB_PTHREAD_POOL_SIZE ?= 24
+WEB_MEMORY ?= 268435456
+# Web build deliberately does NOT link SDL. main.cpp's Platform layer talks
+# straight to the <canvas> + emscripten input/timing APIs on the web target.
+WEB_CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O2 -g2 -fno-omit-frame-pointer -fstrict-aliasing \
+  -msimd128 -msse4.2 \
+  -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) \
+  -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_CROSS_PLATFORM_DETERMINISTIC -DJPH_ENABLE_ASSERTS \
+  -DDEFAULT_TL_THREADS=$(WEB_TL_THREADS) -DDEFAULT_RASTER_THREADS=$(WEB_RASTER_THREADS) -DDEFAULT_JOLT_WORKER_THREADS=$(WEB_JOLT_WORKER_THREADS) \
+  -pthread
+WEB_LDFLAGS = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
+  -sPTHREAD_POOL_SIZE=$(WEB_PTHREAD_POOL_SIZE) \
+  -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
+  -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
+  -sASSERTIONS=1 -sEXIT_RUNTIME=0 \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 \
+  -g2
+WEB_PRELOADS = $(foreach asset,$(WEB_ASSETS),--preload-file $(asset))
+WEB_JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release -DUSE_ASSERTS=ON \
+  -DINTERPROCEDURAL_OPTIMIZATION=OFF -DCROSS_PLATFORM_DETERMINISTIC=ON \
+  -DENABLE_ALL_WARNINGS=OFF -DCMAKE_CXX_FLAGS="-pthread -g2 -msimd128 -msse4.2"
 
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
@@ -41,6 +73,22 @@ $(JOLT_LIB):
 
 $(TARGET): $(SOURCES) $(JOLT_LIB)
 	$(CXX) $(CXXFLAGS) $(SDL2_CFLAGS) -o $(TARGET) $(SOURCES) $(SDL2_LIBS) $(JOLT_LIB) $(LDFLAGS) -pthread
+
+# Separate Emscripten/WebAssembly build. Native `all` and `app` targets are unchanged.
+$(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
+	@command -v $(EMCMAKE) >/dev/null 2>&1 || { echo "Error: Emscripten emcmake not found. Activate/install emsdk first."; exit 1; }
+	@echo "Building Jolt Physics for WebAssembly..."
+	@mkdir -p $(JOLT_WEB_BUILD_DIR)
+	$(EMCMAKE) cmake -S $(JOLT_DIR)/Build -B $(JOLT_WEB_BUILD_DIR) $(WEB_JOLT_CMAKE_FLAGS)
+	cmake --build $(JOLT_WEB_BUILD_DIR) --target Jolt --parallel $(WEB_JOBS)
+
+$(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(WEB_ASSETS) web_shell.html Makefile
+	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten em++ not found. Activate/install emsdk first."; exit 1; }
+	@mkdir -p $(WEB_BUILD_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -o $(WEB_TARGET) $(SOURCES) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file web_shell.html
+
+web: $(WEB_TARGET)
+	@echo "Web build written to $(WEB_BUILD_DIR)/"
 
 # App bundle depends on executable - will rebuild exe if source changes
 # IMPORTANT: Check if exe in bundle is older than source exe and copy if needed
@@ -89,4 +137,7 @@ clean:
 	rm -rf icon.iconset
 	@# Note: icon.png and icon.icns are kept in project directory
 
-.PHONY: clean app all
+clean-web:
+	rm -rf $(WEB_BUILD_DIR)
+
+.PHONY: clean clean-web app all web

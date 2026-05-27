@@ -1,23 +1,502 @@
-#include <SDL.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 #include <algorithm>
+#include <utility>
 #include <thread>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
 #include <cstdarg>
 #include <memory>
+#include <chrono>
+#include <deque>
 #include <Eigen/Dense>
 #include "geometry.h"
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
-#ifdef __APPLE__
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <emscripten/html5.h>
+#else
+#include <SDL.h>
+#include <sys/resource.h>
+#if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <limits.h>
 #endif
+#endif
+
+// Portable pixel format + surface used by the renderer. On native we just
+// alias SDL's types so SDL-loaded textures pass through unchanged. On web we
+// own these structs outright and never link against SDL.
+#ifdef __EMSCRIPTEN__
+using Uint8 = uint8_t;
+using Uint32 = uint32_t;
+using Uint64 = uint64_t;
+
+struct SDL_PixelFormat {
+    int BytesPerPixel;
+    uint8_t Rloss, Gloss, Bloss;
+    uint8_t Rshift, Gshift, Bshift;
+    uint32_t Rmask, Gmask, Bmask, Amask;
+};
+
+struct SDL_Surface {
+    int w;
+    int h;
+    int pitch;
+    void* pixels;
+    SDL_PixelFormat* format;
+    bool owns_pixels;
+};
+#endif
+
+// Minimal portable platform abstraction. The renderer always writes into a
+// platform-owned RGBA8 framebuffer (Platform::GetFramebuffer()). Platform::Present()
+// blits that framebuffer to the actual display (SDL window on native, <canvas>
+// on web). One codebase, one render path, two thin platform backends.
+namespace Platform {
+
+struct Event {
+    enum Type {
+        None,
+        Quit,
+        KeyDown,        // key field: 'space' for now
+        MouseButton,    // button=1 left; pressed=true/false
+        MouseMotion,    // xrel/yrel deltas
+        MouseWheel,     // wheel_y
+        VisibilityChanged // visible flag
+    } type = None;
+    int key = 0;
+    int button = 0;
+    bool pressed = false;
+    int xrel = 0;
+    int yrel = 0;
+    int wheel_y = 0;
+    bool visible = true;
+};
+
+bool Init(int w, int h, const char* title);
+void Shutdown();
+
+// The renderer's render target. Pixels are RGBA8; format/pitch are stable for
+// the lifetime of the window unless the user resizes (native only).
+SDL_Surface* GetFramebuffer();
+
+// Push the current framebuffer to the display. On web this is a synchronous
+// putImageData on the browser main thread; on native it copies into the SDL
+// window surface and updates.
+void Present();
+
+bool IsRenderable();
+bool PollEvent(Event& out);
+
+Uint64 TicksMs();
+Uint64 PerfCounter();
+Uint64 PerfFrequency();
+void   Delay(Uint32 ms);
+
+SDL_Surface* LoadBMP(const char* path);
+void FreeSurface(SDL_Surface* s);
+
+} // namespace Platform
+
+// ------- Platform implementation -------------------------------------------
+
+namespace Platform {
+
+namespace {
+
+bool g_visible = true;
+
+#ifndef __EMSCRIPTEN__
+// --------- Native (SDL2) -----------------------------------------------------
+// On native we render directly into SDL's window surface — that surface is
+// already an in-memory pixel buffer the OS blits to the screen on
+// SDL_UpdateWindowSurface(). No extra copy, no format mismatch concerns.
+SDL_Window* g_win = nullptr;
+SDL_Surface* g_fb_native = nullptr;
+#else
+// --------- Web (direct canvas + emscripten input) ----------------------------
+// Web has no OS-provided surface; we own the framebuffer.
+SDL_PixelFormat g_fb_format{};
+SDL_Surface     g_fb_web{};
+std::vector<uint32_t> g_fb_pixels;
+
+// Input events are pushed into this lock-protected queue by JavaScript
+// listeners registered in web_shell.html. They run on the browser main
+// thread and call the WASM-exported swr_push_* entry points below.
+// Platform::PollEvent() (called from the worker pthread that hosts our
+// renderer's main loop) drains the queue.
+std::mutex g_event_mtx;
+std::deque<Event> g_event_queue;
+
+static void push_event(const Event& ev) {
+    std::lock_guard<std::mutex> lock(g_event_mtx);
+    g_event_queue.push_back(ev);
+}
+#endif
+
+} // anon
+
+#ifdef __EMSCRIPTEN__
+// ---- C entry points called directly from JS in the page shell ---------------
+// EMSCRIPTEN_KEEPALIVE exports them so they're reachable as Module._swr_*().
+// Because USE_PTHREADS=1 makes WASM memory a SharedArrayBuffer, calling these
+// from the browser UI thread safely contends with the renderer worker pthread
+// through the std::mutex guarding the queue.
+extern "C" {
+
+EMSCRIPTEN_KEEPALIVE void swr_push_key(int key) {
+    Platform::Event ev; ev.type = Platform::Event::KeyDown; ev.key = key;
+    Platform::push_event(ev);
+}
+
+EMSCRIPTEN_KEEPALIVE void swr_push_mouse_button(int button, int pressed) {
+    Platform::Event ev; ev.type = Platform::Event::MouseButton;
+    ev.button = button; ev.pressed = pressed != 0;
+    Platform::push_event(ev);
+}
+
+EMSCRIPTEN_KEEPALIVE void swr_push_mouse_motion(int dx, int dy) {
+    Platform::Event ev; ev.type = Platform::Event::MouseMotion;
+    ev.xrel = dx; ev.yrel = dy;
+    Platform::push_event(ev);
+}
+
+EMSCRIPTEN_KEEPALIVE void swr_push_wheel(int wy) {
+    Platform::Event ev; ev.type = Platform::Event::MouseWheel; ev.wheel_y = wy;
+    Platform::push_event(ev);
+}
+
+EMSCRIPTEN_KEEPALIVE void swr_push_visibility(int visible) {
+    Platform::g_visible = (visible != 0);
+    Platform::Event ev; ev.type = Platform::Event::VisibilityChanged;
+    ev.visible = (visible != 0);
+    Platform::push_event(ev);
+}
+
+} // extern "C"
+#endif
+
+bool Init(int w, int h, const char* title) {
+#ifndef __EMSCRIPTEN__
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
+    g_win = SDL_CreateWindow(title,
+                             SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                             w, h, 0);
+    if (!g_win) { SDL_Quit(); return false; }
+    g_fb_native = SDL_GetWindowSurface(g_win);
+    if (!g_fb_native || !g_fb_native->format || g_fb_native->format->BytesPerPixel != 4) {
+        fprintf(stderr, "Unsupported window surface format (expected 32-bit pixels)\n");
+        SDL_DestroyWindow(g_win); g_win = nullptr;
+        SDL_Quit();
+        return false;
+    }
+    return true;
+#else
+    (void)title;
+    // RGBA8 little-endian: byte order R,G,B,A in memory. putImageData expects this.
+    g_fb_format = SDL_PixelFormat{};
+    g_fb_format.BytesPerPixel = 4;
+    g_fb_format.Rshift = 0;  g_fb_format.Gshift = 8;  g_fb_format.Bshift = 16;
+    g_fb_format.Rmask  = 0x000000ffu;
+    g_fb_format.Gmask  = 0x0000ff00u;
+    g_fb_format.Bmask  = 0x00ff0000u;
+    g_fb_format.Amask  = 0xff000000u;
+
+    g_fb_web = SDL_Surface{};
+    g_fb_web.w = w;
+    g_fb_web.h = h;
+    g_fb_web.pitch = w * 4;
+    g_fb_pixels.assign((size_t)w * (size_t)h, 0);
+    g_fb_web.pixels = g_fb_pixels.data();
+    g_fb_web.format = &g_fb_format;
+
+    // Size the canvas + install input listeners on the browser main thread.
+    MAIN_THREAD_EM_ASM({
+        var canvas = Module.canvas;
+        if (!canvas) {
+            canvas = document.getElementById('canvas');
+            if (canvas) Module.canvas = canvas;
+        }
+        if (canvas) {
+            canvas.width = $0;
+            canvas.height = $1;
+            // Prevent the page from scrolling while the user wheels over the
+            // canvas (we use the wheel for camera dolly). Also stop the
+            // right-click menu so mouse buttons stay usable for the renderer.
+            canvas.addEventListener('wheel', function(ev) { ev.preventDefault(); }, { passive: false });
+            canvas.addEventListener('contextmenu', function(ev) { ev.preventDefault(); });
+            // Make the canvas keyboard-focusable so it captures key events when
+            // clicked. Emscripten still routes keys via the window, but this
+            // makes the click-to-focus story consistent.
+            if (!canvas.hasAttribute('tabindex')) canvas.setAttribute('tabindex', '0');
+        }
+    }, w, h);
+    // Input is wired in JS in web_shell.html, which calls our swr_push_*()
+    // exports directly. No emscripten_set_*_callback() proxy needed.
+    return true;
+#endif
+}
+
+void Shutdown() {
+#ifndef __EMSCRIPTEN__
+    if (g_win) { SDL_DestroyWindow(g_win); g_win = nullptr; }
+    g_fb_native = nullptr;
+    SDL_Quit();
+#else
+    g_fb_pixels.clear();
+    g_fb_web = SDL_Surface{};
+#endif
+}
+
+SDL_Surface* GetFramebuffer() {
+#ifndef __EMSCRIPTEN__
+    g_fb_native = SDL_GetWindowSurface(g_win);
+    return g_fb_native;
+#else
+    return &g_fb_web;
+#endif
+}
+
+void Present() {
+#ifndef __EMSCRIPTEN__
+    if (g_win) SDL_UpdateWindowSurface(g_win);
+#else
+    // Synchronous blit to <canvas> via 2D context on the browser main thread.
+    // MAIN_THREAD_EM_ASM blocks the worker pthread until the JS finishes, so
+    // g_fb_pixels is safe to overwrite once we return.
+    MAIN_THREAD_EM_ASM({
+        var ptr = $0;
+        var w = $1;
+        var h = $2;
+        var canvas = Module.canvas;
+        if (!canvas) {
+            canvas = document.getElementById('canvas');
+            if (canvas) Module.canvas = canvas;
+        }
+        if (!canvas) return;
+        if (canvas.width !== w) canvas.width = w;
+        if (canvas.height !== h) canvas.height = h;
+        var cache = Module.swrCanvasCache;
+        if (!cache) {
+            cache = {};
+            Module.swrCanvasCache = cache;
+        }
+        if (cache.canvas !== canvas || cache.w !== w || cache.h !== h) {
+            cache.canvas = canvas;
+            cache.w = w;
+            cache.h = h;
+            cache.ctx = canvas.getContext('2d');
+            cache.image = cache.ctx.createImageData(w, h);
+        }
+        cache.image.data.set(HEAPU8.subarray(ptr, ptr + w * h * 4));
+        cache.ctx.putImageData(cache.image, 0, 0);
+    }, g_fb_web.pixels, g_fb_web.w, g_fb_web.h);
+#endif
+}
+
+bool IsRenderable() {
+#ifndef __EMSCRIPTEN__
+    if (!g_win) return false;
+    Uint32 flags = SDL_GetWindowFlags(g_win);
+    return (flags & SDL_WINDOW_SHOWN) && !(flags & SDL_WINDOW_HIDDEN) && !(flags & SDL_WINDOW_MINIMIZED);
+#else
+    return g_visible;
+#endif
+}
+
+bool PollEvent(Event& out) {
+    out = Event{};
+#ifndef __EMSCRIPTEN__
+    SDL_Event e;
+    if (!SDL_PollEvent(&e)) return false;
+    switch (e.type) {
+        case SDL_QUIT: out.type = Event::Quit; return true;
+        case SDL_KEYDOWN:
+            if (!e.key.repeat && e.key.keysym.sym == SDLK_SPACE) {
+                out.type = Event::KeyDown;
+                out.key = ' ';
+                return true;
+            }
+            return PollEvent(out);
+        case SDL_MOUSEBUTTONDOWN:
+        case SDL_MOUSEBUTTONUP:
+            if (e.button.button == SDL_BUTTON_LEFT) {
+                out.type = Event::MouseButton;
+                out.button = 1;
+                out.pressed = (e.type == SDL_MOUSEBUTTONDOWN);
+                return true;
+            }
+            return PollEvent(out);
+        case SDL_MOUSEMOTION:
+            out.type = Event::MouseMotion;
+            out.xrel = e.motion.xrel;
+            out.yrel = e.motion.yrel;
+            return true;
+        case SDL_MOUSEWHEEL:
+            out.type = Event::MouseWheel;
+            out.wheel_y = e.wheel.y;
+            return true;
+        case SDL_WINDOWEVENT:
+            switch (e.window.event) {
+                case SDL_WINDOWEVENT_HIDDEN:
+                case SDL_WINDOWEVENT_MINIMIZED:
+                case SDL_WINDOWEVENT_FOCUS_LOST:
+                    out.type = Event::VisibilityChanged;
+                    out.visible = false;
+                    g_visible = false;
+                    return true;
+                case SDL_WINDOWEVENT_SHOWN:
+                case SDL_WINDOWEVENT_RESTORED:
+                case SDL_WINDOWEVENT_EXPOSED:
+                case SDL_WINDOWEVENT_FOCUS_GAINED:
+                    out.type = Event::VisibilityChanged;
+                    out.visible = true;
+                    g_visible = true;
+                    return true;
+                default: break;
+            }
+            return PollEvent(out);
+        default: break;
+    }
+    return PollEvent(out);
+#else
+    std::lock_guard<std::mutex> lock(g_event_mtx);
+    if (g_event_queue.empty()) return false;
+    out = g_event_queue.front();
+    g_event_queue.pop_front();
+    return true;
+#endif
+}
+
+Uint64 TicksMs() {
+#ifndef __EMSCRIPTEN__
+    return SDL_GetTicks64();
+#else
+    return (Uint64)emscripten_get_now();
+#endif
+}
+
+Uint64 PerfCounter() {
+#ifndef __EMSCRIPTEN__
+    return SDL_GetPerformanceCounter();
+#else
+    return (Uint64)(emscripten_get_now() * 1000.0); // microseconds
+#endif
+}
+
+Uint64 PerfFrequency() {
+#ifndef __EMSCRIPTEN__
+    return SDL_GetPerformanceFrequency();
+#else
+    return 1000000ull;
+#endif
+}
+
+void Delay(Uint32 ms) {
+#ifndef __EMSCRIPTEN__
+    SDL_Delay(ms);
+#else
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+#endif
+}
+
+// Portable BMP loader (24/32 bpp uncompressed) used on web; native uses SDL's.
+#ifdef __EMSCRIPTEN__
+namespace {
+SDL_PixelFormat g_bmp_rgba_format{};
+bool g_bmp_format_inited = false;
+void ensure_bmp_format() {
+    if (g_bmp_format_inited) return;
+    g_bmp_rgba_format = SDL_PixelFormat{};
+    g_bmp_rgba_format.BytesPerPixel = 4;
+    g_bmp_rgba_format.Rshift = 0;  g_bmp_rgba_format.Gshift = 8;  g_bmp_rgba_format.Bshift = 16;
+    g_bmp_rgba_format.Rmask  = 0x000000ffu;
+    g_bmp_rgba_format.Gmask  = 0x0000ff00u;
+    g_bmp_rgba_format.Bmask  = 0x00ff0000u;
+    g_bmp_rgba_format.Amask  = 0xff000000u;
+    g_bmp_format_inited = true;
+}
+
+uint16_t rd16(const uint8_t* p) { return (uint16_t)p[0] | ((uint16_t)p[1] << 8); }
+uint32_t rd32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+} // anon
+#endif
+
+SDL_Surface* LoadBMP(const char* path) {
+#ifndef __EMSCRIPTEN__
+    return SDL_LoadBMP(path);
+#else
+    ensure_bmp_format();
+    FILE* f = fopen(path, "rb");
+    if (!f) return nullptr;
+    uint8_t header[54];
+    if (fread(header, 1, sizeof(header), f) != sizeof(header) ||
+        header[0] != 'B' || header[1] != 'M') { fclose(f); return nullptr; }
+    uint32_t data_off = rd32(header + 10);
+    if (rd32(header + 14) < 40) { fclose(f); return nullptr; }
+    int width = (int32_t)rd32(header + 18);
+    int h_signed = (int32_t)rd32(header + 22);
+    uint16_t planes = rd16(header + 26);
+    uint16_t bpp = rd16(header + 28);
+    uint32_t compr = rd32(header + 30);
+    if (width <= 0 || h_signed == 0 || planes != 1 ||
+        (bpp != 24 && bpp != 32) || compr != 0) { fclose(f); return nullptr; }
+    int height = h_signed < 0 ? -h_signed : h_signed;
+    bool top_down = h_signed < 0;
+    int src_stride = ((width * (int)bpp + 31) / 32) * 4;
+    std::vector<uint8_t> row((size_t)src_stride);
+    std::vector<uint8_t> px((size_t)width * (size_t)height * 4);
+    if (fseek(f, (long)data_off, SEEK_SET) != 0) { fclose(f); return nullptr; }
+    for (int sy = 0; sy < height; sy++) {
+        if (fread(row.data(), 1, row.size(), f) != row.size()) { fclose(f); return nullptr; }
+        int dy = top_down ? sy : (height - 1 - sy);
+        uint8_t* d = px.data() + (size_t)dy * (size_t)width * 4;
+        for (int x = 0; x < width; x++) {
+            const uint8_t* s = row.data() + (size_t)x * (bpp / 8);
+            d[x * 4 + 0] = s[2];
+            d[x * 4 + 1] = s[1];
+            d[x * 4 + 2] = s[0];
+            d[x * 4 + 3] = 255;
+        }
+    }
+    fclose(f);
+    SDL_Surface* s = (SDL_Surface*)calloc(1, sizeof(SDL_Surface));
+    if (!s) return nullptr;
+    s->w = width;
+    s->h = height;
+    s->pitch = width * 4;
+    s->format = &g_bmp_rgba_format;
+    s->owns_pixels = true;
+    s->pixels = malloc(px.size());
+    if (!s->pixels) { free(s); return nullptr; }
+    memcpy(s->pixels, px.data(), px.size());
+    return s;
+#endif
+}
+
+void FreeSurface(SDL_Surface* s) {
+#ifndef __EMSCRIPTEN__
+    SDL_FreeSurface(s);
+#else
+    if (!s) return;
+    if (s->owns_pixels) free(s->pixels);
+    free(s);
+#endif
+}
+
+} // namespace Platform
 
 // Jolt Physics
 #include <Jolt/Jolt.h>
@@ -62,22 +541,111 @@ static int NUM_TL_THREADS;
 static int NUM_RASTER_THREADS;
 static int NUM_STRIPS;
 static int NUM_TILE_BINS;
-constexpr int TILE_X_SPLITS = 4;
+#ifndef DEFAULT_TL_THREADS
+#define DEFAULT_TL_THREADS 2
+#endif
+#ifndef DEFAULT_RASTER_THREADS
+#define DEFAULT_RASTER_THREADS 17
+#endif
+#ifndef DEFAULT_JOLT_WORKER_THREADS
+#define DEFAULT_JOLT_WORKER_THREADS 2
+#endif
+constexpr int JOLT_WORKER_THREADS = DEFAULT_JOLT_WORKER_THREADS;
+constexpr int TILE_X_SPLITS = 16;
 
 static void init_thread_counts() {
     int hw = (int)std::thread::hardware_concurrency();
     if (hw < 2) hw = 2;
-    // Reserve 1 core for main thread + physics, bias slightly toward raster work,
-    // then oversubscribe both render worker groups to keep cores fed during stalls.
-    int pool = hw - 1;
-    int base_tl_threads = std::max(2, pool * 9 / 20);
-    int base_raster_threads = std::max(2, pool - base_tl_threads);
-    NUM_TL_THREADS = (base_tl_threads * 13 + 9) / 10;
-    NUM_RASTER_THREADS = (base_raster_threads * 13 + 9) / 10;
+    // Tuned for the current scene: T&L is light, raster/fill dominates.
+    NUM_TL_THREADS = DEFAULT_TL_THREADS;
+    NUM_RASTER_THREADS = DEFAULT_RASTER_THREADS;
     NUM_STRIPS = 8;
     NUM_TILE_BINS = NUM_STRIPS * TILE_X_SPLITS;
     printf("Threads: %d T&L, %d raster, %d strips, %d tiles (hw_concurrency=%d)\n",
            NUM_TL_THREADS, NUM_RASTER_THREADS, NUM_STRIPS, NUM_TILE_BINS, hw);
+}
+
+struct ThreadPerfVariant {
+    int tl_threads;
+    int raster_threads;
+};
+
+struct ThreadPerfSearch {
+    bool enabled = false;
+    int frames_per_variant = 1000;
+    std::vector<ThreadPerfVariant> variants;
+    FILE* log = nullptr;
+    size_t variant_index = 0;
+    int frames_this_variant = 0;
+    Uint64 variant_start_ticks = 0;
+    Uint64 search_start_ticks = 0;
+    uint64_t total_frames = 0;
+    double raster_ms_this_variant = 0.0;
+    double tl_tail_wait_ms_this_variant = 0.0;
+    double physics_ms_this_variant = 0.0;
+    double physics_cpu_ms_this_variant = 0.0;
+    double physics_update_ms_this_variant = 0.0;
+    double physics_sync_ms_this_variant = 0.0;
+    int launched_tl_threads = 20;
+    int launched_raster_threads = 20;
+    int min_tl_threads = 4;
+    int max_tl_threads = 0;
+    int min_raster_threads = 4;
+    int max_raster_threads = 0;
+};
+
+static ThreadPerfSearch make_thread_perf_search(int argc, char** argv) {
+    ThreadPerfSearch search;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--threadperf") == 0) {
+            search.enabled = true;
+        } else if (strcmp(argv[i], "--threadperf-frames") == 0 && i + 1 < argc) {
+            search.frames_per_variant = std::max(1, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--threadperf-tl-min") == 0 && i + 1 < argc) {
+            search.min_tl_threads = std::max(1, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--threadperf-tl-max") == 0 && i + 1 < argc) {
+            search.max_tl_threads = std::max(1, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--threadperf-raster-min") == 0 && i + 1 < argc) {
+            search.min_raster_threads = std::max(1, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--threadperf-raster-max") == 0 && i + 1 < argc) {
+            search.max_raster_threads = std::max(1, atoi(argv[++i]));
+        }
+    }
+    if (!search.enabled) return search;
+
+    constexpr int max_threads = 20;
+    if (search.max_tl_threads == 0) search.max_tl_threads = max_threads;
+    if (search.max_raster_threads == 0) search.max_raster_threads = max_threads;
+    search.min_tl_threads = std::min(search.min_tl_threads, max_threads);
+    search.max_tl_threads = std::min(search.max_tl_threads, max_threads);
+    search.min_raster_threads = std::min(search.min_raster_threads, max_threads);
+    search.max_raster_threads = std::min(search.max_raster_threads, max_threads);
+    if (search.min_tl_threads > search.max_tl_threads) std::swap(search.min_tl_threads, search.max_tl_threads);
+    if (search.min_raster_threads > search.max_raster_threads) std::swap(search.min_raster_threads, search.max_raster_threads);
+    for (int tl = search.min_tl_threads; tl <= search.max_tl_threads; tl++) {
+        for (int raster = search.min_raster_threads; raster <= search.max_raster_threads; raster++) {
+            search.variants.push_back({tl, raster});
+        }
+    }
+    return search;
+}
+
+static inline double perf_ms(Uint64 start, Uint64 end) {
+    static const double inv_freq_ms = 1000.0 / (double)Platform::PerfFrequency();
+    return (double)(end - start) * inv_freq_ms;
+}
+
+static inline double process_cpu_ms() {
+#ifdef __EMSCRIPTEN__
+    return 0.0;
+#else
+    auto timeval_ms = [](const timeval& tv) {
+        return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec * 0.001;
+    };
+    rusage usage{};
+    getrusage(RUSAGE_SELF, &usage);
+    return timeval_ms(usage.ru_utime) + timeval_ms(usage.ru_stime);
+#endif
 }
 
 static inline void tile_column_range(int width, int col, int& x_min, int& x_max) {
@@ -90,23 +658,6 @@ static inline int tile_column_for_x(int width, int x) {
     if (col < 0) return 0;
     if (col >= TILE_X_SPLITS) return TILE_X_SPLITS - 1;
     return col;
-}
-
-static inline size_t tile_column_base(int width, int height, int col) {
-    int base = 0;
-    for (int c = 0; c < col; c++) {
-        int x0, x1;
-        tile_column_range(width, c, x0, x1);
-        base += (x1 - x0 + 1) * height;
-    }
-    return (size_t)base;
-}
-
-static inline size_t tile_index(int x, int y, int width, int height) {
-    int col = tile_column_for_x(width, x);
-    int x0, x1;
-    tile_column_range(width, col, x0, x1);
-    return tile_column_base(width, height, col) + (size_t)y * (size_t)(x1 - x0 + 1) + (size_t)(x - x0);
 }
 
 // Jolt Physics constants
@@ -127,6 +678,11 @@ constexpr float SHADOW_DEPTH_BIAS = 0.0025f;
 using ShadowDepth = uint16_t;
 constexpr ShadowDepth SHADOW_DEPTH_CLEAR = 0xffff;
 constexpr ShadowDepth SHADOW_DEPTH_BIAS_U16 = (ShadowDepth)(SHADOW_DEPTH_BIAS * 65535.0f + 1.0f);
+#if defined(__GNUC__) || defined(__clang__)
+typedef uint32_t Pixel32 __attribute__((may_alias));
+#else
+using Pixel32 = uint32_t;
+#endif
 
 static inline ShadowDepth shadow_depth_to_u16(float z) {
     z = fminf(1.0f, fmaxf(0.0f, z));
@@ -147,11 +703,13 @@ std::atomic<bool> raster_threads_running{true};
 // Signal variables (Sleep/Wake)
 std::mutex mtx_tl;
 std::condition_variable cv_tl;
-int frame_tl_target = 0;
+std::atomic<int> frame_tl_target{0};
+int active_tl_job_thread_count = 0; // Protected by mtx_tl.
 
 std::mutex mtx_raster;
 std::condition_variable cv_raster;
-int frame_raster_target = 0;
+std::atomic<int> frame_raster_target{0};
+int active_raster_job_thread_count = 0; // Protected by mtx_raster.
 int active_raster_buf_id = 0; // Set by main under mtx_raster before signaling
 enum class RasterJobMode { ShadowDepth, Color, Ssao, Luminaire };
 RasterJobMode active_raster_job = RasterJobMode::Color;
@@ -159,21 +717,29 @@ RasterJobMode active_raster_job = RasterJobMode::Color;
 std::mutex mtx_main;
 std::condition_variable cv_main;
 
-// CV for T&L workers waiting on buffer_tl_ready
-std::mutex mtx_buf_ready;
-std::condition_variable cv_buf_ready;
-
 std::atomic<int> tl_done_counter{0};
 std::atomic<int> raster_strips_done{0}; // Counter for completed strips
 std::atomic<int> raster_workers_done{0}; // Counter for workers fully out of the current raster job
 std::atomic<int> next_strip_ticket{0}; // Dynamic strip assignment
 
-// Per-buffer strip completion counters (initialized in init_thread_counts via main)
-std::atomic<int> buffer_strips_complete[2];
-std::atomic<bool> buffer_tl_ready[2] = {true, true}; // T&L can write to this buffer
-std::atomic<size_t> opaque_counter{0};
-std::atomic<size_t> trans_counter{0};
-std::atomic<size_t> shadow_counter{0};
+// Wait for a predicate that worker threads will eventually set true. On
+// native we use a plain condition variable. On Emscripten's PROXY_TO_PTHREAD
+// build, main runs on a worker pthread whose futex implementation can occasionally
+// drop a wake (silently, with ASSERTIONS=0). To stay robust we mix a short
+// timed wait with a cheap predicate recheck.
+template <typename Predicate>
+static inline void wait_for_main_thread_predicate(Predicate&& predicate) {
+#ifndef __EMSCRIPTEN__
+    std::unique_lock<std::mutex> lock(mtx_main);
+    cv_main.wait(lock, std::forward<Predicate>(predicate));
+#else
+    if (predicate()) return;
+    std::unique_lock<std::mutex> lock(mtx_main);
+    while (!predicate()) {
+        cv_main.wait_for(lock, std::chrono::milliseconds(2));
+    }
+#endif
+}
 
 // Simple 5x7 font for digits 0-9
 static const uint8_t font_5x7[10][7] = {
@@ -308,11 +874,13 @@ static std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src) {
             const uint8_t* p = row + x * bpp;
             uint32_t pixel;
             if (bpp == 4) {
-                pixel = *(const uint32_t*)p;
+                memcpy(&pixel, p, sizeof(pixel));
             } else if (bpp == 3) {
                 pixel = p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
             } else if (bpp == 2) {
-                pixel = *(const uint16_t*)p;
+                uint16_t pixel16;
+                memcpy(&pixel16, p, sizeof(pixel16));
+                pixel = pixel16;
             } else {
                 pixel = *p;
             }
@@ -414,7 +982,7 @@ static inline uint32_t sample_texture_anisotropic(const PackedTextureLevel& leve
     return ((r / taps) << 16) | ((g / taps) << 8) | (b / taps);
 }
 
-static inline void add_pixel_rgb(uint32_t* row_pixels, int x, SDL_PixelFormat* format,
+static inline void add_pixel_rgb(Pixel32* row_pixels, int x, SDL_PixelFormat* format,
                                  float add_r, float add_g, float add_b) {
     uint8_t dr, dg, db;
     unpack_rgb_fast(row_pixels[x], format, dr, dg, db);
@@ -576,7 +1144,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     int y_max = std::min(screen_height - 1, (int)ceilf(ly + disk_radius));
     float inv_sigma2 = 1.0f / (disk_radius * disk_radius * 0.35f);
     for (int y = y_min; y <= y_max; y++) {
-        uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
         float dy = (float)y + 0.5f - ly;
         for (int x = x_min; x <= x_max; x++) {
             size_t idx = (size_t)y * screen_width + x;
@@ -789,8 +1357,8 @@ static inline bool sphere_intersects_spotlight_frustum_eye(const Vector3f& cente
 // Transform 3D vertices using 4x4 matrix (positions and normals)
 // For rigid-body transforms (rotation + translation), the upper 3x3 is orthonormal,
 // so the normal matrix (inverse-transpose) is just the upper 3x3 itself.
-void transform_vertices(const std::vector<Vertex3D>& source_vertices,
-                       std::vector<Vertex3D>& transformed_vertices,
+void transform_vertices(const RenderVertexList& source_vertices,
+                       RenderVertexList& transformed_vertices,
                        const Matrix4f& transform) {
     size_t n = source_vertices.size();
     transformed_vertices.resize(n);
@@ -1031,7 +1599,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                     }
                 }
                 float illum = fminf(1.0f, 0.35f + direct * visibility);
-                uint32_t* row_pixels = (uint32_t*)(pixels + y0 * pitch);
+                Pixel32* row_pixels = (Pixel32*)(pixels + y0 * pitch);
                 row_pixels[x0] = pack_rgb_fast(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
                 depth_buffer[idx] = z;
             }
@@ -1344,7 +1912,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     }
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
-        uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
         float* row_depth = depth_buffer + (size_t)y * screen_width;
         
         for (int x = x_min; x <= x_max; x++) {
@@ -1650,7 +2218,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     };
     
     for (int y = y_strip_min; y <= y_strip_max; y++) {
-        uint32_t* row_pixels = (uint32_t*)(pixels + y * pitch);
+        Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
         size_t row_base = (size_t)y * screen_width;
         const float* row_depth = depth_buffer + row_base;
         for (int x = x_tile_min; x <= x_tile_max; x++) {
@@ -1732,113 +2300,116 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
 }
 
 // Generate a UV sphere
-int main() {
+int main(int argc, char** argv) {
     init_thread_counts();
-    buffer_strips_complete[0].store(NUM_TILE_BINS);
-    buffer_strips_complete[1].store(NUM_TILE_BINS);
-    
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        return 1;
+    ThreadPerfSearch thread_perf = make_thread_perf_search(argc, argv);
+    active_tl_job_thread_count = NUM_TL_THREADS;
+    active_raster_job_thread_count = NUM_RASTER_THREADS;
+    if (thread_perf.enabled && !thread_perf.variants.empty()) {
+        NUM_TL_THREADS = thread_perf.variants[0].tl_threads;
+        NUM_RASTER_THREADS = thread_perf.variants[0].raster_threads;
+        active_tl_job_thread_count = NUM_TL_THREADS;
+        active_raster_job_thread_count = NUM_RASTER_THREADS;
+        thread_perf.log = fopen("threaadperf.log", "w");
+        if (!thread_perf.log) {
+            fprintf(stderr, "Failed to open threaadperf.log for writing\n");
+            return 1;
+        }
+        fprintf(thread_perf.log,
+                "threadperf frames_per_variant=%d variants=%zu launched_tl=%d launched_raster=%d tl_range=%d-%d raster_range=%d-%d\n",
+                thread_perf.frames_per_variant, thread_perf.variants.size(),
+                thread_perf.launched_tl_threads, thread_perf.launched_raster_threads,
+                thread_perf.min_tl_threads, thread_perf.max_tl_threads,
+                thread_perf.min_raster_threads, thread_perf.max_raster_threads);
+        fprintf(thread_perf.log, "variant tl_threads raster_threads frames elapsed_ms avg_ms fps avg_physics_wall_ms avg_physics_cpu_ms avg_physics_update_wall_ms avg_physics_sync_wall_ms avg_raster_ms avg_tl_tail_wait_ms total_frames total_elapsed_ms total_avg_ms\n");
+        fflush(thread_perf.log);
     }
-
+    
     int w = 1280;
     int h = 1024;
 
-    SDL_Window* win = SDL_CreateWindow("x", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                                       w, h, 0);
-    if (!win) {
-        SDL_Quit();
+    if (!Platform::Init(w, h, "swraster")) {
+        fprintf(stderr, "Platform::Init failed\n");
         return 1;
     }
-
-    SDL_Surface* fb = SDL_GetWindowSurface(win);  // window framebuffer (CPU)
-    if (!fb) {
-        SDL_DestroyWindow(win);
-        SDL_Quit();
-        return 1;
-    }
+    SDL_Surface* fb = Platform::GetFramebuffer();
 
     // Load textures
     SDL_Surface* surface_baboon = nullptr;
     SDL_Surface* surface_lenna = nullptr;
     SDL_Surface* surface_tiles = nullptr;
-    
+
     {
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
         char texture_path[PATH_MAX] = {0};
-        
-#ifdef __APPLE__
-        // Get executable path to construct resource path
+
         uint32_t size = PATH_MAX;
         char exe_path[PATH_MAX];
         if (_NSGetExecutablePath(exe_path, &size) == 0) {
             char real_path[PATH_MAX];
             if (realpath(exe_path, real_path)) {
-                // Check if we're in an app bundle
                 char* macos_pos = strstr(real_path, ".app/Contents/MacOS/");
                 if (macos_pos) {
                     *macos_pos = '\0';
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/baboon.bmp", real_path);
-                    surface_baboon = SDL_LoadBMP(texture_path);
-                    
+                    surface_baboon = Platform::LoadBMP(texture_path);
+
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/lenna.bmp", real_path);
-                    surface_lenna = SDL_LoadBMP(texture_path);
-                    
+                    surface_lenna = Platform::LoadBMP(texture_path);
+
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/tiles.bmp", real_path);
-                    surface_tiles = SDL_LoadBMP(texture_path);
+                    surface_tiles = Platform::LoadBMP(texture_path);
                 }
             }
         }
 #endif
-        
-        // Fallback paths if bundle path didn't work
+
         if (!surface_baboon) {
             const char* paths[] = { "../Resources/baboon.bmp", "baboon.bmp" };
             for (const char* p : paths) {
-                surface_baboon = SDL_LoadBMP(p);
+                surface_baboon = Platform::LoadBMP(p);
                 if (surface_baboon) break;
             }
         }
-        
         if (!surface_lenna) {
             const char* paths[] = { "../Resources/lenna.bmp", "lenna.bmp" };
             for (const char* p : paths) {
-                surface_lenna = SDL_LoadBMP(p);
+                surface_lenna = Platform::LoadBMP(p);
                 if (surface_lenna) break;
             }
         }
-        
         if (!surface_tiles) {
             const char* paths[] = { "../Resources/tiles.bmp", "tiles.bmp" };
             for (const char* p : paths) {
-                surface_tiles = SDL_LoadBMP(p);
+                surface_tiles = Platform::LoadBMP(p);
                 if (surface_tiles) break;
             }
         }
     }
     std::unique_ptr<PackedTexture> texture_baboon = make_packed_texture(surface_baboon);
-    std::unique_ptr<PackedTexture> texture_lenna = make_packed_texture(surface_lenna);
-    std::unique_ptr<PackedTexture> texture_tiles = make_packed_texture(surface_tiles);
-    if (surface_baboon) SDL_FreeSurface(surface_baboon);
-    if (surface_lenna) SDL_FreeSurface(surface_lenna);
-    if (surface_tiles) SDL_FreeSurface(surface_tiles);
+    std::unique_ptr<PackedTexture> texture_lenna  = make_packed_texture(surface_lenna);
+    std::unique_ptr<PackedTexture> texture_tiles  = make_packed_texture(surface_tiles);
+    if (surface_baboon) Platform::FreeSurface(surface_baboon);
+    if (surface_lenna)  Platform::FreeSurface(surface_lenna);
+    if (surface_tiles)  Platform::FreeSurface(surface_tiles);
 
     // 1. Generate Cube Geometry
-    std::vector<Vertex3D> cube_vertices;
+    RenderVertexList cube_vertices;
     std::vector<Face> cube_faces;
     generate_cube(cube_vertices, cube_faces);
     
     // 2. Generate Sphere Geometry
-    std::vector<Vertex3D> sphere_vertices;
+    RenderVertexList sphere_vertices;
     std::vector<Face> sphere_faces;
     generate_sphere(1.3f, 16, 16, sphere_vertices, sphere_faces);
     
     // 3. Generate Torus Geometry
-    std::vector<Vertex3D> torus_vertices;
+    RenderVertexList torus_vertices;
     std::vector<Face> torus_faces;
     generate_torus(1.0f, 0.4f, 32, 10, torus_vertices, torus_faces);
     
     // 4. Generate Teapot Geometry
-    std::vector<Vertex3D> teapot_vertices;
+    RenderVertexList teapot_vertices;
     std::vector<Face> teapot_faces;
     generate_teapot(teapot_vertices, teapot_faces);
     
@@ -1910,14 +2481,13 @@ int main() {
     ObjectLayerPairFilterImpl object_vs_object_layer_filter;
 
     // Create physics system
-    TempAllocatorImpl temp_allocator(64 * 1024 * 1024); // 64MB for many bodies
+    TempAllocatorImplWithMallocFallback temp_allocator(64 * 1024 * 1024); // fixed block, with safety fallback
     // PhysicsSystem must be destroyed AFTER JobSystem (which stops threads).
     // By declaring it BEFORE JobSystem, it will be destroyed LAST.
     // Interfaces declared above must outlive PhysicsSystem.
     PhysicsSystem physics_system;
     
-    unsigned int num_threads = std::thread::hardware_concurrency();
-    JobSystemThreadPool job_system(JOLT_MAX_PHYSICS_JOBS, JOLT_MAX_PHYSICS_BARRIERS, num_threads > 1 ? num_threads - 1 : 1);
+    JobSystemThreadPool job_system(JOLT_MAX_PHYSICS_JOBS, JOLT_MAX_PHYSICS_BARRIERS, JOLT_WORKER_THREADS);
     
     physics_system.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints,
                         broad_phase_layer_interface, object_vs_broadphase_layer_filter, object_vs_object_layer_filter);
@@ -1968,14 +2538,14 @@ int main() {
     instances.reserve(441); // 40 main objects + 400 balls + ground
     
     // Generate small ball geometry (once)
-    std::vector<Vertex3D> smallball_vertices;
+    RenderVertexList smallball_vertices;
     std::vector<Face> smallball_faces;
     generate_sphere(0.3f, 8, 6, smallball_vertices, smallball_faces);
     
     // Render-only ground plane: low enough to remain below the rotating cube envelope.
     const float ground_y = -(sqrtf(3.0f) * box_half + wall_thick + 0.5f);
     const float ground_half = 48.0f;
-    std::vector<Vertex3D> ground_vertices;
+    RenderVertexList ground_vertices;
     std::vector<Face> ground_faces;
     ground_vertices.reserve(4);
     auto add_ground_vertex = [&](float x, float z, float u, float v) {
@@ -1990,10 +2560,10 @@ int main() {
     int g1 = add_ground_vertex( ground_half, -ground_half, 2.0f, 0.0f);
     int g2 = add_ground_vertex( ground_half,  ground_half, 2.0f, 2.0f);
     int g3 = add_ground_vertex(-ground_half,  ground_half, 0.0f, 2.0f);
-    ground_faces.push_back({g0, g2, g1, 0.68f, 0.68f, 0.68f, 1.0f, nullptr});
-    ground_faces.push_back({g0, g3, g2, 0.68f, 0.68f, 0.68f, 1.0f, nullptr});
+    ground_faces.push_back({g0, g2, g1, 0.68f, 0.68f, 0.68f, 1.0f});
+    ground_faces.push_back({g0, g3, g2, 0.68f, 0.68f, 0.68f, 1.0f});
     
-    auto compute_bound_radius = [](const std::vector<Vertex3D>& vertices) {
+    auto compute_bound_radius = [](const RenderVertexList& vertices) {
         float max_r2 = 0.0f;
         for (const Vertex3D& v : vertices) {
             max_r2 = std::max(max_r2, v.position.head<3>().squaredNorm());
@@ -2231,6 +2801,85 @@ int main() {
     printf("Jolt: Created %zu physics bodies\n", instances.size());
     
     physics_system.OptimizeBroadPhase();
+
+    struct InitialInstanceState {
+        float tx, ty, tz;
+        float qx, qy, qz, qw;
+        Vec3 linear_velocity;
+        Vec3 angular_velocity;
+    };
+    std::vector<InitialInstanceState> initial_instance_states;
+    initial_instance_states.reserve(instances.size());
+    for (const auto& inst : instances) {
+        InitialInstanceState state{inst.tx, inst.ty, inst.tz, inst.qx, inst.qy, inst.qz, inst.qw,
+                                   Vec3::sZero(), Vec3::sZero()};
+        if (!inst.body_id.IsInvalid()) {
+            RVec3 pos;
+            Quat rot;
+            body_interface.GetPositionAndRotation(inst.body_id, pos, rot);
+            body_interface.GetLinearAndAngularVelocity(inst.body_id, state.linear_velocity, state.angular_velocity);
+            state.tx = (float)pos.GetX();
+            state.ty = (float)pos.GetY();
+            state.tz = (float)pos.GetZ();
+            state.qx = rot.GetX();
+            state.qy = rot.GetY();
+            state.qz = rot.GetZ();
+            state.qw = rot.GetW();
+        }
+        initial_instance_states.push_back(state);
+    }
+
+    struct InstancePose {
+        float tx, ty, tz;
+        float qx, qy, qz, qw;
+    };
+    struct PoseSnapshot {
+        std::vector<InstancePose> poses;
+        float sim_time = 0.0f;
+        uint64_t sequence = 0;
+    };
+    auto write_instance_pose_snapshot = [&](PoseSnapshot& snapshot, float snapshot_time, uint64_t sequence) {
+        snapshot.sim_time = snapshot_time;
+        snapshot.sequence = sequence;
+        if (snapshot.poses.size() != instances.size()) {
+            snapshot.poses.resize(instances.size());
+        }
+        for (size_t i = 0; i < instances.size(); i++) {
+            const CubeInstance& inst = instances[i];
+            snapshot.poses[i] = {inst.tx, inst.ty, inst.tz, inst.qx, inst.qy, inst.qz, inst.qw};
+        }
+    };
+    PoseSnapshot pose_snapshots[3];
+    for (auto& snapshot : pose_snapshots) {
+        snapshot.poses.resize(instances.size());
+        for (size_t i = 0; i < instances.size(); i++) {
+            snapshot.poses[i] = {instances[i].tx, instances[i].ty, instances[i].tz,
+                                 instances[i].qx, instances[i].qy, instances[i].qz, instances[i].qw};
+        }
+    }
+    std::mutex pose_snapshot_mtx;
+    std::atomic<int> published_pose_snapshot{0};
+    std::atomic<uint64_t> published_pose_sequence{0};
+    uint64_t consumed_pose_sequence = UINT64_MAX;
+
+    std::mutex physics_mtx;
+    std::condition_variable physics_cv;
+    std::condition_variable physics_idle_cv;
+    bool physics_thread_running = true;
+    bool physics_job_pending = false;
+    bool physics_job_active = false;
+    bool physics_job_armed = false;
+    bool physics_trigger_deferred = false;
+    int raster_phase_state = 2; // 0 = not started, 1 = raster in flight, 2 = raster done
+    float physics_job_delta = 0.0f;
+    float physics_job_time = 0.0f;
+    uint64_t physics_job_sequence = 0;
+    uint64_t next_physics_sequence = 1;
+    int next_physics_snapshot = 1;
+    double physics_wall_ms_accum = 0.0;
+    double physics_cpu_ms_accum = 0.0;
+    double physics_update_wall_ms_accum = 0.0;
+    double physics_sync_wall_ms_accum = 0.0;
     
     // Structure for collected triangles (for threaded rendering)
     struct RenderTriangle {
@@ -2292,24 +2941,21 @@ int main() {
     struct TLSharedData {
         const std::vector<CubeInstance>* instances;
         const std::vector<std::pair<float, size_t>>* sorted_instances;
-        const std::vector<Vertex3D>* cube_vertices;
+        const RenderVertexList* cube_vertices;
         const std::vector<Face>* cube_faces;
-        const std::vector<Vertex3D>* sphere_vertices;
+        const RenderVertexList* sphere_vertices;
         const std::vector<Face>* sphere_faces;
-        const std::vector<Vertex3D>* torus_vertices;
+        const RenderVertexList* torus_vertices;
         const std::vector<Face>* torus_faces;
-        const std::vector<Vertex3D>* teapot_vertices;
+        const RenderVertexList* teapot_vertices;
         const std::vector<Face>* teapot_faces;
-        const std::vector<Vertex3D>* smallball_vertices;
+        const RenderVertexList* smallball_vertices;
         const std::vector<Face>* smallball_faces;
-        const std::vector<Vertex3D>* ground_vertices;
+        const RenderVertexList* ground_vertices;
         const std::vector<Face>* ground_faces;
         std::vector<RenderTriangle>* opaque_triangles;
-        std::atomic<size_t>* opaque_count;
         std::vector<RenderTriangle>* trans_triangles;
-        std::atomic<size_t>* trans_count;
         std::vector<RenderTriangle>* shadow_triangles;
-        std::atomic<size_t>* shadow_count;
         StripTriangleBuffer* opaque_strip_triangles;
         StripTriangleBuffer* trans_strip_triangles;
         StripTriangleBuffer* shadow_strip_triangles;
@@ -2343,7 +2989,9 @@ int main() {
         std::vector<std::vector<RenderTriangle>> trans_bins;
         std::vector<std::vector<RenderTriangle>> shadow_bins;
     };
-    std::vector<TLThreadOutput> tl_thread_outputs(NUM_TL_THREADS);
+    int launched_tl_threads = thread_perf.enabled ? thread_perf.launched_tl_threads : NUM_TL_THREADS;
+    int launched_raster_threads = thread_perf.enabled ? thread_perf.launched_raster_threads : NUM_RASTER_THREADS;
+    std::vector<TLThreadOutput> tl_thread_outputs(launched_tl_threads);
     for (auto& out : tl_thread_outputs) {
         out.opaque.reserve(1000);
         out.trans.reserve(1000);
@@ -2351,6 +2999,11 @@ int main() {
         out.opaque_bins.resize(NUM_TILE_BINS);
         out.trans_bins.resize(NUM_TILE_BINS);
         out.shadow_bins.resize(NUM_TILE_BINS);
+        for (int s = 0; s < NUM_TILE_BINS; s++) {
+            out.opaque_bins[s].reserve(128);
+            out.trans_bins[s].reserve(64);
+            out.shadow_bins[s].reserve(128);
+        }
     }
     
     // Shared data for raster threads
@@ -2385,6 +3038,184 @@ int main() {
         bool depth_write_enabled;
     };
     RasterSharedData raster_shared[2]; // Double-buffered to prevent race
+
+    auto wait_for_physics_idle = [&]() {
+        std::unique_lock<std::mutex> lock(physics_mtx);
+        physics_idle_cv.wait(lock, [&]{
+            return !physics_job_pending && !physics_job_active;
+        });
+    };
+
+    auto apply_latest_pose_snapshot = [&]() {
+        int snapshot_idx;
+        uint64_t sequence;
+        {
+            std::lock_guard<std::mutex> lock(pose_snapshot_mtx);
+            snapshot_idx = published_pose_snapshot.load(std::memory_order_acquire);
+            sequence = published_pose_sequence.load(std::memory_order_acquire);
+            if (sequence == consumed_pose_sequence) {
+                return pose_snapshots[snapshot_idx].sim_time;
+            }
+            const PoseSnapshot& snapshot = pose_snapshots[snapshot_idx];
+            size_t n = std::min(instances.size(), snapshot.poses.size());
+            for (size_t i = 0; i < n; i++) {
+                const InstancePose& pose = snapshot.poses[i];
+                CubeInstance& inst = instances[i];
+                inst.tx = pose.tx;
+                inst.ty = pose.ty;
+                inst.tz = pose.tz;
+                inst.qx = pose.qx;
+                inst.qy = pose.qy;
+                inst.qz = pose.qz;
+                inst.qw = pose.qw;
+            }
+            consumed_pose_sequence = sequence;
+            return snapshot.sim_time;
+        }
+    };
+
+    auto arm_physics_after_tl = [&](float delta_time, float target_time) {
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        physics_job_armed = delta_time > 0.0f && !physics_job_pending && !physics_job_active;
+        physics_trigger_deferred = false;
+        raster_phase_state = physics_job_armed ? 0 : 2;
+        if (physics_job_armed) {
+            physics_job_delta = delta_time;
+            physics_job_time = target_time;
+            physics_job_sequence = next_physics_sequence++;
+        }
+    };
+
+    auto trigger_physics_after_tl = [&]() {
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        if (!physics_job_armed || physics_job_pending || physics_job_active) {
+            return;
+        }
+        if (raster_phase_state == 0) {
+            physics_trigger_deferred = true;
+            return;
+        }
+        physics_trigger_deferred = false;
+        physics_job_armed = false;
+        physics_job_pending = true;
+        physics_cv.notify_one();
+    };
+
+    auto mark_raster_phase_in_flight = [&]() {
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        raster_phase_state = 1;
+        if (physics_trigger_deferred && physics_job_armed &&
+            !physics_job_pending && !physics_job_active) {
+            physics_trigger_deferred = false;
+            physics_job_armed = false;
+            physics_job_pending = true;
+            physics_cv.notify_one();
+        }
+    };
+
+    auto mark_raster_phase_done = [&]() {
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        raster_phase_state = 2;
+        physics_trigger_deferred = false;
+    };
+
+    auto step_physics_to_snapshot = [&](float delta_time, float target_time,
+                                        uint64_t sequence, PoseSnapshot& out_snapshot) {
+        Uint64 physics_phase_start = Platform::PerfCounter();
+        Uint64 physics_update_start = physics_phase_start;
+        Uint64 physics_update_end = physics_phase_start;
+        Uint64 physics_sync_end = physics_phase_start;
+        double physics_cpu_start_ms = process_cpu_ms();
+
+        Quat box_rotation = Quat::sEulerAngles(Vec3(target_time * 0.8f,
+                                                   target_time * 0.6f,
+                                                   target_time * 0.4f));
+        for (const auto& wall : walls) {
+            Vec3 rotated_pos = box_rotation * wall.local_pos;
+            body_interface.MoveKinematic(wall.id,
+                                         RVec3(rotated_pos.GetX(), rotated_pos.GetY(), rotated_pos.GetZ()),
+                                         box_rotation, delta_time);
+        }
+
+        int collision_steps = (int)ceilf(delta_time * 60.0f);
+        if (collision_steps < 1) collision_steps = 1;
+        if (collision_steps > 4) collision_steps = 4;
+        physics_update_start = Platform::PerfCounter();
+        physics_system.Update(delta_time, collision_steps, &temp_allocator, &job_system);
+        physics_update_end = Platform::PerfCounter();
+
+        out_snapshot.sim_time = target_time;
+        out_snapshot.sequence = sequence;
+        if (out_snapshot.poses.size() != instances.size()) {
+            out_snapshot.poses.resize(instances.size());
+        }
+        for (size_t i = 0; i < instances.size(); i++) {
+            const CubeInstance& inst = instances[i];
+            InstancePose pose{inst.tx, inst.ty, inst.tz, inst.qx, inst.qy, inst.qz, inst.qw};
+            if (!inst.body_id.IsInvalid()) {
+                RVec3 pos;
+                Quat rot;
+                body_interface.GetPositionAndRotation(inst.body_id, pos, rot);
+                pose.tx = (float)pos.GetX();
+                pose.ty = (float)pos.GetY();
+                pose.tz = (float)pos.GetZ();
+                pose.qx = rot.GetX();
+                pose.qy = rot.GetY();
+                pose.qz = rot.GetZ();
+                pose.qw = rot.GetW();
+            }
+            out_snapshot.poses[i] = pose;
+        }
+        physics_sync_end = Platform::PerfCounter();
+
+        double wall_ms = perf_ms(physics_phase_start, physics_sync_end);
+        double update_wall_ms = perf_ms(physics_update_start, physics_update_end);
+        double sync_wall_ms = perf_ms(physics_update_end, physics_sync_end);
+        double cpu_ms = process_cpu_ms() - physics_cpu_start_ms;
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        physics_wall_ms_accum += wall_ms;
+        physics_cpu_ms_accum += cpu_ms;
+        physics_update_wall_ms_accum += update_wall_ms;
+        physics_sync_wall_ms_accum += sync_wall_ms;
+    };
+
+    auto physics_worker_func = [&]() {
+        while (true) {
+            float delta_time;
+            float target_time;
+            uint64_t sequence;
+            int snapshot_idx;
+            {
+                std::unique_lock<std::mutex> lock(physics_mtx);
+                physics_cv.wait(lock, [&]{
+                    return !physics_thread_running || physics_job_pending;
+                });
+                if (!physics_thread_running && !physics_job_pending) {
+                    break;
+                }
+                physics_job_pending = false;
+                physics_job_active = true;
+                delta_time = physics_job_delta;
+                target_time = physics_job_time;
+                sequence = physics_job_sequence;
+                snapshot_idx = next_physics_snapshot;
+                next_physics_snapshot = (next_physics_snapshot + 1) % 3;
+            }
+
+            step_physics_to_snapshot(delta_time, target_time, sequence, pose_snapshots[snapshot_idx]);
+
+            {
+                std::lock_guard<std::mutex> lock(pose_snapshot_mtx);
+                published_pose_snapshot.store(snapshot_idx, std::memory_order_release);
+                published_pose_sequence.store(sequence, std::memory_order_release);
+            }
+            {
+                std::lock_guard<std::mutex> lock(physics_mtx);
+                physics_job_active = false;
+                physics_idle_cv.notify_all();
+            }
+        }
+    };
     
     // T&L worker function (persistent)
     auto tl_worker_func = [&](int thread_id) {
@@ -2403,24 +3234,20 @@ int main() {
         while (tl_threads_running.load()) {
             // Wait for work (Sleep until signaled)
             int current_frame;
+            int active_tl_threads;
             {
                 std::unique_lock<std::mutex> lock(mtx_tl);
                 cv_tl.wait(lock, [&]{ 
-                    return !tl_threads_running.load() || frame_tl_target > last_frame_processed; 
+                    return !tl_threads_running.load(std::memory_order_relaxed) ||
+                        frame_tl_target.load(std::memory_order_acquire) > last_frame_processed;
                 });
-                if (!tl_threads_running.load()) break;
-                current_frame = frame_tl_target;
-            }
-            last_frame_processed = current_frame;
-            
-            // Wait for buffer to be ready (main finished sorting previous use)
-            int buf_idx = current_frame % 2;
-            {
-                std::unique_lock<std::mutex> lock(mtx_buf_ready);
-                cv_buf_ready.wait(lock, [&]{ 
-                    return !tl_threads_running.load() || buffer_tl_ready[buf_idx].load(); 
-                });
-                if (!tl_threads_running.load()) break;
+                if (!tl_threads_running.load(std::memory_order_relaxed)) break;
+                current_frame = frame_tl_target.load(std::memory_order_acquire);
+                active_tl_threads = active_tl_job_thread_count;
+                last_frame_processed = current_frame;
+                if (thread_id >= active_tl_threads) {
+                    continue;
+                }
             }
             
             // Clear local buffer
@@ -2435,7 +3262,7 @@ int main() {
             
             // Process assigned instances
             int num_instances = (int)tl_shared.sorted_instances->size();
-            int instances_per_thread = (num_instances + NUM_TL_THREADS - 1) / NUM_TL_THREADS;
+            int instances_per_thread = (num_instances + active_tl_threads - 1) / active_tl_threads;
             int start_idx = thread_id * instances_per_thread;
             int end_idx = std::min(start_idx + instances_per_thread, num_instances);
             auto screen_tile_range = [&](float x0, float x1, float x2, float y0, float y1, float y2,
@@ -2477,8 +3304,8 @@ int main() {
             };
             
             // Pre-allocated thread-local vertex buffers (reused across instances)
-            std::vector<Vertex3D> eye_space_vertices;
-            std::vector<Vertex3D> clip_space_vertices;
+            RenderVertexList eye_space_vertices;
+            RenderVertexList clip_space_vertices;
             
             for (int i = start_idx; i < end_idx; i++) {
                 const auto& depth_pair = (*tl_shared.sorted_instances)[i];
@@ -2486,7 +3313,7 @@ int main() {
                 const auto& inst = (*tl_shared.instances)[depth_pair.second];
                 
                 // Select geometry based on instance type
-                const std::vector<Vertex3D>* src_vertices;
+                const RenderVertexList* src_vertices;
                 const std::vector<Face>* src_faces;
                 float src_bound_radius;
                 switch (inst.type) {
@@ -2790,7 +3617,14 @@ int main() {
             }
             
             // Signal completion; the wait predicate reads this atomic.
-            if (tl_done_counter.fetch_add(1, std::memory_order_release) + 1 >= NUM_TL_THREADS) {
+            if (tl_done_counter.fetch_add(1, std::memory_order_release) + 1 >= active_tl_threads) {
+                trigger_physics_after_tl();
+                // Synchronise with main's mtx_main critical section to close the
+                // lost-wakeup window between main checking the predicate and
+                // entering cv_main.wait(). Without this, notify_one() can fire
+                // while main is mid-transition into wait() and be dropped,
+                // hard-deadlocking on native and stalling on web.
+                { std::lock_guard<std::mutex> lock(mtx_main); }
                 cv_main.notify_one();
             }
         }
@@ -2819,25 +3653,33 @@ int main() {
             // Wait for work (Sleep)
             int current_frame;
             int buf_id;
+            int active_raster_threads;
             RasterJobMode job_mode;
             {
                 std::unique_lock<std::mutex> lock(mtx_raster);
                 cv_raster.wait(lock, [&]{ 
-                    return !raster_threads_running.load() || frame_raster_target > last_frame_processed; 
+                    return !raster_threads_running.load(std::memory_order_relaxed) ||
+                        frame_raster_target.load(std::memory_order_acquire) > last_frame_processed;
                 });
-                if (!raster_threads_running.load()) break;
-                current_frame = frame_raster_target;
+                if (!raster_threads_running.load(std::memory_order_relaxed)) break;
+                current_frame = frame_raster_target.load(std::memory_order_acquire);
                 buf_id = active_raster_buf_id;
+                active_raster_threads = active_raster_job_thread_count;
                 job_mode = active_raster_job;
+                last_frame_processed = current_frame;
+                if (thread_id >= active_raster_threads) {
+                    continue;
+                }
             }
-            last_frame_processed = current_frame;
             
             // Reference to the active buffer's shared data
             auto& rs = raster_shared[buf_id];
             
-            // Dynamic strip assignment - grab next ticket (relaxed: pure counter)
+            // Dynamic strip assignment - each worker grabs unique tile tickets
+            // under a strong acq_rel order so the resulting tile_idx is fully
+            // serialised with the per-tile reads/writes that follow.
             while (true) {
-                int ticket = next_strip_ticket.fetch_add(1, std::memory_order_relaxed);
+                int ticket = next_strip_ticket.fetch_add(1, std::memory_order_acq_rel);
                 if (ticket >= NUM_TILE_BINS) break;
                 
                 int tile_idx = tile_order[ticket];
@@ -2895,7 +3737,7 @@ int main() {
                     }
                 } else if (job_mode == RasterJobMode::Color) {
                     // Clear strip (vectorizable by compiler with -O3)
-                    uint32_t* pixel_buffer = (uint32_t*)rs.pixels;
+                    Pixel32* pixel_buffer = (Pixel32*)rs.pixels;
                     int pixels_per_row = rs.pitch / 4;
                     for (int y = y_min; y <= y_max; y++) {
                         std::fill(pixel_buffer + (size_t)y * pixels_per_row + x_min,
@@ -2969,7 +3811,11 @@ int main() {
                 raster_strips_done.fetch_add(1, std::memory_order_relaxed);
             }
             
-            if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= NUM_RASTER_THREADS) {
+            if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= active_raster_threads) {
+                // See matching comment in tl_worker_func: empty critical
+                // section on mtx_main closes the predicate-check / wait()
+                // race window so notify_one() can't be dropped.
+                { std::lock_guard<std::mutex> lock(mtx_main); }
                 cv_main.notify_one();
             }
             
@@ -2979,23 +3825,25 @@ int main() {
     
     // Launch persistent worker threads
     std::vector<std::thread> tl_workers;
-    for (int i = 0; i < NUM_TL_THREADS; i++) {
+    for (int i = 0; i < launched_tl_threads; i++) {
         tl_workers.emplace_back(tl_worker_func, i);
     }
     
     std::vector<std::thread> raster_workers;
-    for (int i = 0; i < NUM_RASTER_THREADS; i++) {
+    for (int i = 0; i < launched_raster_threads; i++) {
         raster_workers.emplace_back(raster_worker_func, i);
     }
 
+    std::thread physics_worker(physics_worker_func);
+
     bool running = true;
     bool paused = false;
-    bool camera_orbiting = false;
+    [[maybe_unused]] bool camera_orbiting = false;
     float camera_yaw = 0.0f;
     float camera_pitch = asinf(8.0f / sqrtf(8.0f * 8.0f + 21.7f * 21.7f));
     float camera_distance = sqrtf(8.0f * 8.0f + 21.7f * 21.7f);
-    SDL_Event event;
-    
+    Platform::Event event;
+
     // Allocate depth buffer
     int screen_width = fb->w;
     int screen_height = fb->h;
@@ -3003,136 +3851,194 @@ int main() {
     std::vector<ShadowDepth> shadow_depth_buffers[2];
     shadow_depth_buffers[0].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     shadow_depth_buffers[1].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
-    
+
     // FPS tracking
     Uint64 frame_count = 0;
-    Uint64 last_fps_time = SDL_GetTicks64();
+    Uint64 last_fps_time = Platform::TicksMs();
     int fps = 0;
+    float sim_time = 0.0f;
+    int frame_num = 1;       // Resets per benchmark variant to flush the pipeline.
+    int frame_sequence = 1;  // Monotonic worker wake token; never resets while threads live.
     
     // Pre-allocate instance_depths outside loop
     std::vector<std::pair<float, size_t>> instance_depths;
     instance_depths.reserve(instances.size());
     std::vector<uint8_t> instance_occlusion_flags(instances.size(), 0);
-    Uint64 last_physics_time = SDL_GetTicks64();
-    auto window_can_render = [&]() {
-        Uint32 flags = SDL_GetWindowFlags(win);
-        return (flags & SDL_WINDOW_SHOWN) &&
-               (flags & SDL_WINDOW_INPUT_FOCUS) &&
-               !(flags & SDL_WINDOW_HIDDEN) &&
-               !(flags & SDL_WINDOW_MINIMIZED);
+    Uint64 last_physics_time = Platform::TicksMs();
+    auto reset_animation = [&]() {
+        wait_for_physics_idle();
+        sim_time = 0.0f;
+        frame_num = 1;
+        frame_count = 0;
+        fps = 0;
+        last_fps_time = Platform::TicksMs();
+        last_physics_time = last_fps_time;
+
+        for (const auto& wall : walls) {
+            body_interface.SetPositionAndRotation(
+                wall.id,
+                RVec3(wall.local_pos.GetX(), wall.local_pos.GetY(), wall.local_pos.GetZ()),
+                Quat::sIdentity(),
+                EActivation::Activate);
+            body_interface.SetLinearAndAngularVelocity(wall.id, Vec3::sZero(), Vec3::sZero());
+        }
+        for (size_t i = 0; i < instances.size() && i < initial_instance_states.size(); i++) {
+            const InitialInstanceState& state = initial_instance_states[i];
+            CubeInstance& inst = instances[i];
+            inst.tx = state.tx;
+            inst.ty = state.ty;
+            inst.tz = state.tz;
+            inst.qx = state.qx;
+            inst.qy = state.qy;
+            inst.qz = state.qz;
+            inst.qw = state.qw;
+            if (!inst.body_id.IsInvalid()) {
+                body_interface.SetPositionAndRotation(
+                    inst.body_id,
+                    RVec3(state.tx, state.ty, state.tz),
+                    Quat(state.qx, state.qy, state.qz, state.qw),
+                    EActivation::Activate);
+                body_interface.SetLinearAndAngularVelocity(
+                    inst.body_id, state.linear_velocity, state.angular_velocity);
+            }
+        }
+        physics_system.OptimizeBroadPhase();
+        {
+            std::lock_guard<std::mutex> lock(pose_snapshot_mtx);
+            for (auto& snapshot : pose_snapshots) {
+                write_instance_pose_snapshot(snapshot, 0.0f, 0);
+            }
+            published_pose_snapshot.store(0, std::memory_order_release);
+            published_pose_sequence.store(0, std::memory_order_release);
+            consumed_pose_sequence = UINT64_MAX;
+        }
+        {
+            std::lock_guard<std::mutex> lock(physics_mtx);
+            physics_job_pending = false;
+            physics_job_active = false;
+            physics_job_armed = false;
+            physics_trigger_deferred = false;
+            raster_phase_state = 2;
+            physics_job_delta = 0.0f;
+            physics_job_time = 0.0f;
+            physics_job_sequence = 0;
+            next_physics_sequence = 1;
+            next_physics_snapshot = 1;
+            physics_wall_ms_accum = 0.0;
+            physics_cpu_ms_accum = 0.0;
+            physics_update_wall_ms_accum = 0.0;
+            physics_sync_wall_ms_accum = 0.0;
+        }
+        for (int b = 0; b < 2; b++) {
+            opaque_buffers[b].count = 0;
+            trans_buffers[b].count = 0;
+            shadow_buffers[b].count = 0;
+            for (int s = 0; s < NUM_TILE_BINS; s++) {
+                opaque_strip_buffers[b].bins[s].clear();
+                trans_strip_buffers[b].bins[s].clear();
+                shadow_strip_buffers[b].bins[s].clear();
+            }
+        }
+        tl_done_counter.store(0, std::memory_order_relaxed);
+        raster_workers_done.store(0, std::memory_order_relaxed);
+        raster_strips_done.store(0, std::memory_order_relaxed);
+        next_strip_ticket.store(0, std::memory_order_relaxed);
     };
-    bool window_renderable = window_can_render();
-    
+    if (thread_perf.enabled) {
+        reset_animation();
+        thread_perf.search_start_ticks = Platform::TicksMs();
+        thread_perf.variant_start_ticks = thread_perf.search_start_ticks;
+        printf("Thread perf variant %zu/%zu: TL=%d raster=%d frames=%d\n",
+               thread_perf.variant_index + 1, thread_perf.variants.size(),
+               NUM_TL_THREADS, NUM_RASTER_THREADS, thread_perf.frames_per_variant);
+    }
+    bool window_renderable = Platform::IsRenderable();
+
     while (running) {
-        // Handle events
-        while (SDL_PollEvent(&event)) {
-            if (event.type == SDL_QUIT) {
-                running = false;
-            } else if (event.type == SDL_WINDOWEVENT) {
-                switch (event.window.event) {
-                    case SDL_WINDOWEVENT_HIDDEN:
-                    case SDL_WINDOWEVENT_MINIMIZED:
-                    case SDL_WINDOWEVENT_FOCUS_LOST:
-                        window_renderable = false;
-                        camera_orbiting = false;
-                        SDL_FlushEvents(SDL_MOUSEMOTION, SDL_MULTIGESTURE);
-                        break;
-                    case SDL_WINDOWEVENT_SHOWN:
-                    case SDL_WINDOWEVENT_RESTORED:
-                    case SDL_WINDOWEVENT_EXPOSED:
-                    case SDL_WINDOWEVENT_FOCUS_GAINED:
-                        window_renderable = window_can_render();
-                        last_physics_time = SDL_GetTicks64();
-                        SDL_FlushEvents(SDL_MOUSEMOTION, SDL_MULTIGESTURE);
-                        break;
-                    default:
-                        break;
-                }
-            } else if (event.type == SDL_KEYDOWN && !event.key.repeat && event.key.keysym.sym == SDLK_SPACE) {
-                paused = !paused;
-            } else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-                camera_orbiting = true;
-            } else if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-                camera_orbiting = false;
-            } else if (event.type == SDL_MOUSEMOTION && camera_orbiting) {
-                camera_yaw -= event.motion.xrel * 0.006f;
-                camera_pitch += event.motion.yrel * 0.006f;
-                const float max_pitch = 1.45f;
-                if (camera_pitch > max_pitch) camera_pitch = max_pitch;
-                if (camera_pitch < -max_pitch) camera_pitch = -max_pitch;
-            } else if (event.type == SDL_MOUSEWHEEL) {
-                camera_distance *= powf(0.88f, (float)event.wheel.y);
-                if (camera_distance < 4.0f) camera_distance = 4.0f;
-                if (camera_distance > 80.0f) camera_distance = 80.0f;
-            } else if (event.type == SDL_MULTIGESTURE) {
-                camera_distance *= expf(-event.mgesture.dDist * 6.0f);
-                if (camera_distance < 4.0f) camera_distance = 4.0f;
-                if (camera_distance > 80.0f) camera_distance = 80.0f;
+        // Pump platform events through a small portable Event type.
+        while (Platform::PollEvent(event)) {
+            switch (event.type) {
+                case Platform::Event::Quit:
+                    running = false;
+                    break;
+                case Platform::Event::VisibilityChanged:
+                    window_renderable = event.visible;
+                    if (!event.visible) camera_orbiting = false;
+                    last_physics_time = Platform::TicksMs();
+                    break;
+                case Platform::Event::KeyDown:
+                    if (event.key == ' ') paused = !paused;
+                    break;
+                case Platform::Event::MouseButton:
+                    if (event.button == 1) camera_orbiting = event.pressed;
+                    break;
+                case Platform::Event::MouseMotion:
+                    if (camera_orbiting) {
+                        camera_yaw   -= event.xrel * 0.006f;
+                        camera_pitch += event.yrel * 0.006f;
+                        const float max_pitch = 1.45f;
+                        if (camera_pitch > max_pitch) camera_pitch = max_pitch;
+                        if (camera_pitch < -max_pitch) camera_pitch = -max_pitch;
+                    }
+                    break;
+                case Platform::Event::MouseWheel:
+                    camera_distance *= powf(0.88f, (float)event.wheel_y);
+                    if (camera_distance < 4.0f) camera_distance = 4.0f;
+                    if (camera_distance > 80.0f) camera_distance = 80.0f;
+                    break;
+                default:
+                    break;
             }
         }
 
         if (!running) {
             break;
         }
-        window_renderable = window_can_render();
+        window_renderable = Platform::IsRenderable();
         if (!window_renderable) {
             camera_orbiting = false;
-            last_physics_time = SDL_GetTicks64();
-            SDL_Delay(16);
+            last_physics_time = Platform::TicksMs();
+            Platform::Delay(16);
             continue;
         }
 
-        SDL_LockSurface(fb);
-        
-        uint8_t* pixels = (uint8_t*)fb->pixels;       // raw pointer
-        int pitch = fb->pitch;                        // bytes per row
+        fb = Platform::GetFramebuffer();
+        if (!fb || !fb->format || fb->format->BytesPerPixel != 4) {
+            camera_orbiting = false;
+            last_physics_time = Platform::TicksMs();
+            Platform::Delay(16);
+            continue;
+        }
+        if (fb->w != screen_width || fb->h != screen_height) {
+            screen_width = fb->w;
+            screen_height = fb->h;
+            depth_buffer.assign((size_t)screen_width * (size_t)screen_height, 1.0f);
+            last_physics_time = Platform::TicksMs();
+        }
+
+        uint8_t* pixels = (uint8_t*)fb->pixels;
+        int pitch = fb->pitch;
 
         // Get current time and compute delta
-        Uint64 now = SDL_GetTicks64();
+        Uint64 now = Platform::TicksMs();
         float delta_time = (now - last_physics_time) / 1000.0f;
         last_physics_time = now;
         
-        // Clamp delta to 16ms max to avoid physics explosion on pause/lag
-        if (delta_time > 0.016f) delta_time = 0.016f;
-        if (paused) delta_time = 0.0f;
-        
-        // Track simulated time (only advances by clamped delta)
-        static float sim_time = 0.0f;
-        sim_time += delta_time;
-        float time = sim_time;
-        
-        if (!paused) {
-            // Tumble the container box
-            Quat box_rotation = Quat::sEulerAngles(Vec3(time * 0.8f, time * 0.6f, time * 0.4f));
-            for (const auto& wall : walls) {
-                // Rotate local position around origin
-                Vec3 rotated_pos = box_rotation * wall.local_pos;
-                // Use MoveKinematic so Jolt computes wall velocity for proper collision response
-                body_interface.MoveKinematic(wall.id, RVec3(rotated_pos.GetX(), rotated_pos.GetY(), rotated_pos.GetZ()), box_rotation, delta_time);
-            }
-            
-            // Physics Update with real delta time
-            int collision_steps = (int)ceilf(delta_time * 60.0f); // More steps for larger deltas
-            if (collision_steps < 1) collision_steps = 1;
-            if (collision_steps > 4) collision_steps = 4;
-            physics_system.Update(delta_time, collision_steps, &temp_allocator, &job_system);
-            
-            // Sync all physics bodies to graphics instances
-            for (auto& inst : instances) {
-                if (!inst.body_id.IsInvalid()) {
-                    RVec3 pos;
-                    Quat rot;
-                    body_interface.GetPositionAndRotation(inst.body_id, pos, rot);
-                    inst.tx = (float)pos.GetX();
-                    inst.ty = (float)pos.GetY();
-                    inst.tz = (float)pos.GetZ();
-                    inst.qx = rot.GetX();
-                    inst.qy = rot.GetY();
-                    inst.qz = rot.GetZ();
-                    inst.qw = rot.GetW();
-                }
-            }
+        // Benchmark variants use a fixed step so every thread-count candidate sees
+        // the same animation sequence independent of how fast it renders.
+        if (thread_perf.enabled) {
+            delta_time = 1.0f / 60.0f;
+        } else {
+            // Clamp delta to 16ms max to avoid physics explosion on pause/lag
+            if (delta_time > 0.016f) delta_time = 0.016f;
+            if (paused) delta_time = 0.0f;
         }
+        
+        // Render from the newest completed physics pose. The next Jolt step is armed
+        // now, but starts only when T&L finishes and raster is already in flight.
+        sim_time = apply_latest_pose_snapshot();
+        float time = sim_time;
+        arm_physics_after_tl(delta_time, time + delta_time);
         
         // Build projection matrix (60 degrees FOV) - persistent, only build once
         static float last_aspect = 0.0f;
@@ -3301,17 +4207,14 @@ int main() {
                   });
         
         // Pipelined Rendering Logic
-        static int frame_num = 1;
         int tl_buf_idx = frame_num % 2;       // Buffer we will FILL
         int raster_buf_idx = (frame_num + 1) % 2; // Buffer we will RASTERIZE (filled previous frame)
         
-        // 1. Setup T&L for Frame N - just reset counters, buffers are pre-allocated.
+        // 1. Setup T&L for Frame N - just clear the bins. Buffer counts are
+        // published once the worker-local outputs have been merged below.
         // Raster jobs are joined before the next frame advances, so the alternating
         // T&L target buffer is already free here. Waiting on a stale buffer flag can
         // deadlock the main thread with all workers asleep.
-        opaque_counter.store(0);
-        trans_counter.store(0);
-        shadow_counter.store(0);
         for (int s = 0; s < NUM_TILE_BINS; s++) {
             opaque_strip_buffers[tl_buf_idx].bins[s].clear();
             trans_strip_buffers[tl_buf_idx].bins[s].clear();
@@ -3334,11 +4237,8 @@ int main() {
         tl_shared.ground_faces = &ground_faces;
         
         tl_shared.opaque_triangles = &opaque_buffers[tl_buf_idx].triangles;
-        tl_shared.opaque_count = &opaque_counter;
         tl_shared.trans_triangles = &trans_buffers[tl_buf_idx].triangles;
-        tl_shared.trans_count = &trans_counter;
         tl_shared.shadow_triangles = &shadow_buffers[tl_buf_idx].triangles;
-        tl_shared.shadow_count = &shadow_counter;
         tl_shared.opaque_strip_triangles = &opaque_strip_buffers[tl_buf_idx];
         tl_shared.trans_strip_triangles = &trans_strip_buffers[tl_buf_idx];
         tl_shared.shadow_strip_triangles = &shadow_strip_buffers[tl_buf_idx];
@@ -3398,13 +4298,11 @@ int main() {
         
         // 3. Setup Rasterizer for Frame N-1 (if available)
         bool do_raster = (frame_num > 1); // Start rasterizing from frame 2 (after frame 1 is filled)
+        if (!do_raster) {
+            mark_raster_phase_done();
+        }
         
         if (do_raster) {
-            // Ensure the raster buffer is READY (T&L finished writing it)
-            // Logic: We only swap to it if T&L finished.
-            // The 'buffer_strips_complete' should be 0 here if T&L reset it, OR we reset it now.
-            // We reset it AFTER T&L finishes.
-            
             // Setup Raster Shared Data
             uint32_t clear_color = pack_rgb_fast(fb->format, 45, 45, 45);
             raster_shared[raster_buf_idx].opaque_triangles = &opaque_buffers[raster_buf_idx].triangles;
@@ -3442,35 +4340,48 @@ int main() {
         // Start T&L
         {
             std::lock_guard<std::mutex> lock(mtx_tl);
-            frame_tl_target = frame_num;
+            active_tl_job_thread_count = NUM_TL_THREADS;
+            frame_tl_target.store(frame_sequence, std::memory_order_release);
         }
         cv_tl.notify_all();
         
+        bool raster_phase_marked = false;
         auto run_raster_job = [&](RasterJobMode job_mode, int buf_idx) {
-            next_strip_ticket.store(0);
-            raster_strips_done.store(0);
-            raster_workers_done.store(0);
+            int expected_raster_workers = NUM_RASTER_THREADS;
+            // Publish job state and reset all per-job counters atomically under
+            // mtx_raster. Workers see the ticket reset paired with the frame
+            // bump via the mutex release/acquire, so a previously-spinning
+            // worker can't grab a stale ticket against the new job.
             {
                 std::lock_guard<std::mutex> lock(mtx_raster);
+                next_strip_ticket.store(0, std::memory_order_relaxed);
+                raster_strips_done.store(0, std::memory_order_relaxed);
+                raster_workers_done.store(0, std::memory_order_relaxed);
                 active_raster_buf_id = buf_idx;
                 active_raster_job = job_mode;
-                frame_raster_target++;
+                active_raster_job_thread_count = expected_raster_workers;
+                frame_raster_target.store(frame_raster_target.load(std::memory_order_relaxed) + 1,
+                                          std::memory_order_release);
             }
             cv_raster.notify_all();
-            
-            std::unique_lock<std::mutex> lock(mtx_main);
-            cv_main.wait(lock, []{ return raster_workers_done.load() >= NUM_RASTER_THREADS; });
-            if (job_mode == RasterJobMode::Color) {
-                buffer_strips_complete[buf_idx].store(NUM_TILE_BINS, std::memory_order_release);
+            if (!raster_phase_marked) {
+                raster_phase_marked = true;
+                mark_raster_phase_in_flight();
             }
+
+            wait_for_main_thread_predicate([expected_raster_workers]{
+                return raster_workers_done.load(std::memory_order_acquire) >= expected_raster_workers;
+            });
         };
         
         // Shadow depth must complete before RGB samples it.
+        Uint64 raster_phase_start = Platform::PerfCounter();
         if (do_raster) {
             run_raster_job(RasterJobMode::ShadowDepth, raster_buf_idx);
             run_raster_job(RasterJobMode::Color, raster_buf_idx);
             run_raster_job(RasterJobMode::Ssao, raster_buf_idx);
             run_raster_job(RasterJobMode::Luminaire, raster_buf_idx);
+            mark_raster_phase_done();
         }
         
         if (do_raster && raster_shared[raster_buf_idx].use_spotlight) {
@@ -3479,6 +4390,7 @@ int main() {
                                      projection_buffers[raster_buf_idx],
                                      raster_shared[raster_buf_idx].light_pos);
         }
+        Uint64 raster_phase_end = Platform::PerfCounter();
         
         // Draw wireframe cube around container box
         {
@@ -3552,17 +4464,33 @@ int main() {
         
         // Draw FPS (Safe now that Raster is done)
         int fps_x = fb->w - 50;
-        int fps_y = 10;
+        int fps_y = 20;
         draw_number(pixels, pitch, fps_x, fps_y, fps, 255, 255, 255, fb->format);
         
-        // B. Update Window IMMEDIATELY (Minimize transport delay)
-        SDL_UnlockSurface(fb);
-        SDL_UpdateWindowSurface(win);
-        
-        // C. Wait for T&L to finish
+        // Present our in-memory framebuffer to the display. On native this
+        // memcpy/format-converts into the SDL window surface; on web it sync
+        // blits to <canvas> via putImageData.
+        Platform::Present();
+#ifdef __EMSCRIPTEN__
+        if (frame_num <= 3 || (frame_num % 60) == 0) {
+            printf("frame %d presented (fps=%d, sim_t=%.2f)\n", frame_num, fps, sim_time);
+        }
+#endif
+
+        // Wait for T&L to finish so it can be merged for the next frame.
         {
-            std::unique_lock<std::mutex> lock(mtx_main);
-            cv_main.wait(lock, []{ return tl_done_counter.load() >= NUM_TL_THREADS; });
+            int expected_tl_workers = NUM_TL_THREADS;
+            Uint64 tl_wait_start = Platform::PerfCounter();
+            wait_for_main_thread_predicate([expected_tl_workers]{
+                return tl_done_counter.load(std::memory_order_acquire) >= expected_tl_workers;
+            });
+            Uint64 tl_wait_end = Platform::PerfCounter();
+            if (thread_perf.enabled) {
+                thread_perf.tl_tail_wait_ms_this_variant += perf_ms(tl_wait_start, tl_wait_end);
+            }
+        }
+        if (thread_perf.enabled && do_raster) {
+            thread_perf.raster_ms_this_variant += perf_ms(raster_phase_start, raster_phase_end);
         }
         
         // Concatenate per-worker outputs in sorted instance-slice order. This preserves
@@ -3615,6 +4543,9 @@ int main() {
         auto back_to_front = [](const RenderTriangle& a, const RenderTriangle& b) {
             return a.sort_z > b.sort_z;
         };
+        size_t max_opaque_bin = 0;
+        size_t max_trans_bin = 0;
+        size_t max_shadow_bin = 0;
         for (int tid = 0; tid < NUM_TL_THREADS; tid++) {
             const auto& out = tl_thread_outputs[tid];
             if (ENABLE_RGB_TRIANGLE_SORT) {
@@ -3636,12 +4567,11 @@ int main() {
                 append_bin(opaque_dst, out.opaque_bins[s], ENABLE_RGB_TRIANGLE_SORT, front_to_back);
                 append_bin(trans_dst, out.trans_bins[s], ENABLE_RGB_TRIANGLE_SORT, back_to_front);
                 append_bin(shadow_dst, out.shadow_bins[s], ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
+                max_opaque_bin = std::max(max_opaque_bin, opaque_dst.size());
+                max_trans_bin = std::max(max_trans_bin, trans_dst.size());
+                max_shadow_bin = std::max(max_shadow_bin, shadow_dst.size());
             }
         }
-        
-        // Finalize T&L Buffers and optional sort
-        // Block T&L from racing ahead to next use of this buffer
-        buffer_tl_ready[tl_buf_idx].store(false);
         
         if (dropped_opaque || dropped_trans || dropped_shadow) {
             static bool warned_triangle_overflow = false;
@@ -3651,10 +4581,14 @@ int main() {
                 warned_triangle_overflow = true;
             }
         }
-        opaque_counter.store(count_opaque, std::memory_order_relaxed);
-        trans_counter.store(count_trans, std::memory_order_relaxed);
-        shadow_counter.store(count_shadow, std::memory_order_relaxed);
-        
+        if (max_opaque_bin > 50000 || max_trans_bin > 50000 || max_shadow_bin > 50000) {
+            static bool warned_bin_growth = false;
+            if (!warned_bin_growth) {
+                printf("Warning: large triangle bin: opaque=%zu trans=%zu shadow=%zu\n",
+                       max_opaque_bin, max_trans_bin, max_shadow_bin);
+                warned_bin_growth = true;
+            }
+        }
         // Per-worker T&L outputs were sorted while private, then merged above in
         // worker-slice order. Avoid re-sorting the full global/tile streams here.
         
@@ -3662,30 +4596,124 @@ int main() {
         opaque_buffers[tl_buf_idx].count = count_opaque;
         trans_buffers[tl_buf_idx].count = count_trans;
         shadow_buffers[tl_buf_idx].count = count_shadow;
-        
-        // Allow T&L to use this buffer again (sort complete)
-        {
-            std::lock_guard<std::mutex> lock(mtx_buf_ready);
-            buffer_tl_ready[tl_buf_idx].store(true);
+
+        // Periodic capacity-shrink. std::vector::clear() keeps capacity at the
+        // all-time peak content, so on a long-running view that briefly stresses
+        // one tile (camera close-up, zoom-in, etc.) every bin slowly ratchets
+        // its capacity up. After ~thousands of frames the cumulative capacity
+        // can blow past wasm32's address space. Once every ~4s wall-time we
+        // walk the bins and reclaim any vector whose capacity has drifted to
+        // >4x its current size, which catches the ratchet without paying
+        // realloc cost in steady-state scenes.
+        if ((frame_num & 0xff) == 0) {
+            auto shrink_if_bloated = [](std::vector<RenderTriangle>& v) {
+                if (v.capacity() > v.size() * 4 + 32) {
+                    std::vector<RenderTriangle>(v).swap(v);
+                }
+            };
+            for (int b = 0; b < 2; b++) {
+                for (int s = 0; s < NUM_TILE_BINS; s++) {
+                    shrink_if_bloated(opaque_strip_buffers[b].bins[s]);
+                    shrink_if_bloated(trans_strip_buffers[b].bins[s]);
+                    shrink_if_bloated(shadow_strip_buffers[b].bins[s]);
+                }
+            }
+            for (auto& out : tl_thread_outputs) {
+                shrink_if_bloated(out.opaque);
+                shrink_if_bloated(out.trans);
+                shrink_if_bloated(out.shadow);
+                for (int s = 0; s < NUM_TILE_BINS; s++) {
+                    shrink_if_bloated(out.opaque_bins[s]);
+                    shrink_if_bloated(out.trans_bins[s]);
+                    shrink_if_bloated(out.shadow_bins[s]);
+                }
+            }
         }
-        cv_buf_ready.notify_all();
-        
-        // Mark T&L buffer as READY for next raster pass
-        buffer_strips_complete[tl_buf_idx].store(0);
-        
+
         // Reset counters for next frame
         tl_done_counter.store(0);
 
         // Increment frame
         frame_num++;
+        frame_sequence++;
         
         // Calculate and display FPS
         frame_count++;
-        Uint64 current_time = SDL_GetTicks64();
+        Uint64 current_time = Platform::TicksMs();
         if (current_time - last_fps_time >= 1000) {
             fps = frame_count;
             frame_count = 0;
             last_fps_time = current_time;
+        }
+        if (thread_perf.enabled) {
+            thread_perf.frames_this_variant++;
+            if (thread_perf.frames_this_variant >= thread_perf.frames_per_variant) {
+                wait_for_physics_idle();
+                current_time = Platform::TicksMs();
+                {
+                    std::lock_guard<std::mutex> lock(physics_mtx);
+                    thread_perf.physics_ms_this_variant = physics_wall_ms_accum;
+                    thread_perf.physics_cpu_ms_this_variant = physics_cpu_ms_accum;
+                    thread_perf.physics_update_ms_this_variant = physics_update_wall_ms_accum;
+                    thread_perf.physics_sync_ms_this_variant = physics_sync_wall_ms_accum;
+                }
+                Uint64 elapsed_ms = current_time - thread_perf.variant_start_ticks;
+                double avg_ms = (double)elapsed_ms / (double)thread_perf.frames_this_variant;
+                double fps_measured = elapsed_ms > 0
+                    ? (1000.0 * (double)thread_perf.frames_this_variant / (double)elapsed_ms)
+                    : 0.0;
+                double avg_raster_ms = thread_perf.raster_ms_this_variant / (double)thread_perf.frames_this_variant;
+                double avg_tl_tail_wait_ms = thread_perf.tl_tail_wait_ms_this_variant / (double)thread_perf.frames_this_variant;
+                double avg_physics_ms = thread_perf.physics_ms_this_variant / (double)thread_perf.frames_this_variant;
+                double avg_physics_cpu_ms = thread_perf.physics_cpu_ms_this_variant / (double)thread_perf.frames_this_variant;
+                double avg_physics_update_ms = thread_perf.physics_update_ms_this_variant / (double)thread_perf.frames_this_variant;
+                double avg_physics_sync_ms = thread_perf.physics_sync_ms_this_variant / (double)thread_perf.frames_this_variant;
+                thread_perf.total_frames += (uint64_t)thread_perf.frames_this_variant;
+                Uint64 total_elapsed_ms = current_time - thread_perf.search_start_ticks;
+                double total_avg_ms = thread_perf.total_frames > 0
+                    ? (double)total_elapsed_ms / (double)thread_perf.total_frames
+                    : 0.0;
+                fprintf(thread_perf.log, "%zu %d %d %d %llu %.6f %.3f %.6f %.6f %.6f %.6f %.6f %.6f %llu %llu %.6f\n",
+                        thread_perf.variant_index,
+                        NUM_TL_THREADS,
+                        NUM_RASTER_THREADS,
+                        thread_perf.frames_this_variant,
+                        (unsigned long long)elapsed_ms,
+                        avg_ms,
+                        fps_measured,
+                        avg_physics_ms,
+                        avg_physics_cpu_ms,
+                        avg_physics_update_ms,
+                        avg_physics_sync_ms,
+                        avg_raster_ms,
+                        avg_tl_tail_wait_ms,
+                        (unsigned long long)thread_perf.total_frames,
+                        (unsigned long long)total_elapsed_ms,
+                        total_avg_ms);
+                fflush(thread_perf.log);
+
+                thread_perf.variant_index++;
+                if (thread_perf.variant_index >= thread_perf.variants.size()) {
+                    thread_perf.frames_this_variant = 0;
+                    running = false;
+                } else {
+                    const ThreadPerfVariant& next_variant = thread_perf.variants[thread_perf.variant_index];
+                    NUM_TL_THREADS = next_variant.tl_threads;
+                    NUM_RASTER_THREADS = next_variant.raster_threads;
+                    thread_perf.frames_this_variant = 0;
+                    thread_perf.raster_ms_this_variant = 0.0;
+                    thread_perf.tl_tail_wait_ms_this_variant = 0.0;
+                    thread_perf.physics_ms_this_variant = 0.0;
+                    thread_perf.physics_cpu_ms_this_variant = 0.0;
+                    thread_perf.physics_update_ms_this_variant = 0.0;
+                    thread_perf.physics_sync_ms_this_variant = 0.0;
+                    reset_animation();
+                    thread_perf.variant_start_ticks = Platform::TicksMs();
+                    printf("Thread perf variant %zu/%zu: TL=%d raster=%d frames=%d\n",
+                           thread_perf.variant_index + 1, thread_perf.variants.size(),
+                           NUM_TL_THREADS, NUM_RASTER_THREADS, thread_perf.frames_per_variant);
+                }
+            }
         }
     }
 
@@ -3695,7 +4723,6 @@ int main() {
     
     // Wake up everyone to exit (must notify all CVs workers might be blocked on)
     { std::lock_guard<std::mutex> lock(mtx_tl); cv_tl.notify_all(); }
-    { std::lock_guard<std::mutex> lock(mtx_buf_ready); cv_buf_ready.notify_all(); }
     { std::lock_guard<std::mutex> lock(mtx_raster); cv_raster.notify_all(); }
     
     for (auto& t : tl_workers) {
@@ -3705,12 +4732,69 @@ int main() {
         if (t.joinable()) t.join();
     }
 
+    {
+        std::lock_guard<std::mutex> lock(physics_mtx);
+        physics_thread_running = false;
+        physics_job_armed = false;
+        physics_cv.notify_all();
+    }
+    if (physics_worker.joinable()) {
+        physics_worker.join();
+    }
+
     // Cleanup Jolt Physics
     // physics_system and job_system are stack allocated and will be destroyed in reverse order of declaration.
     // job_system (declared later) will be destroyed first -> stops threads.
     // physics_system (declared earlier) will be destroyed second -> safe.
 
-    SDL_DestroyWindow(win);
-    SDL_Quit();
+    if (thread_perf.log) {
+        if (thread_perf.enabled && thread_perf.frames_this_variant > 0) {
+            {
+                std::lock_guard<std::mutex> lock(physics_mtx);
+                thread_perf.physics_ms_this_variant = physics_wall_ms_accum;
+                thread_perf.physics_cpu_ms_this_variant = physics_cpu_ms_accum;
+                thread_perf.physics_update_ms_this_variant = physics_update_wall_ms_accum;
+                thread_perf.physics_sync_ms_this_variant = physics_sync_wall_ms_accum;
+            }
+            Uint64 now = Platform::TicksMs();
+            Uint64 elapsed_ms = now - thread_perf.variant_start_ticks;
+            uint64_t partial_total_frames = thread_perf.total_frames + (uint64_t)thread_perf.frames_this_variant;
+            Uint64 total_elapsed_ms = now - thread_perf.search_start_ticks;
+            double avg_ms = (double)elapsed_ms / (double)thread_perf.frames_this_variant;
+            double fps_measured = elapsed_ms > 0
+                ? (1000.0 * (double)thread_perf.frames_this_variant / (double)elapsed_ms)
+                : 0.0;
+            double avg_raster_ms = thread_perf.raster_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double avg_tl_tail_wait_ms = thread_perf.tl_tail_wait_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double avg_physics_ms = thread_perf.physics_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double avg_physics_cpu_ms = thread_perf.physics_cpu_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double avg_physics_update_ms = thread_perf.physics_update_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double avg_physics_sync_ms = thread_perf.physics_sync_ms_this_variant / (double)thread_perf.frames_this_variant;
+            double total_avg_ms = partial_total_frames > 0
+                ? (double)total_elapsed_ms / (double)partial_total_frames
+                : 0.0;
+            fprintf(thread_perf.log, "partial %zu %d %d %d %llu %.6f %.3f %.6f %.6f %.6f %.6f %.6f %.6f %llu %llu %.6f\n",
+                    thread_perf.variant_index,
+                    NUM_TL_THREADS,
+                    NUM_RASTER_THREADS,
+                    thread_perf.frames_this_variant,
+                    (unsigned long long)elapsed_ms,
+                    avg_ms,
+                    fps_measured,
+                    avg_physics_ms,
+                    avg_physics_cpu_ms,
+                    avg_physics_update_ms,
+                    avg_physics_sync_ms,
+                    avg_raster_ms,
+                    avg_tl_tail_wait_ms,
+                    (unsigned long long)partial_total_frames,
+                    (unsigned long long)total_elapsed_ms,
+                    total_avg_ms);
+        }
+        fclose(thread_perf.log);
+        thread_perf.log = nullptr;
+    }
+
+    Platform::Shutdown();
     return 0;
 }

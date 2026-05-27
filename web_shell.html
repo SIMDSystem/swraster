@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en-us">
+<head>
+  <meta charset="utf-8">
+  <title>swraster</title>
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: #1a1a1a;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #888;
+    }
+    #canvas {
+      display: block;
+      background: #000;
+      outline: none;
+      cursor: crosshair;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
+    }
+    #boot {
+      position: absolute;
+      pointer-events: none;
+      font-size: 14px;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+  <div id="boot">loading...</div>
+
+  <script>
+    var canvas = document.getElementById('canvas');
+    var boot = document.getElementById('boot');
+
+    function focusCanvas() { try { canvas.focus(); } catch (e) {} }
+    window.addEventListener('load', focusCanvas);
+
+    // Input plumbing. JS listeners run on the browser UI thread; they call
+    // the WASM-exported swr_push_*() functions directly. Memory is shared
+    // because we built with -sUSE_PTHREADS=1, so the queue mutex on the
+    // C++ side safely contends with the renderer worker pthread.
+    function pushEvents() {
+      // canvas owns mouse and wheel; window owns key and mouseup/move so
+      // we keep tracking the drag even if the pointer leaves the canvas.
+      canvas.addEventListener('mousedown', function(e) {
+        if (e.button !== 0) return;
+        focusCanvas();
+        e.preventDefault();
+        if (Module && Module._swr_push_mouse_button) {
+          Module._swr_push_mouse_button(1, 1);
+        }
+      });
+      window.addEventListener('mouseup', function(e) {
+        if (e.button !== 0) return;
+        if (Module && Module._swr_push_mouse_button) {
+          Module._swr_push_mouse_button(1, 0);
+        }
+      });
+      window.addEventListener('mousemove', function(e) {
+        var dx = e.movementX | 0;
+        var dy = e.movementY | 0;
+        if (dx === 0 && dy === 0) return;
+        if (Module && Module._swr_push_mouse_motion) {
+          Module._swr_push_mouse_motion(dx, dy);
+        }
+      });
+      canvas.addEventListener('wheel', function(e) {
+        e.preventDefault();
+        var wy = e.deltaY < 0 ? 1 : e.deltaY > 0 ? -1 : 0;
+        if (wy === 0) return;
+        if (Module && Module._swr_push_wheel) {
+          Module._swr_push_wheel(wy);
+        }
+      }, { passive: false });
+      window.addEventListener('keydown', function(e) {
+        if (e.repeat) return;
+        if (e.code === 'Space') {
+          e.preventDefault();
+          if (Module && Module._swr_push_key) Module._swr_push_key(32);
+        }
+      });
+      document.addEventListener('visibilitychange', function() {
+        if (Module && Module._swr_push_visibility) {
+          Module._swr_push_visibility(document.hidden ? 0 : 1);
+        }
+      });
+      console.log('[swraster] input listeners installed');
+    }
+
+    var Module = {
+      canvas: canvas,
+      print: function() { console.log.apply(console, arguments); },
+      printErr: function() { console.error.apply(console, arguments); },
+      setStatus: function(text) {
+        if (!boot) return;
+        if (!text) { boot.style.display = 'none'; return; }
+        boot.textContent = text;
+      },
+      totalDependencies: 0,
+      monitorRunDependencies: function(left) {
+        this.totalDependencies = Math.max(this.totalDependencies, left);
+        Module.setStatus(left
+          ? 'loading... (' + (this.totalDependencies - left) + '/' + this.totalDependencies + ')'
+          : '');
+      },
+      onRuntimeInitialized: function() {
+        console.log('[swraster] runtime initialised, wiring input');
+        pushEvents();
+        focusCanvas();
+      }
+    };
+
+    window.onerror = function(msg) {
+      console.error('Unhandled error:', msg);
+      Module.setStatus('error - see console');
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

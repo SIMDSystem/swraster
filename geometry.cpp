@@ -3,6 +3,8 @@
 #include <map>
 #include <tuple>
 
+using namespace Eigen;
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -52,7 +54,7 @@ const float teapot_data[32][4][4][3] = {
     {{{0.0,0.0,0.0},{0.0,0.0,0.0},{0.0,0.0,0.0},{0.0,0.0,0.0}},{{0.0,0.0,-1.425},{0.798,0.0,-1.425},{1.425,0.0,-0.798},{1.425,0.0,0.0}},{{0.0,0.075,-1.5},{0.84,0.075,-1.5},{1.5,0.075,-0.84},{1.5,0.075,0.0}},{{0.0,0.15,-1.5},{0.84,0.15,-1.5},{1.5,0.15,-0.84},{1.5,0.15,0.0}}}
 };
 
-void generate_cube(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
+void generate_cube(RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
     vertices.reserve(24);
@@ -70,51 +72,51 @@ void generate_cube(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
     int f1 = make_cube_vertex( 1, -1,  1,  0, 0, 1, 1, 1);
     int f2 = make_cube_vertex( 1,  1,  1,  0, 0, 1, 1, 0);
     int f3 = make_cube_vertex(-1,  1,  1,  0, 0, 1, 0, 0);
-    faces.push_back({f0, f1, f2, 1, 0, 0, 1.0f, nullptr});
-    faces.push_back({f0, f2, f3, 1, 0, 0, 1.0f, nullptr});
+    faces.push_back({f0, f1, f2, 1, 0, 0, 1.0f});
+    faces.push_back({f0, f2, f3, 1, 0, 0, 1.0f});
     
     // Back (Z-)
     int b0 = make_cube_vertex( 1, -1, -1,  0, 0, -1, 0, 1);
     int b1 = make_cube_vertex(-1, -1, -1,  0, 0, -1, 1, 1);
     int b2 = make_cube_vertex(-1,  1, -1,  0, 0, -1, 1, 0);
     int b3 = make_cube_vertex( 1,  1, -1,  0, 0, -1, 0, 0);
-    faces.push_back({b0, b1, b2, 0, 1, 0, 1.0f, nullptr});
-    faces.push_back({b0, b2, b3, 0, 1, 0, 1.0f, nullptr});
+    faces.push_back({b0, b1, b2, 0, 1, 0, 1.0f});
+    faces.push_back({b0, b2, b3, 0, 1, 0, 1.0f});
     
     // Right (X+)
     int r0 = make_cube_vertex( 1, -1,  1,  1, 0, 0, 0, 1);
     int r1 = make_cube_vertex( 1, -1, -1,  1, 0, 0, 1, 1);
     int r2 = make_cube_vertex( 1,  1, -1,  1, 0, 0, 1, 0);
     int r3 = make_cube_vertex( 1,  1,  1,  1, 0, 0, 0, 0);
-    faces.push_back({r0, r1, r2, 1, 0, 1, 1.0f, nullptr});
-    faces.push_back({r0, r2, r3, 1, 0, 1, 1.0f, nullptr});
+    faces.push_back({r0, r1, r2, 1, 0, 1, 1.0f});
+    faces.push_back({r0, r2, r3, 1, 0, 1, 1.0f});
     
     // Left (X-)
     int l0 = make_cube_vertex(-1, -1, -1, -1, 0, 0, 0, 1);
     int l1 = make_cube_vertex(-1, -1,  1, -1, 0, 0, 1, 1);
     int l2 = make_cube_vertex(-1,  1,  1, -1, 0, 0, 1, 0);
     int l3 = make_cube_vertex(-1,  1, -1, -1, 0, 0, 0, 0);
-    faces.push_back({l0, l1, l2, 0, 1, 1, 1.0f, nullptr});
-    faces.push_back({l0, l2, l3, 0, 1, 1, 1.0f, nullptr});
+    faces.push_back({l0, l1, l2, 0, 1, 1, 1.0f});
+    faces.push_back({l0, l2, l3, 0, 1, 1, 1.0f});
     
     // Top (Y+)
     int t0 = make_cube_vertex(-1,  1,  1,  0, 1, 0, 0, 1);
     int t1 = make_cube_vertex( 1,  1,  1,  0, 1, 0, 1, 1);
     int t2 = make_cube_vertex( 1,  1, -1,  0, 1, 0, 1, 0);
     int t3 = make_cube_vertex(-1,  1, -1,  0, 1, 0, 0, 0);
-    faces.push_back({t0, t1, t2, 0, 0, 1, 1.0f, nullptr});
-    faces.push_back({t0, t2, t3, 0, 0, 1, 1.0f, nullptr});
+    faces.push_back({t0, t1, t2, 0, 0, 1, 1.0f});
+    faces.push_back({t0, t2, t3, 0, 0, 1, 1.0f});
     
     // Bottom (Y-)
     int bt0 = make_cube_vertex(-1, -1, -1,  0, -1, 0, 0, 1);
     int bt1 = make_cube_vertex( 1, -1, -1,  0, -1, 0, 1, 1);
     int bt2 = make_cube_vertex( 1, -1,  1,  0, -1, 0, 1, 0);
     int bt3 = make_cube_vertex(-1, -1,  1,  0, -1, 0, 0, 0);
-    faces.push_back({bt0, bt1, bt2, 1, 1, 0, 1.0f, nullptr});
-    faces.push_back({bt0, bt2, bt3, 1, 1, 0, 1.0f, nullptr});
+    faces.push_back({bt0, bt1, bt2, 1, 1, 0, 1.0f});
+    faces.push_back({bt0, bt2, bt3, 1, 1, 0, 1.0f});
 }
 
-void generate_sphere(float radius, int slices, int stacks, std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
+void generate_sphere(float radius, int slices, int stacks, RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
     
@@ -157,7 +159,6 @@ void generate_sphere(float radius, int slices, int stacks, std::vector<Vertex3D>
             f1.v1 = first + 1; // Swapped
             f1.v2 = second;    // Swapped
             f1.r = 1.0f; f1.g = 1.0f; f1.b = 1.0f; f1.a = 1.0f;
-            f1.texture = nullptr;
             faces.push_back(f1);
             
             // Triangle 2
@@ -166,13 +167,12 @@ void generate_sphere(float radius, int slices, int stacks, std::vector<Vertex3D>
             f2.v1 = first + 1;  // Swapped
             f2.v2 = second + 1; // Swapped
             f2.r = 1.0f; f2.g = 1.0f; f2.b = 1.0f; f2.a = 1.0f;
-            f2.texture = nullptr;
             faces.push_back(f2);
         }
     }
 }
 
-void generate_torus(float main_radius, float tube_radius, int slices, int stacks, std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
+void generate_torus(float main_radius, float tube_radius, int slices, int stacks, RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
 
@@ -215,8 +215,8 @@ void generate_torus(float main_radius, float tube_radius, int slices, int stacks
             int second = first + stacks + 1;
             
             // Faces with shared vertices (Winding reversed to fix inside-out)
-            faces.push_back({first, first + 1, second, 1, 1, 1, 0.5f, nullptr});
-            faces.push_back({second, first + 1, second + 1, 1, 1, 1, 0.5f, nullptr});
+            faces.push_back({first, first + 1, second, 1, 1, 1, 0.5f});
+            faces.push_back({second, first + 1, second + 1, 1, 1, 1, 0.5f});
         }
     }
 }
@@ -242,7 +242,7 @@ static Vector3f bezier_patch(const Vector3f patch[4][4], float u, float v) {
     return bezier_curve(u_curve, u);
 }
 
-void generate_teapot(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) {
+void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
     
@@ -316,8 +316,8 @@ void generate_teapot(std::vector<Vertex3D>& vertices, std::vector<Face>& faces) 
                 int v3_idx = patch_vertex_indices[next_row + 1];
                 
                 // Two triangles per quad (winding order for correct facing)
-                faces.push_back({v0_idx, v1_idx, v2_idx, 1, 1, 1, 1.0f, nullptr});
-                faces.push_back({v2_idx, v1_idx, v3_idx, 1, 1, 1, 1.0f, nullptr});
+                faces.push_back({v0_idx, v1_idx, v2_idx, 1, 1, 1, 1.0f});
+                faces.push_back({v2_idx, v1_idx, v3_idx, 1, 1, 1, 1.0f});
             }
         }
     }
