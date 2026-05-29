@@ -545,29 +545,25 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
         // This machine is intentionally oversubscribed (NUM_TL + NUM_RASTER
         // > hw_concurrency) and the raster pool for the *previous* frame is
         // draining concurrently with this T&L pass. If one T&L worker is
-        // preempted mid-phase-1 it arrives at the barrier late and holds it;
-        // a pure pause-spin here would burn a core on every worker that
-        // already finished, starving both the straggler and the raster
-        // pool and pushing the phase-2 merge dangerously late (visible as a
-        // long idle gap before the dark-blue merge bars). So spin briefly
-        // for the common fast-release case, then fall back to yield() so a
-        // finished worker hands its core to whoever still needs it. This
-        // trades a few microseconds of best-case latency for a much shorter
-        // worst-case barrier under contention.
-        tl_phase1_done_counter.fetch_add(1, std::memory_order_acq_rel);
+        // preempted mid-phase-1 it arrives at the barrier late and holds it.
+        // A busy-spin (even pause/yield) here burns a core on every worker
+        // that already finished, starving both the straggler and the raster
+        // pool and pushing the phase-2 merge dangerously late. So early
+        // arrivals block on a condvar: the OS deschedules them and hands the
+        // core to whoever still has work, and the last arrival wakes them.
+        // The increment is done under the barrier mutex so the last arrival's
+        // notify cannot slip into the gap between a waiter's predicate check
+        // and its descent into wait() (the classic lost-wakeup).
         {
-            [[maybe_unused]] int spins = 0;
-            while (tl_phase1_done_counter.load(std::memory_order_acquire) < active_tl_threads) {
-#if defined(__x86_64__) || defined(__i386__)
-                if (spins < 256) {
-                    __builtin_ia32_pause();
-                    spins++;
-                } else {
-                    std::this_thread::yield();
-                }
-#else
-                std::this_thread::yield();
-#endif
+            std::unique_lock<std::mutex> lock(mtx_tl_barrier);
+            int arrived = tl_phase1_done_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (arrived >= active_tl_threads) {
+                lock.unlock();
+                cv_tl_barrier.notify_all();
+            } else {
+                cv_tl_barrier.wait(lock, [&] {
+                    return tl_phase1_done_counter.load(std::memory_order_acquire) >= active_tl_threads;
+                });
             }
         }
         Uint64 phase2_start_ts = Platform::PerfCounter();

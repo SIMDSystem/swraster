@@ -57,6 +57,15 @@ extern std::atomic<int> tl_done_counter;
 // T&L kick) free of merge work, and the bin-clear that used to live there
 // is folded into each worker's phase-2 sweep.
 extern std::atomic<int> tl_phase1_done_counter;
+// Blocking barrier primitives for the phase-1 -> phase-2 hand-off. The pool is
+// deliberately oversubscribed (NUM_TL + NUM_RASTER > hw_concurrency) and the
+// previous frame's raster pool drains concurrently, so a finished T&L worker
+// that busy-spins here just steals a core from the straggler still holding the
+// barrier (and from the raster pool). Instead each early arrival sleeps on this
+// condvar; the OS reclaims the core and the straggler runs sooner. The last
+// arrival notifies all.
+extern std::mutex              mtx_tl_barrier;
+extern std::condition_variable cv_tl_barrier;
 extern std::atomic<int> raster_workers_done;  // workers fully out of the current raster job
 
 // Per-row dynamic claim counters. Each row's counter walks 0..TILE_X_SPLITS;

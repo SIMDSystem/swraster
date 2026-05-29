@@ -30,6 +30,8 @@ std::condition_variable cv_main;
 
 std::atomic<int> tl_done_counter{0};
 std::atomic<int> tl_phase1_done_counter{0};
+std::mutex              mtx_tl_barrier;
+std::condition_variable cv_tl_barrier;
 std::atomic<int> raster_workers_done{0};
 std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS] = {};
 
