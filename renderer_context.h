@@ -70,6 +70,7 @@ struct RendererContext {
     StripTriangleBuffer* opaque_strip_buffers = nullptr; // [2]
     StripTriangleBuffer* trans_strip_buffers  = nullptr; // [2]
     StripTriangleBuffer* shadow_strip_buffers = nullptr; // [2]
+    LuminaireConeBuffer* cone_buffers         = nullptr; // [2] spotlight cone fan
 
     // ----- Per-frame staging ring (2 slots, indexed by raster_buf_idx) -----
     ShadowBoxBuffer*  shadow_box_buffers    = nullptr; // [2]
@@ -94,8 +95,12 @@ struct RendererContext {
     int               launched_raster_threads = 0;
 
     // ----- Per-frame instance state -----
-    std::vector<std::pair<float, size_t>>* instance_depths           = nullptr;
-    std::vector<uint8_t>*                  instance_occlusion_flags  = nullptr;
+    std::vector<std::pair<float, size_t>>* instance_depths  = nullptr;
+    // Eye-space occluders (cube/sphere). Rebuilt by main in a single pass
+    // alongside the depth compute, then read by T&L workers running the
+    // small-ball occlusion test in parallel. Replaces the previous
+    // O(N_smallballs * N_total) main-thread occlusion loop.
+    std::vector<OccluderEye>*              occluders_eye    = nullptr;
 
     // ----- Physics + benchmarking + UI -----
     PhysicsPipeline*  physics      = nullptr;

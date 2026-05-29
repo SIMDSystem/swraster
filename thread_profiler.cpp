@@ -11,14 +11,42 @@ void thread_profiler_init(ThreadProfiler& p, int launched_tl_threads, int launch
     for (auto& v : p.tl_intervals)     v.reserve(8);
     for (auto& v : p.raster_intervals) v.reserve(16);
     p.physics_intervals.reserve(64);
+
+    // Mirror shape into the prev arrays so the swap in begin_frame keeps
+    // both sides well-formed (recorders index by thread_id).
+    p.tl_intervals_prev.assign(launched_tl_threads, {});
+    p.raster_intervals_prev.assign(launched_raster_threads, {});
+    for (auto& v : p.tl_intervals_prev)     v.reserve(8);
+    for (auto& v : p.raster_intervals_prev) v.reserve(16);
+    p.physics_intervals_prev.reserve(64);
 }
 
 void thread_profiler_begin_frame(ThreadProfiler& p) {
     // While frozen the most recent live snapshot is preserved for inspection.
     if (p.frozen.load(std::memory_order_relaxed)) return;
+
+    // Promote the previous frame's blit/draw markers from the values that
+    // belonged to it at draw time. At begin_frame, present_history[0] is
+    // the blit that just completed (= the new frame's left anchor), and
+    // present_history[1] is the one before that (= the OLDER frame's left
+    // anchor, i.e. the anchor that the live intervals we're about to
+    // promote were drawn against last frame).
+    p.prev_blit_start_ts = p.present_history[1].start_ts;
+    p.prev_blit_end_ts   = p.present_history[1].end_ts;
+    p.prev_draw_end_ts   = p.last_draw_end_ts;
+
+    // Ping-pong: live (= frame N-1's data) <-> prev (= frame N-2's data,
+    // about to be discarded). After the swap, the new "live" arrays hold
+    // frame N-2 capacity — we clear them so frame N starts empty.
+    p.tl_intervals.swap(p.tl_intervals_prev);
+    p.raster_intervals.swap(p.raster_intervals_prev);
+    {
+        std::lock_guard<std::mutex> lock(p.physics_mtx);
+        p.physics_intervals.swap(p.physics_intervals_prev);
+        p.physics_intervals.clear();
+    }
     for (auto& v : p.tl_intervals)     v.clear();
     for (auto& v : p.raster_intervals) v.clear();
-    // Physics log self-trims in the recorder; nothing to do here.
 }
 
 // Fill the half-open horizontal span [x0, x1) at row y with `color`.
@@ -48,10 +76,11 @@ void thread_profiler_draw(ThreadProfiler& p,
     if (!p.enabled.load(std::memory_order_relaxed)) return;
     if (!format) return;
 
-    // Pick the marker timestamps. Live: blit start/end come from the most
-    // recent Present(); orange marker is "now" at draw time. Frozen: all
-    // three come from the snapshot captured at freeze-take-effect so the
-    // panel doesn't scroll while paused.
+    // Pick the marker timestamps for the *current* (newer) frame's section.
+    // Live: blit start/end come from the most recent Present(); orange
+    // marker is "now" at draw time. Frozen: all three come from the
+    // snapshot captured at freeze-take-effect so the panel doesn't scroll
+    // while paused.
     Uint64 blit_start_ts, blit_end_ts, orange_ts;
     if (p.frozen.load(std::memory_order_relaxed)) {
         blit_start_ts = p.frozen_blit_start_ts;
@@ -64,9 +93,16 @@ void thread_profiler_draw(ThreadProfiler& p,
     }
     if (blit_start_ts == 0) return; // No Present() has happened yet; nothing to anchor to.
 
-    // The panel's left margin maps to blit_start (the start of the prior
-    // Present blit). Bar positions are computed relative to this.
-    const Uint64 left_ts = blit_start_ts;
+    // The panel anchors at the OLDER frame's left edge so both ping-pong
+    // buffers paint onto a single wallclock-aligned axis (older on the
+    // left, newer on the right). If we don't have a previous-frame
+    // snapshot yet (first couple of frames), the older anchor is just
+    // the current one and the panel collapses to a single-frame view.
+    Uint64 prev_blit_start_ts = p.prev_blit_start_ts;
+    Uint64 prev_blit_end_ts   = p.prev_blit_end_ts;
+    Uint64 prev_orange_ts     = p.prev_draw_end_ts;
+    bool   have_prev_frame    = (prev_blit_start_ts != 0);
+    const Uint64 left_ts = have_prev_frame ? prev_blit_start_ts : blit_start_ts;
 
     const int right_edge = surface_w - p.right_margin_px;
     const int left_edge  = p.left_margin_px;
@@ -105,11 +141,14 @@ void thread_profiler_draw(ThreadProfiler& p,
 
     // Raster bars are colored per RasterJobMode tag; T&L / physics use a
     // single lane color. Map kept inline so it's obvious at a glance.
+    // The Luminaire bar is now strictly the per-pixel cone raster — its
+    // vertex T&L was hoisted into a separate Spotlight-tagged T&L
+    // interval, which the T&L lane drawer paints in darker blue.
     auto raster_color_for = [&](uint8_t tag) {
         switch ((RasterJobMode)tag) {
             case RasterJobMode::ShadowDepth: return pack_rgb_fast(format, 255, 220,  0); // yellow
             case RasterJobMode::Ssao:        return pack_rgb_fast(format,  40, 130, 40); // dark green
-            case RasterJobMode::Luminaire:   return pack_rgb_fast(format, 180, 100, 220);// soft purple
+            case RasterJobMode::Luminaire:   return pack_rgb_fast(format, 180, 100, 220);// soft purple (raster only)
             case RasterJobMode::Color:
             default:                         return pack_rgb_fast(format,  80, 220, 80); // green
         }
@@ -127,10 +166,20 @@ void thread_profiler_draw(ThreadProfiler& p,
             // started before left_ts (e.g. a long-running physics step
             // that began on the prior frame); those get clipped on the
             // left edge below.
+            //
+            // Bar WIDTH is driven by CPU time, not wall time: if cpu_ns
+            // < (end-start) the thread was preempted somewhere inside
+            // the interval, and the colored bar is shorter than the
+            // wall window by exactly the descheduled duration. The
+            // unconsumed portion (start + cpu_ns .. end) is left
+            // uncolored, surfacing kernel scheduling jitter as gaps.
             double ms_start = perf_ms(left_ts, iv.start_ts);
-            double ms_end   = perf_ms(left_ts, iv.end_ts);
+            double cpu_ms   = (iv.cpu_ns > 0) ? (double)iv.cpu_ns * 1.0e-6
+                                              : perf_ms(iv.start_ts, iv.end_ts);
+            double wall_ms  = perf_ms(iv.start_ts, iv.end_ts);
+            if (cpu_ms > wall_ms) cpu_ms = wall_ms; // sanity clamp
             int x_start = left_edge + (int)(ms_start * p.pixels_per_ms);
-            int x_end   = left_edge + (int)(ms_end   * p.pixels_per_ms);
+            int x_end   = left_edge + (int)((ms_start + cpu_ms) * p.pixels_per_ms);
             if (x_end   <= left_edge)  continue;
             if (x_start >= right_edge) continue;
             if (x_start <  left_edge)  x_start = left_edge;
@@ -144,33 +193,67 @@ void thread_profiler_draw(ThreadProfiler& p,
     int lane = 0;
 
     // Physics lane (red). Read under the mutex; bars are short and few.
+    // Both prev-frame and current-frame intervals are placed by their
+    // absolute start_ts, so a single lane carries both.
     {
         std::lock_guard<std::mutex> lock(p.physics_mtx);
         const uint32_t physics_color = pack_rgb_fast(format, 255, 64, 64);
+        if (have_prev_frame) {
+            draw_lane(lane, p.physics_intervals_prev,
+                      [&](const ProfilerInterval&) { return physics_color; });
+        }
         draw_lane(lane++, p.physics_intervals,
                   [&](const ProfilerInterval&) { return physics_color; });
     }
 
-    // T&L lanes (blue).
-    const uint32_t tl_color = pack_rgb_fast(format, 80, 140, 255);
+    // T&L lanes, colored per TLJobTag so the functionally distinct
+    // sub-passes are visually separable:
+    //   PerInstance — phase-1 per-instance T&L sweep (cyan).
+    //   Spotlight   — once-per-frame cone fan T&L on thread 0; folded into
+    //                 cyan because it's tiny and adjacent to phase 1 there.
+    //   LocalSort   — phase-1 tail: each worker sorts its own local bins
+    //                 (light blue).
+    //   BinMerge    — phase-2 cross-worker bin merge (dark blue).
+    // The gap between the light-blue local sort and the dark-blue merge is
+    // the phase-1 barrier spin-wait.
+    const uint32_t tl_color_per_inst  = pack_rgb_fast(format,  60, 200, 220); // cyan
+    const uint32_t tl_color_spotlight = tl_color_per_inst;                    // same as PerInstance
+    const uint32_t tl_color_sort      = pack_rgb_fast(format, 120, 160, 255); // light blue
+    const uint32_t tl_color_merge     = pack_rgb_fast(format,  30,  60, 160); // dark blue
+    auto tl_color_for = [&](uint8_t tag) {
+        switch ((TLJobTag)tag) {
+            case TLJobTag::Spotlight: return tl_color_spotlight;
+            case TLJobTag::LocalSort: return tl_color_sort;
+            case TLJobTag::BinMerge:  return tl_color_merge;
+            case TLJobTag::PerInstance:
+            default:                  return tl_color_per_inst;
+        }
+    };
     for (int i = 0; i < num_tl; i++) {
+        if (have_prev_frame && i < (int)p.tl_intervals_prev.size()) {
+            draw_lane(lane, p.tl_intervals_prev[i],
+                      [&](const ProfilerInterval& iv) { return tl_color_for(iv.tag); });
+        }
         draw_lane(lane++, p.tl_intervals[i],
-                  [&](const ProfilerInterval&) { return tl_color; });
+                  [&](const ProfilerInterval& iv) { return tl_color_for(iv.tag); });
     }
 
     // Raster lanes colored per RasterJobMode tag.
     for (size_t i = 0; i < p.raster_intervals.size(); i++) {
+        if (have_prev_frame && i < p.raster_intervals_prev.size()) {
+            draw_lane(lane, p.raster_intervals_prev[i],
+                      [&](const ProfilerInterval& iv) { return raster_color_for(iv.tag); });
+        }
         draw_lane(lane++, p.raster_intervals[i],
                   [&](const ProfilerInterval& iv) { return raster_color_for(iv.tag); });
     }
 
-    // Vertical markers:
-    //   purple #1 : start of the previous Platform::Present() (= left margin)
-    //   purple #2 : end of the previous Present() (= when this frame's
-    //               work actually started). The gap between the two
-    //               purple lines is the previous blit cost.
-    //   orange    : end of debug drawing for this frame (= the tick
-    //               captured by the renderer right before calling us).
+    // Vertical markers. With both ping-pong buffers visible we paint two
+    // sets at their absolute wallclock positions:
+    //   prev frame:  purple at prev_blit_start (=left margin), purple at
+    //                prev_blit_end, orange at prev_draw_end.
+    //   curr frame:  purple at curr_blit_start, purple at curr_blit_end,
+    //                orange at draw_end_ts (= panel right).
     // Saturated magenta keeps the purple lines visually distinct from
     // the Luminaire bar color (which is a softer purple).
     const uint32_t purple_color = pack_rgb_fast(format, 220, 60, 220);
@@ -183,24 +266,35 @@ void thread_profiler_draw(ThreadProfiler& p,
             row[x] = color;
         }
     };
-    // Purple #1: blit start, always at the left margin by construction.
-    draw_vline(left_edge, purple_color);
+    auto draw_marker_at = [&](Uint64 ts, uint32_t color) {
+        double ms = perf_ms(left_ts, ts);
+        int x = left_edge + (int)(ms * p.pixels_per_ms);
+        if (x < left_edge)  x = left_edge;
+        if (x > right_edge) x = right_edge;
+        draw_vline(x, color);
+    };
 
-    // Purple #2: blit end. Distance from the left margin is the previous
-    // Present()'s wall time. Clipped to panel if the blit was unusually
-    // long (e.g. vsync block, browser tab regaining focus).
-    double blit_ms = perf_ms(left_ts, blit_end_ts);
-    int blit_end_x = left_edge + (int)(blit_ms * p.pixels_per_ms);
-    if (blit_end_x < left_edge)  blit_end_x = left_edge;
-    if (blit_end_x > right_edge) blit_end_x = right_edge;
-    if (blit_end_x != left_edge) {
-        draw_vline(blit_end_x, purple_color);
+    if (have_prev_frame) {
+        // Previous frame's three markers. Purple #1 lands on the left edge
+        // by construction (left_ts == prev_blit_start_ts when have_prev_frame).
+        draw_marker_at(prev_blit_start_ts, purple_color);
+        if (prev_blit_end_ts > prev_blit_start_ts) {
+            draw_marker_at(prev_blit_end_ts, purple_color);
+        }
+        if (prev_orange_ts > prev_blit_start_ts) {
+            draw_marker_at(prev_orange_ts, orange_color);
+        }
     }
 
-    // Orange floating marker: end of debug draw for this frame.
-    double draw_ms = perf_ms(left_ts, orange_ts);
-    int orange_x = left_edge + (int)(draw_ms * p.pixels_per_ms);
-    if (orange_x < left_edge)  orange_x = left_edge;
-    if (orange_x > right_edge) orange_x = right_edge;
-    draw_vline(orange_x, orange_color);
+    // Current frame's markers. When there is no previous snapshot yet, the
+    // current blit_start sits exactly on the left margin (single-frame mode).
+    draw_marker_at(blit_start_ts, purple_color);
+    if (blit_end_ts > blit_start_ts) {
+        draw_marker_at(blit_end_ts, purple_color);
+    }
+    draw_marker_at(orange_ts, orange_color);
+
+    // Remember this draw's orange tick so the next begin_frame can promote
+    // it into prev_draw_end_ts when the live buffer ping-pongs.
+    p.last_draw_end_ts = orange_ts;
 }

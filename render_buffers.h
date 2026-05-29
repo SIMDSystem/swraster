@@ -16,6 +16,7 @@
 #include "render_config.h"
 #include "geometry.h"
 #include "clip.h"
+#include "cull.h"     // OccluderEye
 #include "draw.h"     // VertexVaryings, RasterTriangleSetup
 #include "shadow.h"   // ShadowVertex
 #include "texture.h"  // PackedTexture (used as opaque pointer here)
@@ -53,6 +54,21 @@ struct StripTriangleBuffer {
 struct ShadowBoxBuffer {
     ShadowVertex vertices[8];
     bool         visible[8];
+};
+
+// Pre-T&L'd spotlight luminaire cone fan. The cone has a fixed segment
+// count (LUMINAIRE_CONE_SEGMENTS) so its triangle list is small and the
+// vertex transforms are identical across all raster tiles — doing them
+// once per frame in the T&L pass replaces the previous "transform 64
+// segments inside every Luminaire raster tile" pathology. Filled by T&L
+// worker thread 0 each frame (or marked !valid if the spotlight is off),
+// consumed by the Luminaire raster job.
+struct LuminaireConeTri {
+    VertexVaryings v0, v1, v2;
+};
+struct LuminaireConeBuffer {
+    std::vector<LuminaireConeTri> tris; // sized to LUMINAIRE_CONE_SEGMENTS
+    bool valid = false;                 // false when spotlight is off
 };
 
 // One instance pose snapshot from the physics producer thread, consumed by
@@ -110,7 +126,22 @@ struct TLSharedData {
     int   screen_width;
     int   screen_height;
     SDL_PixelFormat* format;
-    const std::vector<uint8_t>* instance_occlusion_flags;
+    // Eye-space occluder list (type 0/1 instances), precomputed by main once
+    // per frame. T&L workers consume read-only when running small-ball
+    // (type 4) occlusion checks; the test cost is then O(occluders) per
+    // small ball instead of O(all instances) with redundant matrix work.
+    const std::vector<OccluderEye>* occluders_eye;
+    // Read slot of the physics pose ring for this frame. T&L workers
+    // pull per-instance translation + quaternion from here when building
+    // model matrices, so there is no copy of physics output into the
+    // CubeInstance fields. Physics is concurrently writing the OPPOSITE
+    // slot, so this pointer stays valid for the duration of the T&L pass.
+    const PoseSnapshot* pose_snapshot;
+    // Write slot for the spotlight luminaire cone fan. T&L worker thread 0
+    // fills this each frame (or marks !valid when the spotlight is off);
+    // the raster Luminaire pass reads from the matching read slot in
+    // RasterSharedData::cone_buf_read on the next frame.
+    LuminaireConeBuffer* cone_buf_write;
 };
 
 // Per-T&L-thread scratch output. Allocated once at startup, cleared each
@@ -155,4 +186,8 @@ struct RasterSharedData {
     int                shadow_size;
     const ShadowBoxBuffer* shadow_box;
     bool depth_write_enabled;
+    // Pre-T&L'd spotlight cone fan from the previous frame's T&L pass.
+    // Null / !valid when the spotlight is off; otherwise the Luminaire
+    // raster job iterates this buffer per tile (no per-tile T&L work).
+    const LuminaireConeBuffer* cone_buf_read;
 };

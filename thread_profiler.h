@@ -34,7 +34,13 @@ struct SDL_PixelFormat;
 struct ProfilerInterval {
     Uint64  start_ts;
     Uint64  end_ts;
-    uint8_t tag = 0; // For raster: cast of RasterJobMode. Unused for T&L / physics.
+    // CPU time actually consumed by the recording thread between
+    // start_ts and end_ts, in nanoseconds. The overlay draws each
+    // bar at width = cpu_ns mapped through pixels_per_ms (anchored at
+    // start_ts) so kernel preemption shows up as an uncolored gap to
+    // the right of the bar instead of a misleading "busy" stretch.
+    Uint64  cpu_ns  = 0;
+    uint8_t tag     = 0; // For raster: cast of RasterJobMode. Unused for T&L / physics.
 };
 
 // A single Platform::Present() blit window: the tick range from the
@@ -73,13 +79,31 @@ struct ThreadProfiler {
     std::mutex                    physics_mtx;
     std::vector<ProfilerInterval> physics_intervals;
 
+    // Double-buffered previous-frame snapshot: live arrays are ping-ponged
+    // with these at begin_frame, so the drawer can paint two consecutive
+    // frames side-by-side on a single wallclock-aligned timeline (older
+    // frame on the left, newer on the right). prev_blit_start/end_ts
+    // and prev_draw_end_ts are the markers that belonged to the older
+    // frame at the time IT was drawn — captured at the same begin_frame
+    // call that snapshots its intervals.
+    std::vector<std::vector<ProfilerInterval>> tl_intervals_prev;
+    std::vector<std::vector<ProfilerInterval>> raster_intervals_prev;
+    std::vector<ProfilerInterval>              physics_intervals_prev;
+    Uint64                                     prev_blit_start_ts = 0;
+    Uint64                                     prev_blit_end_ts   = 0;
+    Uint64                                     prev_draw_end_ts   = 0;
+
+    // Most-recent value passed to thread_profiler_draw, captured so the
+    // next frame's begin_frame can promote it into prev_draw_end_ts.
+    Uint64                                     last_draw_end_ts   = 0;
+
     // Visual layout (in framebuffer pixels).
     int   right_margin_px     = 40;
     int   left_margin_px      = 40;
     int   top_y               = 30;
     int   lane_height_px      = 3;
     int   lane_gap_px         = 1;
-    double pixels_per_ms      = 100.0;
+    double pixels_per_ms      = 50.0;
 };
 
 // Size the per-worker vectors. Call once after thread counts are decided.
@@ -92,25 +116,52 @@ void thread_profiler_begin_frame(ThreadProfiler& p);
 
 // Per-worker recorders. Inlined and gated on the atomic flag so disabled
 // builds pay one relaxed load per call site.
-inline void profiler_record_tl(ThreadProfiler& p, int thread_id, Uint64 start, Uint64 end) {
+// T&L tag values for the profiler overlay, one per functionally-distinct
+// T&L sub-pass:
+//   PerInstance (default) — phase-1 per-instance sweep: vertex transforms,
+//                           lighting, clip, project, shadow + RGB triangle
+//                           emission, per-tile bin assignment. Painted cyan.
+//   Spotlight             — once-per-frame spotlight luminaire cone fan
+//                           T&L on thread 0. Folded into the cyan family.
+//   LocalSort             — phase-1 tail: each worker sorts its own local
+//                           bins + overflow lists. Painted light blue.
+//   BinMerge              — phase-2 bin merge: each worker clears the
+//                           bins it owns and concatenates all workers'
+//                           local-bin contributions via inplace_merge.
+//                           Painted dark blue. The gap between the
+//                           light-blue local sort and the dark-blue merge
+//                           is the phase-1 barrier spin-wait.
+enum class TLJobTag : uint8_t {
+    PerInstance = 0, // phase-1 per-instance T&L (transform/light/clip/project/bin-assign)
+    Spotlight   = 1, // once-per-frame spotlight luminaire cone fan T&L (thread 0)
+    BinMerge    = 2, // phase-2 cross-worker bin merge (inplace_merge into published bins)
+    LocalSort   = 3, // phase-1 tail: each worker sorts its own local bins + overflow lists
+};
+
+inline void profiler_record_tl(ThreadProfiler& p, int thread_id,
+                               Uint64 start, Uint64 end, Uint64 cpu_ns,
+                               uint8_t tag = 0) {
     if (!p.enabled.load(std::memory_order_relaxed)) return;
     if (p.frozen.load(std::memory_order_relaxed)) return;
     if ((size_t)thread_id < p.tl_intervals.size()) {
-        p.tl_intervals[thread_id].push_back({start, end});
+        p.tl_intervals[thread_id].push_back({start, end, cpu_ns, tag});
     }
 }
-inline void profiler_record_raster(ThreadProfiler& p, int thread_id, Uint64 start, Uint64 end, uint8_t tag) {
+inline void profiler_record_raster(ThreadProfiler& p, int thread_id,
+                                   Uint64 start, Uint64 end, Uint64 cpu_ns,
+                                   uint8_t tag) {
     if (!p.enabled.load(std::memory_order_relaxed)) return;
     if (p.frozen.load(std::memory_order_relaxed)) return;
     if ((size_t)thread_id < p.raster_intervals.size()) {
-        p.raster_intervals[thread_id].push_back({start, end, tag});
+        p.raster_intervals[thread_id].push_back({start, end, cpu_ns, tag});
     }
 }
-inline void profiler_record_physics(ThreadProfiler& p, Uint64 start, Uint64 end) {
+inline void profiler_record_physics(ThreadProfiler& p,
+                                    Uint64 start, Uint64 end, Uint64 cpu_ns) {
     if (!p.enabled.load(std::memory_order_relaxed)) return;
     if (p.frozen.load(std::memory_order_relaxed)) return;
     std::lock_guard<std::mutex> lock(p.physics_mtx);
-    p.physics_intervals.push_back({start, end});
+    p.physics_intervals.push_back({start, end, cpu_ns, 0});
     if (p.physics_intervals.size() > 64) {
         p.physics_intervals.erase(p.physics_intervals.begin(),
                                   p.physics_intervals.begin() + (p.physics_intervals.size() - 64));

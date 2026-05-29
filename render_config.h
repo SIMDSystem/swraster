@@ -49,6 +49,13 @@ static inline ShadowDepth shadow_depth_to_u16(float z) {
     return (ShadowDepth)(z * 65535.0f + 0.5f);
 }
 
+// Spotlight luminaire cone tessellation. The cone fan has a fixed segment
+// count so the per-frame T&L cost (one apex + two rim vertices per segment)
+// is constant and tiny; the raster Luminaire pass then just walks the
+// pre-T&L'd triangle list per tile instead of re-transforming inside the
+// tile inner loop.
+constexpr int LUMINAIRE_CONE_SEGMENTS = 64;
+
 // Tile dispatch shape. TILE_X_SPLITS is fixed at compile time; NUM_STRIPS and
 // the derived NUM_TILE_BINS are set at startup once we know the platform's
 // hardware concurrency. Workers and the merge phase read these as plain ints.

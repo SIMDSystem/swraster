@@ -71,11 +71,10 @@ static void reset_animation(RendererContext& ctx,
     }
     pp.system->OptimizeBroadPhase();
 
-    {
-        std::lock_guard<std::mutex> lock(pp.pose_mtx);
-        for (auto& snapshot : pp.pose_snapshots) {
-            write_instance_pose_snapshot(snapshot, instances, 0.0f, 0);
-        }
+    // Producer is idle (physics_wait_for_idle above), so we can repopulate
+    // both ring slots without a lock — no concurrent writer.
+    for (auto& snapshot : pp.pose_snapshots) {
+        write_instance_pose_snapshot(snapshot, instances, 0.0f, 0);
     }
     physics_reset_pipeline_state(pp);
 
@@ -90,16 +89,24 @@ static void reset_animation(RendererContext& ctx,
         }
     }
     tl_done_counter.store(0, std::memory_order_relaxed);
+    tl_phase1_done_counter.store(0, std::memory_order_relaxed);
     raster_workers_done.store(0, std::memory_order_relaxed);
-    for (int r = 0; r < NUM_STRIPS; r++) {
+    for (int r = 0; r < NUM_STRIPS * 2; r++) {  // Luminaire uses 2*NUM_STRIPS rows
         raster_row_next_col[r].store(0, std::memory_order_relaxed);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Merge per-thread T&L outputs into the published double-buffer slot.
+// Merge per-thread T&L globals (the flat opaque/trans/shadow triangle lists)
+// into the published double-buffer slot.
+//
+// The lists are fixed-capacity scratch buffers; we publish their valid
+// length via `count`, so reuse across frames is a free "counter reset" —
+// the underlying vectors are never cleared or resized down. This runs on
+// main post-Present; the much bigger per-tile bin merge is done in
+// parallel by the T&L workers themselves (see tl_worker.cpp phase 2).
 // ---------------------------------------------------------------------------
-static void merge_tl_outputs(RendererContext& ctx, int tl_buf_idx) {
+static void merge_tl_globals(RendererContext& ctx, int tl_buf_idx) {
     size_t count_opaque = 0;
     size_t count_trans = 0;
     size_t count_shadow = 0;
@@ -133,22 +140,9 @@ static void merge_tl_outputs(RendererContext& ctx, int tl_buf_idx) {
         }
         dropped_count += src.size() - write_count;
     };
-    auto append_bin = [](std::vector<RenderTriangle>& dst,
-                         const std::vector<RenderTriangle>& src,
-                         bool keep_sorted, auto less_than) {
-        if (src.empty()) return;
-        size_t old_size = dst.size();
-        dst.insert(dst.end(), src.begin(), src.end());
-        if (keep_sorted && old_size > 0) {
-            std::inplace_merge(dst.begin(), dst.begin() + old_size, dst.end(), less_than);
-        }
-    };
     auto front_to_back = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; };
     auto back_to_front = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; };
 
-    size_t max_opaque_bin = 0;
-    size_t max_trans_bin  = 0;
-    size_t max_shadow_bin = 0;
     for (int tid = 0; tid < NUM_TL_THREADS; tid++) {
         const auto& out = (*ctx.tl_thread_outputs)[tid];
         if (ENABLE_RGB_TRIANGLE_SORT) {
@@ -163,17 +157,6 @@ static void merge_tl_outputs(RendererContext& ctx, int tl_buf_idx) {
         } else {
             append_limited(ctx.shadow_buffers[tl_buf_idx].triangles, count_shadow, out.shadow, dropped_shadow);
         }
-        for (int s = 0; s < NUM_TILE_BINS; s++) {
-            auto& opaque_dst = ctx.opaque_strip_buffers[tl_buf_idx].bins[s];
-            auto& trans_dst  = ctx.trans_strip_buffers [tl_buf_idx].bins[s];
-            auto& shadow_dst = ctx.shadow_strip_buffers[tl_buf_idx].bins[s];
-            append_bin(opaque_dst, out.opaque_bins[s], ENABLE_RGB_TRIANGLE_SORT, front_to_back);
-            append_bin(trans_dst,  out.trans_bins [s], ENABLE_RGB_TRIANGLE_SORT, back_to_front);
-            append_bin(shadow_dst, out.shadow_bins[s], ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
-            max_opaque_bin = std::max(max_opaque_bin, opaque_dst.size());
-            max_trans_bin  = std::max(max_trans_bin,  trans_dst .size());
-            max_shadow_bin = std::max(max_shadow_bin, shadow_dst.size());
-        }
     }
 
     if (dropped_opaque || dropped_trans || dropped_shadow) {
@@ -182,14 +165,6 @@ static void merge_tl_outputs(RendererContext& ctx, int tl_buf_idx) {
             printf("Warning: dropped triangles: opaque=%zu trans=%zu shadow=%zu\n",
                    dropped_opaque, dropped_trans, dropped_shadow);
             warned = true;
-        }
-    }
-    if (max_opaque_bin > 50000 || max_trans_bin > 50000 || max_shadow_bin > 50000) {
-        static bool warned_bin = false;
-        if (!warned_bin) {
-            printf("Warning: large triangle bin: opaque=%zu trans=%zu shadow=%zu\n",
-                   max_opaque_bin, max_trans_bin, max_shadow_bin);
-            warned_bin = true;
         }
     }
 
@@ -231,13 +206,17 @@ static void periodic_capacity_shrink(RendererContext& ctx) {
 // ---------------------------------------------------------------------------
 // Dispatch one raster job to the worker pool and wait for it to drain.
 // ---------------------------------------------------------------------------
-static void run_raster_job(RendererContext& ctx,
-                           RasterJobMode job_mode, int buf_idx,
-                           bool& raster_phase_marked) {
+static void run_raster_job(RendererContext& /*ctx*/,
+                           RasterJobMode job_mode, int buf_idx) {
     int expected_raster_workers = NUM_RASTER_THREADS;
+    // Luminaire subdivides the tile grid 2x in both dims, so its workers
+    // consume strip indices [0..2*NUM_STRIPS); reset all the counters
+    // those workers will touch. For other passes the extra resets are
+    // a handful of harmless atomic stores into never-read slots.
+    int strips_to_reset = NUM_STRIPS * 2;
     {
         std::lock_guard<std::mutex> lock(mtx_raster);
-        for (int r = 0; r < NUM_STRIPS; r++) {
+        for (int r = 0; r < strips_to_reset; r++) {
             raster_row_next_col[r].store(0, std::memory_order_relaxed);
         }
         raster_workers_done.store(0, std::memory_order_relaxed);
@@ -248,10 +227,6 @@ static void run_raster_job(RendererContext& ctx,
                                   std::memory_order_release);
     }
     cv_raster.notify_all();
-    if (!raster_phase_marked) {
-        raster_phase_marked = true;
-        physics_mark_raster_in_flight(*ctx.physics);
-    }
     wait_for_main_thread_predicate([expected_raster_workers] {
         return raster_workers_done.load(std::memory_order_acquire) >= expected_raster_workers;
     });
@@ -376,7 +351,25 @@ void run_render_loop(RendererContext& ctx) {
 
     // Camera state (interactive orbit cam, owned by the loop).
     bool  running         = true;
-    bool  paused          = false;
+    bool  paused              = false;
+    // 'F' toggle: when set, keep recording live profiler intervals even
+    // while physics is paused (paused stops sim advancement but raster
+    // still runs on the last-published pose, so the profiler bars
+    // reflect the cost of those repeated frames).
+    bool  profiler_unfreeze   = false;
+    // 'T' toggle (only meaningful while the profiler overlay is on, i.e. 'P'
+    // is enabled). When trace_mode is on we keep a rolling ring buffer of
+    // the last 10 frame deltas (the orange-bar position relative to the
+    // previous frame's blit start) and maintain a running sum so the average
+    // is a single fetch + divide per frame. Any single frame whose delta
+    // exceeds 1.3 * average auto-pauses the sim and freezes the profiler so
+    // the spike is captured on-screen for inspection.
+    bool          trace_mode        = false;
+    constexpr int trace_window_size = 10;
+    double        trace_ring[trace_window_size] = {0};
+    int           trace_ring_count  = 0;
+    int           trace_ring_head   = 0;
+    double        trace_ring_sum    = 0.0;
     [[maybe_unused]] bool  camera_orbiting = false;
     float camera_yaw      = 0.0f;
     float camera_pitch    = asinf(8.0f / sqrtf(8.0f * 8.0f + 21.7f * 21.7f));
@@ -425,6 +418,20 @@ void run_render_loop(RendererContext& ctx) {
                     if (event.key == 'p' || event.key == 'P') {
                         bool was = ctx.profiler->enabled.load(std::memory_order_relaxed);
                         ctx.profiler->enabled.store(!was, std::memory_order_relaxed);
+                    }
+                    if (event.key == 'f' || event.key == 'F') {
+                        profiler_unfreeze = !profiler_unfreeze;
+                    }
+                    if (event.key == 't' || event.key == 'T') {
+                        // Trace mode only makes sense while the profiler
+                        // overlay is on; ignore otherwise so 't' doesn't
+                        // silently arm a watchdog the user can't see.
+                        if (ctx.profiler->enabled.load(std::memory_order_relaxed)) {
+                            trace_mode = !trace_mode;
+                            trace_ring_count = 0;
+                            trace_ring_head  = 0;
+                            trace_ring_sum   = 0.0;
+                        }
                     }
                     break;
                 case Platform::Event::MouseButton:
@@ -488,10 +495,13 @@ void run_render_loop(RendererContext& ctx) {
             if (paused) delta_time = 0.0f;
         }
 
-        // Render from the newest completed physics pose. The next Jolt step is
-        // armed now, but starts only when T&L finishes and raster is in flight.
-        sim_time = physics_apply_latest_snapshot(pp);
-        float time = sim_time;
+        // Pick the pose-ring slot T&L will read this frame, then arm the
+        // next Jolt step against the OPPOSITE slot. Trigger happens
+        // after the T&L kick below so the physics worker can run
+        // concurrently with T&L (different ring slot, no conflict).
+        int pose_read_idx = pp.published_snapshot.load(std::memory_order_acquire);
+        sim_time          = pp.pose_snapshots[pose_read_idx].sim_time;
+        float time        = sim_time;
         physics_arm_after_tl(pp, delta_time, time + delta_time);
 
         // Projection (rebuild only on aspect change).
@@ -548,87 +558,33 @@ void run_render_loop(RendererContext& ctx) {
         }
 
         // Sort instances front-to-back (opaque) / back-to-front (transparent).
-        // Also cheaply cull small balls hidden behind conservative inner spheres
-        // of large opaque occluders from both camera and spotlight views.
-        auto& instance_depths        = *ctx.instance_depths;
-        auto& instances              = *ctx.instances;
-        auto& instance_occlusion_flags = *ctx.instance_occlusion_flags;
+        // Main does only the cheap stuff here:
+        //   * one matrix-vec per instance to get eye-space center z (sort key)
+        //   * harvest type 0/1 occluder eye positions into a small list
+        // T&L workers consume the precomputed occluder list to run the
+        // expensive O(small_balls * occluders) cone test in parallel.
+        auto& instance_depths = *ctx.instance_depths;
+        auto& instances       = *ctx.instances;
+        auto& occluders_eye   = *ctx.occluders_eye;
+        // Both vectors are kept at high-water-mark capacity across frames; clear()
+        // on trivial-T vector is just size=0, no allocator traffic.
         instance_depths.clear();
-        if (instance_occlusion_flags.size() != instances.size()) {
-            instance_occlusion_flags.resize(instances.size(), 0);
-        }
-        std::fill(instance_occlusion_flags.begin(), instance_occlusion_flags.end(), 0);
+        occluders_eye.clear();
 
-        auto point_occluded_by_sphere = [](const Vector3f& viewer, const Vector3f& p,
-                                           const Vector3f& occ, float occ_inner_radius,
-                                           float p_radius) {
-            Vector3f to_occ = occ - viewer;
-            float occ_dist2 = to_occ.squaredNorm();
-            if (occ_dist2 <= 0.000001f) return false;
-            Vector3f to_p = p - viewer;
-            float p_dist2 = to_p.squaredNorm();
-            if (p_dist2 <= occ_dist2) return false;
-            float occ_dist = sqrtf(occ_dist2);
-            float p_dist   = sqrtf(p_dist2);
-            float occ_half = asinf(fminf(0.999f, occ_inner_radius / occ_dist));
-            float p_half   = asinf(fminf(0.999f, p_radius / p_dist));
-            float fully_occluded_angle = occ_half - 2.0f * p_half;
-            if (fully_occluded_angle <= 0.0f) return false;
-            float cos_limit       = cosf(fully_occluded_angle);
-            float cos_to_center   = to_occ.dot(to_p) * (1.0f / (occ_dist * p_dist));
-            return cos_to_center >= cos_limit;
-        };
-        auto directional_occluded_by_sphere = [](const Vector3f& light_axis, const Vector3f& p,
-                                                 const Vector3f& occ, float occ_inner_radius,
-                                                 float p_radius) {
-            Vector3f delta = p - occ;
-            float p_behind_occ = delta.dot(-light_axis);
-            if (p_behind_occ <= p_radius) return false;
-            float perp2 = delta.squaredNorm() - p_behind_occ * p_behind_occ;
-            float expanded_radius = occ_inner_radius + p_radius;
-            return perp2 <= expanded_radius * expanded_radius;
-        };
-        constexpr uint8_t OCCLUDED_CAMERA = 1;
-        constexpr uint8_t OCCLUDED_SHADOW = 2;
         constexpr float cube_inner_occluder_radius = 1.0f;
-        float sphere_inner_occluder_radius = ctx.sphere_bound_radius;
-
+        const float sphere_inner_occluder_radius = ctx.sphere_bound_radius;
+        const PoseSnapshot& read_snapshot = pp.pose_snapshots[pose_read_idx];
         for (size_t i = 0; i < instances.size(); i++) {
-            Vector4f center_world(instances[i].tx, instances[i].ty, instances[i].tz, 1.0f);
+            const CubeInstance& inst = instances[i];
+            const InstancePose& pose = read_snapshot.poses[i];
+            Vector4f center_world(pose.tx, pose.ty, pose.tz, 1.0f);
             Vector4f center_view = view_matrix * center_world;
-            uint8_t occlusion_flags = instance_occlusion_flags[i];
-            if (instances[i].type == 4) {
-                occlusion_flags = 0;
-                Vector3f small_eye = center_view.head<3>();
-                for (const CubeInstance& occ_inst : instances) {
-                    float occ_inner_radius;
-                    if      (occ_inst.type == 0) occ_inner_radius = cube_inner_occluder_radius;
-                    else if (occ_inst.type == 1) occ_inner_radius = sphere_inner_occluder_radius;
-                    else continue;
-                    Vector4f occ_world(occ_inst.tx, occ_inst.ty, occ_inst.tz, 1.0f);
-                    Vector3f occ_eye = (view_matrix * occ_world).head<3>();
-                    if ((occlusion_flags & OCCLUDED_CAMERA) == 0 &&
-                        point_occluded_by_sphere(Vector3f::Zero(), small_eye, occ_eye,
-                                                 occ_inner_radius, ctx.smallball_bound_radius)) {
-                        occlusion_flags |= OCCLUDED_CAMERA;
-                    }
-                    if ((occlusion_flags & OCCLUDED_SHADOW) == 0) {
-                        bool shadow_occluded = false;
-                        if (USE_SPOTLIGHT) {
-                            shadow_occluded = point_occluded_by_sphere(light_pos_eye, small_eye, occ_eye,
-                                                                       occ_inner_radius, ctx.smallball_bound_radius);
-                        } else {
-                            shadow_occluded = directional_occluded_by_sphere(light_dir, small_eye, occ_eye,
-                                                                             occ_inner_radius, ctx.smallball_bound_radius);
-                        }
-                        if (shadow_occluded) occlusion_flags |= OCCLUDED_SHADOW;
-                    }
-                    if ((occlusion_flags & (OCCLUDED_CAMERA | OCCLUDED_SHADOW)) ==
-                        (OCCLUDED_CAMERA | OCCLUDED_SHADOW)) break;
-                }
-                instance_occlusion_flags[i] = occlusion_flags;
-            }
             instance_depths.push_back({center_view.z(), i});
+            if (inst.type == 0) {
+                occluders_eye.push_back({center_view.head<3>(), cube_inner_occluder_radius});
+            } else if (inst.type == 1) {
+                occluders_eye.push_back({center_view.head<3>(), sphere_inner_occluder_radius});
+            }
         }
 
         std::sort(instance_depths.begin(), instance_depths.end(),
@@ -644,14 +600,10 @@ void run_render_loop(RendererContext& ctx) {
 
         int tl_buf_idx     = frame_num % 2;
         int raster_buf_idx = (frame_num + 1) % 2;
-
-        // Clear next T&L target's bins. Buffer counts are published once the
-        // worker-local outputs have been merged below.
-        for (int s = 0; s < NUM_TILE_BINS; s++) {
-            ctx.opaque_strip_buffers[tl_buf_idx].bins[s].clear();
-            ctx.trans_strip_buffers [tl_buf_idx].bins[s].clear();
-            ctx.shadow_strip_buffers[tl_buf_idx].bins[s].clear();
-        }
+        // The T&L target slot's bins are cleared and re-filled by the T&L
+        // workers themselves in their phase-2 tail (see tl_worker.cpp).
+        // No clear() loop on main; the gap-time work is just the kick
+        // below and the wait/merge_globals after Present.
 
         // Publish T&L inputs.
         TLSharedData& tl_shared = *ctx.tl_shared;
@@ -694,7 +646,9 @@ void run_render_loop(RendererContext& ctx) {
         tl_shared.screen_width       = ctx.screen_width;
         tl_shared.screen_height      = ctx.screen_height;
         tl_shared.format             = fb->format;
-        tl_shared.instance_occlusion_flags = &instance_occlusion_flags;
+        tl_shared.occluders_eye      = &occluders_eye;
+        tl_shared.pose_snapshot      = &pp.pose_snapshots[pose_read_idx];
+        tl_shared.cone_buf_write     = &ctx.cone_buffers[tl_buf_idx];
 
         // Stage the per-frame matrices + lights into the 2-slot ring.
         ctx.light_dir_buffers    [tl_buf_idx] = light_dir;
@@ -734,7 +688,6 @@ void run_render_loop(RendererContext& ctx) {
 
         // Raster the buffer that T&L populated on the *previous* frame.
         bool do_raster = (frame_num > 1);
-        if (!do_raster) physics_mark_raster_done(pp);
 
         if (do_raster) {
             uint32_t clear_color = pack_rgb_fast(fb->format, 45, 45, 45);
@@ -766,6 +719,7 @@ void run_render_loop(RendererContext& ctx) {
             rs.shadow_depth_write      = ctx.shadow_depth_buffers[raster_buf_idx].data();
             rs.shadow_size             = SHADOW_MAP_SIZE;
             rs.shadow_box              = &ctx.shadow_box_buffers  [raster_buf_idx];
+            rs.cone_buf_read           = &ctx.cone_buffers         [raster_buf_idx];
             rs.depth_write_enabled     = true;
         }
 
@@ -779,12 +733,16 @@ void run_render_loop(RendererContext& ctx) {
         {
             ThreadProfiler& prof = *ctx.profiler;
             bool was_frozen = prof.frozen.load(std::memory_order_relaxed);
-            if (paused && !was_frozen) {
+            // 'F' overrides the pause-driven freeze so the profiler keeps
+            // capturing live intervals (and the orange/purple anchors
+            // float with the live frame) even while physics is paused.
+            bool want_frozen = paused && !profiler_unfreeze;
+            if (want_frozen && !was_frozen) {
                 prof.frozen_blit_start_ts = prof.present_history[1].start_ts;
                 prof.frozen_blit_end_ts   = prof.present_history[1].end_ts;
                 prof.frozen_draw_end_ts   = prof.present_history[0].start_ts;
             }
-            prof.frozen.store(paused, std::memory_order_relaxed);
+            prof.frozen.store(want_frozen, std::memory_order_relaxed);
         }
         // Clear last frame's per-worker profiler logs (safe: workers asleep).
         thread_profiler_begin_frame(*ctx.profiler);
@@ -797,15 +755,18 @@ void run_render_loop(RendererContext& ctx) {
         }
         cv_tl.notify_all();
 
+        // Wake the physics worker NOW so it runs concurrently with T&L.
+        // It writes pose_snapshots[1 - pose_read_idx] while T&L reads
+        // pose_snapshots[pose_read_idx], so there is no slot conflict.
+        physics_trigger_after_tl(pp);
+
         // Raster the previous frame: shadow → color → SSAO → luminaire cones.
         Uint64 raster_phase_start = Platform::PerfCounter();
-        bool raster_phase_marked = false;
         if (do_raster) {
-            run_raster_job(ctx, RasterJobMode::ShadowDepth, raster_buf_idx, raster_phase_marked);
-            run_raster_job(ctx, RasterJobMode::Color,       raster_buf_idx, raster_phase_marked);
-            run_raster_job(ctx, RasterJobMode::Ssao,        raster_buf_idx, raster_phase_marked);
-            run_raster_job(ctx, RasterJobMode::Luminaire,   raster_buf_idx, raster_phase_marked);
-            physics_mark_raster_done(pp);
+            run_raster_job(ctx, RasterJobMode::ShadowDepth, raster_buf_idx);
+            run_raster_job(ctx, RasterJobMode::Color,       raster_buf_idx);
+            run_raster_job(ctx, RasterJobMode::Ssao,        raster_buf_idx);
+            run_raster_job(ctx, RasterJobMode::Luminaire,   raster_buf_idx);
         }
         if (do_raster && ctx.raster_shared[raster_buf_idx].use_spotlight) {
             draw_spotlight_luminaire(pixels, pitch, ctx.depth_buffer->data(),
@@ -882,6 +843,39 @@ void run_render_loop(RendererContext& ctx) {
         // it paints sits exactly at draw_end_ts (captured here, just
         // before drawing the overlay itself).
         Uint64 draw_end_ts = Platform::PerfCounter();
+
+        // Trace-mode spike watchdog. Use the same anchor as the overlay so
+        // the delta we evaluate is exactly the orange-bar position the user
+        // sees. We need the prior frame's blit-start (the panel's left edge)
+        // — present_history[0] still holds it at this point in the frame
+        // because the Present below is what advances it.
+        if (trace_mode && !paused && ctx.profiler->enabled.load(std::memory_order_relaxed)) {
+            Uint64 prev_blit_start = ctx.profiler->present_history[0].start_ts;
+            if (prev_blit_start != 0) {
+                double delta_ms = perf_ms(prev_blit_start, draw_end_ts);
+                if (trace_ring_count >= trace_window_size) {
+                    double avg_ms = trace_ring_sum * (1.0 / trace_window_size);
+                    // Spec: trigger when delta > 1.3 * average.
+                    if (delta_ms > 1.3 * avg_ms) {
+                        paused = true;
+                        profiler_unfreeze = false;
+                    }
+                }
+                if (!paused) {
+                    // Ring-buffer insert with O(1) sum maintenance: subtract the
+                    // slot we're overwriting (only once it's been filled once),
+                    // then add the new sample.
+                    if (trace_ring_count >= trace_window_size) {
+                        trace_ring_sum -= trace_ring[trace_ring_head];
+                    }
+                    trace_ring[trace_ring_head] = delta_ms;
+                    trace_ring_sum += delta_ms;
+                    trace_ring_head = (trace_ring_head + 1) % trace_window_size;
+                    if (trace_ring_count < trace_window_size) trace_ring_count++;
+                }
+            }
+        }
+
         thread_profiler_draw(*ctx.profiler, pixels, pitch,
                              ctx.screen_width, ctx.screen_height, fb->format,
                              draw_end_ts);
@@ -921,11 +915,14 @@ void run_render_loop(RendererContext& ctx) {
             tp.raster_ms_this_variant += perf_ms(raster_phase_start, raster_phase_end);
         }
 
-        merge_tl_outputs(ctx, tl_buf_idx);
+        // Bins were merged in parallel by the workers themselves; main only
+        // does the small globals merge (capacity-fixed, counter-reset lists).
+        merge_tl_globals(ctx, tl_buf_idx);
 
         if ((frame_num & 0xff) == 0) periodic_capacity_shrink(ctx);
 
         tl_done_counter.store(0);
+        tl_phase1_done_counter.store(0);
         frame_num++;
         frame_sequence++;
 

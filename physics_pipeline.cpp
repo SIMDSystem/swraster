@@ -24,31 +24,14 @@ void physics_wait_for_idle(PhysicsPipeline& pp) {
     });
 }
 
-float physics_apply_latest_snapshot(PhysicsPipeline& pp) {
-    std::lock_guard<std::mutex> lock(pp.pose_mtx);
-    int snapshot_idx   = pp.published_snapshot.load(std::memory_order_acquire);
-    uint64_t sequence  = pp.published_sequence.load(std::memory_order_acquire);
-    if (sequence == pp.consumed_sequence) {
-        return pp.pose_snapshots[snapshot_idx].sim_time;
-    }
-    const PoseSnapshot& snapshot = pp.pose_snapshots[snapshot_idx];
-    auto& instances = *pp.instances;
-    size_t n = std::min(instances.size(), snapshot.poses.size());
-    for (size_t i = 0; i < n; i++) {
-        const InstancePose& pose = snapshot.poses[i];
-        CubeInstance& inst = instances[i];
-        inst.tx = pose.tx; inst.ty = pose.ty; inst.tz = pose.tz;
-        inst.qx = pose.qx; inst.qy = pose.qy; inst.qz = pose.qz; inst.qw = pose.qw;
-    }
-    pp.consumed_sequence = sequence;
-    return snapshot.sim_time;
+float physics_current_sim_time(const PhysicsPipeline& pp) {
+    int idx = pp.published_snapshot.load(std::memory_order_acquire);
+    return pp.pose_snapshots[idx].sim_time;
 }
 
 void physics_arm_after_tl(PhysicsPipeline& pp, float delta_time, float target_time) {
     std::lock_guard<std::mutex> lock(pp.mtx);
-    pp.job_armed        = delta_time > 0.0f && !pp.job_pending && !pp.job_active;
-    pp.trigger_deferred = false;
-    pp.raster_phase     = pp.job_armed ? 0 : 2;
+    pp.job_armed = delta_time > 0.0f && !pp.job_pending && !pp.job_active;
     if (pp.job_armed) {
         pp.job_delta       = delta_time;
         pp.job_target_time = target_time;
@@ -59,31 +42,9 @@ void physics_arm_after_tl(PhysicsPipeline& pp, float delta_time, float target_ti
 void physics_trigger_after_tl(PhysicsPipeline& pp) {
     std::lock_guard<std::mutex> lock(pp.mtx);
     if (!pp.job_armed || pp.job_pending || pp.job_active) return;
-    if (pp.raster_phase == 0) {
-        pp.trigger_deferred = true;
-        return;
-    }
-    pp.trigger_deferred = false;
-    pp.job_armed        = false;
-    pp.job_pending      = true;
+    pp.job_armed   = false;
+    pp.job_pending = true;
     pp.cv.notify_one();
-}
-
-void physics_mark_raster_in_flight(PhysicsPipeline& pp) {
-    std::lock_guard<std::mutex> lock(pp.mtx);
-    pp.raster_phase = 1;
-    if (pp.trigger_deferred && pp.job_armed && !pp.job_pending && !pp.job_active) {
-        pp.trigger_deferred = false;
-        pp.job_armed        = false;
-        pp.job_pending      = true;
-        pp.cv.notify_one();
-    }
-}
-
-void physics_mark_raster_done(PhysicsPipeline& pp) {
-    std::lock_guard<std::mutex> lock(pp.mtx);
-    pp.raster_phase     = 2;
-    pp.trigger_deferred = false;
 }
 
 void physics_step_to_snapshot(PhysicsPipeline& pp,
@@ -151,23 +112,16 @@ void physics_step_to_snapshot(PhysicsPipeline& pp,
 }
 
 void physics_reset_pipeline_state(PhysicsPipeline& pp) {
-    {
-        std::lock_guard<std::mutex> lock(pp.pose_mtx);
-        pp.published_snapshot.store(0, std::memory_order_release);
-        pp.published_sequence.store(0, std::memory_order_release);
-        pp.consumed_sequence = UINT64_MAX;
-    }
+    pp.published_snapshot.store(0, std::memory_order_release);
+    pp.published_sequence.store(0, std::memory_order_release);
     std::lock_guard<std::mutex> lock(pp.mtx);
     pp.job_pending           = false;
     pp.job_active            = false;
     pp.job_armed             = false;
-    pp.trigger_deferred      = false;
-    pp.raster_phase          = 2;
     pp.job_delta             = 0.0f;
     pp.job_target_time       = 0.0f;
     pp.job_sequence          = 0;
     pp.next_sequence         = 1;
-    pp.next_snapshot         = 1;
     pp.wall_ms_accum         = 0.0;
     pp.cpu_ms_accum          = 0.0;
     pp.update_wall_ms_accum  = 0.0;
@@ -191,22 +145,27 @@ void physics_worker_thread(PhysicsPipeline& pp) {
             delta_time    = pp.job_delta;
             target_time   = pp.job_target_time;
             sequence      = pp.job_sequence;
-            snapshot_idx  = pp.next_snapshot;
-            pp.next_snapshot = (pp.next_snapshot + 1) % 3;
+            // Ping-pong: write to the slot that is NOT currently published
+            // (and therefore not currently being read by T&L). The pair of
+            // atomics is consistent here because publication only happens
+            // from this worker thread, one step at a time.
+            snapshot_idx  = 1 - pp.published_snapshot.load(std::memory_order_acquire);
         }
 
-        Uint64 work_start_ts = Platform::PerfCounter();
+        Uint64 work_start_ts     = Platform::PerfCounter();
+        Uint64 work_start_cpu_ns = Platform::ThreadCpuNs();
         physics_step_to_snapshot(pp, delta_time, target_time, sequence,
                                  pp.pose_snapshots[snapshot_idx]);
         if (pp.profiler) {
-            profiler_record_physics(*pp.profiler, work_start_ts, Platform::PerfCounter());
+            Uint64 end_cpu_ns = Platform::ThreadCpuNs();
+            Uint64 cpu_ns = end_cpu_ns > work_start_cpu_ns ? end_cpu_ns - work_start_cpu_ns : 0;
+            profiler_record_physics(*pp.profiler, work_start_ts, Platform::PerfCounter(), cpu_ns);
         }
 
-        {
-            std::lock_guard<std::mutex> lock(pp.pose_mtx);
-            pp.published_snapshot.store(snapshot_idx, std::memory_order_release);
-            pp.published_sequence.store(sequence, std::memory_order_release);
-        }
+        // Publish the slot we just wrote; T&L will pick it up on its next
+        // frame via TLSharedData::pose_snapshot.
+        pp.published_snapshot.store(snapshot_idx, std::memory_order_release);
+        pp.published_sequence.store(sequence,     std::memory_order_release);
         {
             std::lock_guard<std::mutex> lock(pp.mtx);
             pp.job_active = false;

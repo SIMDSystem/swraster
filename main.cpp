@@ -237,9 +237,27 @@ int main(int argc, char** argv) {
         opaque_strip_buffers[b].bins.resize(NUM_TILE_BINS);
         trans_strip_buffers [b].bins.resize(NUM_TILE_BINS);
         shadow_strip_buffers[b].bins.resize(NUM_TILE_BINS);
+        // Pre-reserve the published per-tile bins so the first dozen
+        // frames don't realloc-and-copy under T&L phase-2 inplace_merge
+        // (which inserts all worker contributions into one bin). Sized
+        // to absorb a few hundred tris per bin without growth; if the
+        // scene is calmer the periodic_capacity_shrink will trim later.
+        for (int s = 0; s < NUM_TILE_BINS; s++) {
+            opaque_strip_buffers[b].bins[s].reserve(512);
+            trans_strip_buffers [b].bins[s].reserve(128);
+            shadow_strip_buffers[b].bins[s].reserve(512);
+        }
     }
 
     ShadowBoxBuffer shadow_box_buffers[2];
+    LuminaireConeBuffer cone_buffers[2];
+    for (int b = 0; b < 2; b++) {
+        // Pre-reserve so the first frame's build_luminaire_cone_tl doesn't
+        // allocate inside the T&L profiler interval. Capacity is fixed by
+        // the cone tessellation.
+        cone_buffers[b].tris.reserve(LUMINAIRE_CONE_SEGMENTS);
+        cone_buffers[b].valid = false;
+    }
     Vector3f light_dir_buffers[2], light_pos_buffers[2], spot_dir_buffers[2];
     Matrix4f view_matrix_buffers[2], projection_buffers[2], shadow_matrix_buffers[2];
     float    time_buffers[2] = {0.0f, 0.0f};
@@ -256,10 +274,15 @@ int main(int argc, char** argv) {
         out.opaque_bins.resize(NUM_TILE_BINS);
         out.trans_bins .resize(NUM_TILE_BINS);
         out.shadow_bins.resize(NUM_TILE_BINS);
+        // Per-worker thread-local bins. With 256 tile bins and ~3 T&L
+        // workers, each worker's per-tile bin sees roughly one-third of
+        // the total triangle traffic — pre-reserve enough that hot
+        // scenes (light right on top of geometry) don't trigger the
+        // grow-and-realloc cycle that double-buffers every push.
         for (int s = 0; s < NUM_TILE_BINS; s++) {
-            out.opaque_bins[s].reserve(128);
-            out.trans_bins [s].reserve(64);
-            out.shadow_bins[s].reserve(128);
+            out.opaque_bins[s].reserve(256);
+            out.trans_bins [s].reserve(96);
+            out.shadow_bins[s].reserve(256);
         }
     }
     RasterSharedData raster_shared[2];
@@ -273,7 +296,13 @@ int main(int argc, char** argv) {
 
     std::vector<std::pair<float, size_t>> instance_depths;
     instance_depths.reserve(instances.size());
-    std::vector<uint8_t> instance_occlusion_flags(instances.size(), 0);
+    // Per-frame eye-space occluder list (cube + sphere instances). Built
+    // by render_loop.cpp once per frame; consumed concurrently by T&L
+    // workers running small-ball occlusion checks. Reserve a generous
+    // upper bound (every non-smallball candidate) so the per-frame
+    // push_back loop never reallocates.
+    std::vector<OccluderEye> occluders_eye;
+    occluders_eye.reserve(instances.size());
 
     FpsCounter fps_counter;
 
@@ -311,6 +340,7 @@ int main(int argc, char** argv) {
     ctx.opaque_strip_buffers = opaque_strip_buffers;
     ctx.trans_strip_buffers  = trans_strip_buffers;
     ctx.shadow_strip_buffers = shadow_strip_buffers;
+    ctx.cone_buffers         = cone_buffers;
 
     ctx.shadow_box_buffers    = shadow_box_buffers;
     ctx.light_dir_buffers     = light_dir_buffers;
@@ -329,8 +359,8 @@ int main(int argc, char** argv) {
     ctx.raster_shared          = raster_shared;
     ctx.launched_raster_threads = launched_raster_threads;
 
-    ctx.instance_depths           = &instance_depths;
-    ctx.instance_occlusion_flags  = &instance_occlusion_flags;
+    ctx.instance_depths  = &instance_depths;
+    ctx.occluders_eye    = &occluders_eye;
 
     ctx.physics      = &physics;
     ctx.thread_perf  = &thread_perf;

@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <vector>
 #include <chrono>
 #include <thread>
@@ -304,6 +305,15 @@ Uint64 PerfFrequency() {
 #else
     return 1000000ull;
 #endif
+}
+
+Uint64 ThreadCpuNs() {
+    // CLOCK_THREAD_CPUTIME_ID measures CPU time consumed by the calling
+    // thread (user+sys), excluding any time the kernel preempted it.
+    // macOS 10.12+, Linux, and emscripten (under -pthread) all support it.
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
+    return (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
 }
 
 void Delay(Uint32 ms) {

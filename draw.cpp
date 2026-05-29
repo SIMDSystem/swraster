@@ -7,6 +7,7 @@
 
 #include "pixel.h"
 #include "shadow.h"
+#include "render_buffers.h" // LuminaireConeBuffer for build_luminaire_cone_tl / draw_spotlight_cone_strip
 
 using namespace Eigen;
 
@@ -64,18 +65,34 @@ void draw_pixel(uint8_t* pixels, int pitch, int x, int y, uint32_t color, int w,
 void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
                      int x0, int y0, float z0, int x1, int y1, float z1,
                      uint32_t color, int w, int h) {
+    // Pre-clip the segment to the screen rect. z is linear in screen-space NDC.
+    {
+        float t_a, t_b;
+        if (!clip_line_to_rect((float)x0, (float)y0, (float)x1, (float)y1,
+                               0.0f, 0.0f, (float)(w - 1), (float)(h - 1),
+                               t_a, t_b)) return;
+        float dx_f = (float)(x1 - x0);
+        float dy_f = (float)(y1 - y0);
+        float dz_f = z1 - z0;
+        int   nx0  = (int)((float)x0 + t_a * dx_f + 0.5f);
+        int   ny0  = (int)((float)y0 + t_a * dy_f + 0.5f);
+        float nz0  = z0 + t_a * dz_f;
+        int   nx1  = (int)((float)x0 + t_b * dx_f + 0.5f);
+        int   ny1  = (int)((float)y0 + t_b * dy_f + 0.5f);
+        float nz1  = z0 + t_b * dz_f;
+        x0 = nx0; y0 = ny0; z0 = nz0;
+        x1 = nx1; y1 = ny1; z1 = nz1;
+    }
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy, e2;
     int steps = std::max(abs(x1 - x0), abs(y1 - y0));
     float z = z0, dz = (steps > 0) ? (z1 - z0) / steps : 0;
     while (true) {
-        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
-            int idx = y0 * w + x0;
-            if (z < depth_buffer[idx]) {
-                draw_pixel(pixels, pitch, x0, y0, color, w, h);
-                depth_buffer[idx] = z;
-            }
+        int idx = y0 * w + x0;
+        if (z < depth_buffer[idx]) {
+            draw_pixel(pixels, pitch, x0, y0, color, w, h);
+            depth_buffer[idx] = z;
         }
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
@@ -86,13 +103,47 @@ void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
 }
 
 void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
-                                  int x0, int y0, float z0, const Vector3f& p0_eye, float inv_w0,
-                                  int x1, int y1, float z1, const Vector3f& p1_eye, float inv_w1,
+                                  int x0, int y0, float z0, const Vector3f& p0_eye_in, float inv_w0,
+                                  int x1, int y1, float z1, const Vector3f& p1_eye_in, float inv_w1,
                                   int w, int h, SDL_PixelFormat* format,
                                   const ShadowDepth* shadow_depth, int shadow_size,
                                   const Vector3f& light_pos, const Vector3f& spot_dir,
                                   bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                   const Matrix4f& shadow_matrix) {
+    // Pre-clip to the screen rect with perspective-correct re-interpolation of
+    // inv_w-weighted eye-space position. Screen-space NDC z is linear in screen
+    // space, so it interpolates linearly. After this block the Bresenham loop
+    // runs on clipped endpoints with parametric t in [0,1] across the visible
+    // span; its internal inv_w / p_eye reconstruction remains perspective-correct.
+    Vector3f p0_eye = p0_eye_in;
+    Vector3f p1_eye = p1_eye_in;
+    {
+        float t_a, t_b;
+        if (!clip_line_to_rect((float)x0, (float)y0, (float)x1, (float)y1,
+                               0.0f, 0.0f, (float)(w - 1), (float)(h - 1),
+                               t_a, t_b)) return;
+        if (t_a > 0.0f || t_b < 1.0f) {
+            float dx_f = (float)(x1 - x0);
+            float dy_f = (float)(y1 - y0);
+            float dz_f = z1 - z0;
+            Vector3f p0w = p0_eye * inv_w0;
+            Vector3f p1w = p1_eye * inv_w1;
+            float inv_w_a = inv_w0 * (1.0f - t_a) + inv_w1 * t_a;
+            float inv_w_b = inv_w0 * (1.0f - t_b) + inv_w1 * t_b;
+            Vector3f p_eye_a = (p0w * (1.0f - t_a) + p1w * t_a) / inv_w_a;
+            Vector3f p_eye_b = (p0w * (1.0f - t_b) + p1w * t_b) / inv_w_b;
+            int   nx0 = (int)((float)x0 + t_a * dx_f + 0.5f);
+            int   ny0 = (int)((float)y0 + t_a * dy_f + 0.5f);
+            float nz0 = z0 + t_a * dz_f;
+            int   nx1 = (int)((float)x0 + t_b * dx_f + 0.5f);
+            int   ny1 = (int)((float)y0 + t_b * dy_f + 0.5f);
+            float nz1 = z0 + t_b * dz_f;
+            x0 = nx0; y0 = ny0; z0 = nz0;
+            x1 = nx1; y1 = ny1; z1 = nz1;
+            p0_eye = p_eye_a; p1_eye = p_eye_b;
+            inv_w0 = inv_w_a; inv_w1 = inv_w_b;
+        }
+    }
     int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
     int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
     int err = dx + dy, e2;
@@ -103,34 +154,32 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
     int step = 0;
 
     while (true) {
-        if (x0 >= 0 && x0 < w && y0 >= 0 && y0 < h) {
-            size_t idx = (size_t)y0 * w + x0;
-            if (z < depth_buffer[idx]) {
-                float t      = step * inv_steps;
-                float a      = 1.0f - t;
-                float inv_w  = inv_w0 * a + inv_w1 * t;
-                Vector3f p_eye = (p0_eye * inv_w0 * a + p1_eye * inv_w1 * t) / inv_w;
-                float visibility = sample_shadow_pcf(shadow_depth, shadow_size,
-                                                     shadow_matrix * Vector4f(p_eye.x(), p_eye.y(), p_eye.z(), 1.0f));
-                float direct = 0.8f;
-                if (use_spotlight) {
-                    Vector3f L = light_pos - p_eye;
-                    float l_len2 = L.squaredNorm();
-                    if (l_len2 > 0.000001f) {
-                        L *= 1.0f / sqrtf(l_len2);
-                        float cone_cos = (-L).dot(spot_dir);
-                        float cone = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) /
-                                                       (spot_inner_cos - spot_outer_cos)));
-                        direct *= cone * (3.5f / (1.0f + 0.004f * l_len2));
-                    } else {
-                        direct = 0.0f;
-                    }
+        size_t idx = (size_t)y0 * w + x0;
+        if (z < depth_buffer[idx]) {
+            float t      = step * inv_steps;
+            float a      = 1.0f - t;
+            float inv_w  = inv_w0 * a + inv_w1 * t;
+            Vector3f p_eye = (p0_eye * inv_w0 * a + p1_eye * inv_w1 * t) / inv_w;
+            float visibility = sample_shadow_pcf(shadow_depth, shadow_size,
+                                                 shadow_matrix * Vector4f(p_eye.x(), p_eye.y(), p_eye.z(), 1.0f));
+            float direct = 0.8f;
+            if (use_spotlight) {
+                Vector3f L = light_pos - p_eye;
+                float l_len2 = L.squaredNorm();
+                if (l_len2 > 0.000001f) {
+                    L *= 1.0f / sqrtf(l_len2);
+                    float cone_cos = (-L).dot(spot_dir);
+                    float cone = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) /
+                                                   (spot_inner_cos - spot_outer_cos)));
+                    direct *= cone * (3.5f / (1.0f + 0.004f * l_len2));
+                } else {
+                    direct = 0.0f;
                 }
-                float illum = fminf(1.0f, 0.35f + direct * visibility);
-                Pixel32* row_pixels = (Pixel32*)(pixels + y0 * pitch);
-                row_pixels[x0] = pack_rgb_fast(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
-                depth_buffer[idx] = z;
             }
+            float illum = fminf(1.0f, 0.35f + direct * visibility);
+            Pixel32* row_pixels = (Pixel32*)(pixels + y0 * pitch);
+            row_pixels[x0] = pack_rgb_fast(format, (uint8_t)(255.0f * illum), (uint8_t)(255.0f * illum), 0);
+            depth_buffer[idx] = z;
         }
         if (x0 == x1 && y0 == y1) break;
         e2 = 2 * err;
@@ -500,11 +549,15 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     }
 }
 
-void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
-                               int screen_width, int screen_height, SDL_PixelFormat* format,
-                               const Matrix4f& projection, const Vector3f& light_pos,
-                               const Vector3f& spot_dir, float spot_outer_cos,
-                               int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
+void build_luminaire_cone_tl(LuminaireConeBuffer& out,
+                             const Matrix4f& projection,
+                             const Vector3f& light_pos,
+                             const Vector3f& spot_dir,
+                             float spot_outer_cos,
+                             int screen_width, int screen_height) {
+    out.tris.resize(LUMINAIRE_CONE_SEGMENTS);
+    out.valid = false;
+
     Vector3f axis = spot_dir.normalized();
     float outer_angle = acosf(fmaxf(-1.0f, fminf(1.0f, spot_outer_cos)));
     constexpr float cone_len = 4.5f;
@@ -516,23 +569,38 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
     Vector3f v = axis.cross(u).normalized();
     float radius = tanf(outer_angle) * cone_len;
 
-    auto make_vertex = [&](const Vector3f& p, const Vector3f& n, VertexVaryings& out) {
-        if (!project_eye_point(projection, p, screen_width, screen_height, out.x, out.y, out.z, out.inv_w)) {
+    auto make_vertex = [&](const Vector3f& p, const Vector3f& n, VertexVaryings& vv) {
+        if (!project_eye_point(projection, p, screen_width, screen_height,
+                               vv.x, vv.y, vv.z, vv.inv_w)) {
             return false;
         }
-        out.r = out.g = out.b = out.a = 1.0f;
-        out.u = out.v = 0.0f;
-        out.nx = n.x(); out.ny = n.y(); out.nz = n.z();
-        out.ex = p.x(); out.ey = p.y(); out.ez = p.z();
-        out.ss = out.st = out.sr = 0.0f;
-        out.sq = 1.0f;
+        vv.r = vv.g = vv.b = vv.a = 1.0f;
+        vv.u = vv.v = 0.0f;
+        vv.nx = n.x(); vv.ny = n.y(); vv.nz = n.z();
+        vv.ex = p.x(); vv.ey = p.y(); vv.ez = p.z();
+        vv.ss = vv.st = vv.sr = 0.0f;
+        vv.sq = 1.0f;
         return true;
     };
 
-    constexpr int cone_segments = 64;
-    for (int i = 0; i < cone_segments; i++) {
-        float a0 = (2.0f * (float)M_PI * i) / cone_segments;
-        float a1 = (2.0f * (float)M_PI * (i + 1)) / cone_segments;
+    // Build all LUMINAIRE_CONE_SEGMENTS triangles. Any segment that fails
+    // to project (apex or rim behind the near plane) leaves its slot in
+    // an inert state — we flag the whole buffer valid only if at least
+    // one triangle survived, and the raster pass skips inert slots via
+    // the inv_w check inside draw_triangle_barycentric_strip.
+    int emitted = 0;
+    for (int i = 0; i < LUMINAIRE_CONE_SEGMENTS; i++) {
+        LuminaireConeTri& tri = out.tris[i];
+        // Inert default: degenerate (zero-area) so the rasterizer rejects.
+        tri.v0 = VertexVaryings{};
+        tri.v1 = VertexVaryings{};
+        tri.v2 = VertexVaryings{};
+        tri.v0.inv_w = 0.0f;
+        tri.v1.inv_w = 0.0f;
+        tri.v2.inv_w = 0.0f;
+
+        float a0 = (2.0f * (float)M_PI * i) / LUMINAIRE_CONE_SEGMENTS;
+        float a1 = (2.0f * (float)M_PI * (i + 1)) / LUMINAIRE_CONE_SEGMENTS;
         Vector3f radial0 = cosf(a0) * u + sinf(a0) * v;
         Vector3f radial1 = cosf(a1) * u + sinf(a1) * v;
         Vector3f n0      = (cone_len * radial0 - radius * axis).normalized();
@@ -543,10 +611,31 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
         if (!make_vertex(light_pos, apex_n, apex)) continue;
         if (!make_vertex(base_center + radius * radial0, n0, p0)) continue;
         if (!make_vertex(base_center + radius * radial1, n1, p1)) continue;
+        tri.v0 = apex;
+        tri.v1 = p0;
+        tri.v2 = p1;
+        emitted++;
+    }
+    out.valid = (emitted > 0);
+}
 
+void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                               int screen_width, int screen_height, SDL_PixelFormat* format,
+                               const LuminaireConeBuffer& cone,
+                               const Vector3f& light_pos,
+                               const Vector3f& spot_dir, float spot_outer_cos,
+                               int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
+    if (!cone.valid) return;
+    Vector3f axis = spot_dir.normalized();
+    const size_t n = cone.tris.size();
+    for (size_t i = 0; i < n; i++) {
+        const LuminaireConeTri& tri = cone.tris[i];
+        // Inert (failed-projection) slots have zero inv_w on all vertices —
+        // draw_triangle_barycentric_strip's degenerate-area check rejects
+        // them cheaply, so no extra guard needed here.
         draw_triangle_barycentric_strip(pixels, pitch, depth_buffer,
                                         screen_width, screen_height,
-                                        apex, p0, p1,
+                                        tri.v0, tri.v1, tri.v2,
                                         format, nullptr,
                                         Vector3f::Zero(), light_pos, axis,
                                         true, 1.0f, spot_outer_cos,

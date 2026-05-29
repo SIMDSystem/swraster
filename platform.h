@@ -66,6 +66,11 @@ bool PollEvent(Event& out);
 Uint64 TicksMs();
 Uint64 PerfCounter();
 Uint64 PerfFrequency();
+// Calling-thread CPU time in nanoseconds (user+sys). Used by the profiler
+// to subtract out time the kernel scheduled the thread off-core, so an
+// interval that looks "busy" in wall time but was actually preempted is
+// drawn shorter than its wall duration.
+Uint64 ThreadCpuNs();
 void   Delay(Uint32 ms);
 
 SDL_Surface* LoadBMP(const char* path);

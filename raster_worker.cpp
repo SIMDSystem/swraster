@@ -19,6 +19,13 @@
 // advances to a new row when its current row is exhausted. This keeps
 // each core's L1/L2 hot on the same set of scanlines across the four
 // raster passes. Workers count down raster_workers_done when they exit.
+//
+// Profiler instrumentation: one ProfilerInterval is recorded per tile
+// (bracketing just the tile's work, not the row-scan probing in
+// between). Adjacent tiles with no idle in between produce abutting
+// intervals that visually fuse into a single bar; any time spent
+// scanning rows for the next claimable tile (i.e. work-stealing
+// failures) shows up as a visible gap in the worker's lane.
 void raster_worker_main(int thread_id, RendererContext& ctx) {
     int last_frame_processed = 0;
 
@@ -41,37 +48,60 @@ void raster_worker_main(int thread_id, RendererContext& ctx) {
             last_frame_processed  = current_frame;
             if (thread_id >= active_raster_threads) continue;
         }
-        Uint64 work_start_ts = Platform::PerfCounter();
 
         auto& rs = ctx.raster_shared[buf_id];
 
-        // Row-sticky dynamic tile assignment. Each worker starts on a row
-        // chosen by its thread id (spread across all NUM_STRIPS rows) and
-        // drains that row's columns left-to-right via a per-row fetch_add.
-        // When its current row is exhausted it advances to the next row;
-        // termination is detected by scanning all rows without finding a
-        // claim. The sticky-row behaviour keeps each core's L1/L2 hot on
-        // the same set of framebuffer scanlines across consecutive tiles.
-        int current_row = thread_id % NUM_STRIPS;
+        // Luminaire uses a finer strip grid (2x rows, same cols) for
+        // better load balancing on the per-pixel cone work. It has no
+        // per-tile bin lookup so subdividing is free. All other passes
+        // (ShadowDepth, Color, etc.) use the coarse NUM_STRIPS grid
+        // that triangle bins were built against.
+        bool fine_strips = (job_mode == RasterJobMode::Luminaire);
+        int cols_total   = TILE_X_SPLITS;
+        int strips_total = fine_strips ? NUM_STRIPS * 2 : NUM_STRIPS;
+
+        // Row-sticky dynamic tile assignment. Each worker's INITIAL row
+        // is spread evenly across [0, strips_total) so two workers
+        // never start on adjacent strips — adjacent strips share L2/L3
+        // working sets on the shadow/color/depth buffers, and shadow
+        // depth in particular thrashes hard when neighbours compete.
+        // After starting, each worker drains its row's columns
+        // left-to-right via the per-row fetch_add, then advances one
+        // row at a time (wrapping) once its current row is exhausted.
+        // Termination is detected by scanning all rows without finding
+        // a claim.
+        int current_row = ((thread_id * strips_total) / active_raster_threads) % strips_total;
         int rows_scanned = 0;
         while (true) {
             int tile_col = raster_row_next_col[current_row].fetch_add(1, std::memory_order_acq_rel);
-            if (tile_col >= TILE_X_SPLITS) {
+            if (tile_col >= cols_total) {
                 // Row exhausted; advance and try the next one.
-                current_row = (current_row + 1) % NUM_STRIPS;
-                if (++rows_scanned >= NUM_STRIPS) break;
+                current_row = (current_row + 1) % strips_total;
+                if (++rows_scanned >= strips_total) break;
                 continue;
             }
             rows_scanned = 0;
             int strip_idx = current_row;
-            int tile_idx  = tile_col * NUM_STRIPS + strip_idx;
+            // tile_idx indexes the per-tile triangle bins (built by T&L
+            // against the coarse NUM_STRIPS grid). Only the Color and
+            // ShadowDepth passes read these; Luminaire (fine_strips)
+            // doesn't, so the index it would compute is unused.
+            int bin_strip = fine_strips ? (strip_idx >> 1) : strip_idx;
+            int tile_idx  = tile_col * NUM_STRIPS + bin_strip;
+
+            // Per-tile profiler bracket. Time spent above this point (the
+            // row-scan / fetch_add / claim probing) is intentionally not
+            // captured; that's the "downtime between tiles" we want to
+            // surface as a visible gap in the worker's overlay lane.
+            Uint64 tile_start_ts = Platform::PerfCounter();
+            Uint64 tile_start_cpu_ns = Platform::ThreadCpuNs();
 
             int h = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_height;
             int w = (job_mode == RasterJobMode::ShadowDepth) ? rs.shadow_size : rs.screen_width;
-            int x_min, x_max;
-            tile_column_range(w, tile_col, x_min, x_max);
-            int y_min = (strip_idx * h) / NUM_STRIPS;
-            int y_max = ((strip_idx + 1) * h) / NUM_STRIPS - 1;
+            int x_min = (tile_col * w) / cols_total;
+            int x_max = (((tile_col + 1) * w) / cols_total) - 1;
+            int y_min = (strip_idx * h) / strips_total;
+            int y_max = (((strip_idx + 1) * h) / strips_total) - 1;
             if (y_max >= h) y_max = h - 1;
 
             if (job_mode == RasterJobMode::ShadowDepth) {
@@ -177,19 +207,22 @@ void raster_worker_main(int thread_id, RendererContext& ctx) {
                                      x_min, x_max, y_min, y_max);
                 }
             } else {
-                if (rs.use_spotlight) {
+                if (rs.use_spotlight && rs.cone_buf_read && rs.cone_buf_read->valid) {
                     draw_spotlight_cone_strip(rs.pixels, rs.pitch, rs.depth_buffer,
                                               rs.screen_width, rs.screen_height,
-                                              rs.format, rs.projection,
+                                              rs.format, *rs.cone_buf_read,
                                               rs.light_pos, rs.spot_dir, rs.spot_outer_cos,
                                               x_min, x_max, y_min, y_max);
                 }
             }
 
+            Uint64 tile_end_cpu_ns = Platform::ThreadCpuNs();
+            Uint64 tile_cpu_ns = tile_end_cpu_ns > tile_start_cpu_ns
+                ? tile_end_cpu_ns - tile_start_cpu_ns : 0;
+            profiler_record_raster(*ctx.profiler, thread_id,
+                                   tile_start_ts, Platform::PerfCounter(),
+                                   tile_cpu_ns, (uint8_t)job_mode);
         }
-
-        profiler_record_raster(*ctx.profiler, thread_id, work_start_ts, Platform::PerfCounter(),
-                               (uint8_t)job_mode);
 
         if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= active_raster_threads) {
             // See matching comment in tl_worker_main: empty critical section

@@ -29,6 +29,7 @@ std::mutex              mtx_main;
 std::condition_variable cv_main;
 
 std::atomic<int> tl_done_counter{0};
+std::atomic<int> tl_phase1_done_counter{0};
 std::atomic<int> raster_workers_done{0};
 std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS] = {};
 
@@ -44,7 +45,7 @@ void init_thread_counts() {
     // Tuned for the current scene: T&L is light, raster/fill dominates.
     NUM_TL_THREADS     = DEFAULT_TL_THREADS;
     NUM_RASTER_THREADS = DEFAULT_RASTER_THREADS;
-    NUM_STRIPS         = 8;
+    NUM_STRIPS         = 16;
     NUM_TILE_BINS      = NUM_STRIPS * TILE_X_SPLITS;
     printf("Threads: %d T&L, %d raster, %d strips, %d tiles (hw_concurrency=%d)\n",
            NUM_TL_THREADS, NUM_RASTER_THREADS, NUM_STRIPS, NUM_TILE_BINS, hw);

@@ -49,6 +49,14 @@ extern std::mutex             mtx_main;
 extern std::condition_variable cv_main;
 
 extern std::atomic<int> tl_done_counter;
+// Phase-1 barrier inside T&L workers. Each worker bumps this after writing its
+// thread-local outputs; once all active workers have hit the barrier they
+// safely fan back out to do their assigned slice of the per-tile bin merge
+// directly into the published double-buffer slot. Hoisting the merge into
+// the worker tail keeps the post-Present gap (between blit-end and the next
+// T&L kick) free of merge work, and the bin-clear that used to live there
+// is folded into each worker's phase-2 sweep.
+extern std::atomic<int> tl_phase1_done_counter;
 extern std::atomic<int> raster_workers_done;  // workers fully out of the current raster job
 
 // Per-row dynamic claim counters. Each row's counter walks 0..TILE_X_SPLITS;
@@ -58,7 +66,10 @@ extern std::atomic<int> raster_workers_done;  // workers fully out of the curren
 // per-frame shadow / color / SSAO / luminaire passes. Sized to a fixed upper
 // bound so we don't pay a heap allocation. The renderer resets these to zero
 // inside mtx_raster before each raster job is published.
-constexpr int MAX_RASTER_STRIPS = 32;
+// Caps the per-row claim-counter array. Must be >= 2 * NUM_STRIPS because
+// the Luminaire pass doubles the strip count for finer-grain work
+// stealing on the spotlight cone post-pass.
+constexpr int MAX_RASTER_STRIPS = 96;
 extern std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS];
 
 // Wait for a predicate that worker threads will eventually set true. On native
@@ -84,7 +95,7 @@ static inline void wait_for_main_thread_predicate(Predicate&& predicate) {
 // Thread-count configuration
 // ---------------------------------------------------------------------------
 #ifndef DEFAULT_TL_THREADS
-#define DEFAULT_TL_THREADS 2
+#define DEFAULT_TL_THREADS 3
 #endif
 #ifndef DEFAULT_RASTER_THREADS
 #define DEFAULT_RASTER_THREADS 17
