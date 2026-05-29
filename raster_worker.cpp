@@ -1,6 +1,7 @@
 #include "raster_worker.h"
 
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <vector>
 
@@ -12,87 +13,67 @@
 #include "draw.h"
 #include "thread_profiler.h"
 
-// Each persistent raster thread sleeps on cv_raster until main publishes
-// a new job (shadow depth / color / SSAO / luminaire). Workers are
-// row-sticky: each starts on a row chosen by its thread id, drains the
-// row column-by-column via a per-row atomic claim counter, and only
-// advances to a new row when its current row is exhausted. This keeps
-// each core's L1/L2 hot on the same set of scanlines across the four
-// raster passes. Workers count down raster_workers_done when they exit.
+// Raster half of the unified pool. Called once per frame by every pool worker
+// (T&L-preferred workers reach it after finishing their T&L; the rest enter
+// immediately). All workers cooperatively drain the previous frame's four
+// raster passes in dependency order via the shared pass state machine in
+// threading.h:
 //
-// Profiler instrumentation: one ProfilerInterval is recorded per tile
-// (bracketing just the tile's work, not the row-scan probing in
-// between). Adjacent tiles with no idle in between produce abutting
-// intervals that visually fuse into a single bar; any time spent
-// scanning rows for the next claimable tile (i.e. work-stealing
-// failures) shows up as a visible gap in the worker's lane.
-void raster_worker_main(int thread_id, RendererContext& ctx) {
-    int last_frame_processed = 0;
+//   ShadowDepth -> Color -> SSAO -> Luminaire
+//
+// shadow depth must complete before color samples the shadow map; SSAO sits
+// between color and the spotlight luminaire post-pass. Each pass owns its own
+// per-row claim counters (raster_row_next_col[pass][row]) so advancing a pass
+// never resets a counter another worker is mid-claim on. Workers are
+// row-sticky for cache locality: a worker drains its current row's columns,
+// then advances one row (wrapping) once the row is exhausted. The worker that
+// completes the last tile of a pass advances raster_pass and wakes anyone
+// blocked waiting for the next pass. A worker that can't claim a tile and the
+// pass hasn't advanced blocks on cv_pool (a genuine inter-pass dependency,
+// not a busy-wait).
+//
+// Profiler: one ProfilerInterval per tile, bracketing just the tile's work.
+// Time spent scanning rows for the next claimable tile shows up as a visible
+// gap in the worker's lane.
+void raster_worker_frame(int worker_id, RendererContext& ctx) {
+    if (!pool_do_raster) return;
 
-    while (raster_threads_running.load()) {
-        int current_frame;
-        int buf_id;
-        int active_raster_threads;
-        RasterJobMode job_mode;
-        {
-            std::unique_lock<std::mutex> lock(mtx_raster);
-            cv_raster.wait(lock, [&] {
-                return !raster_threads_running.load(std::memory_order_relaxed) ||
-                       frame_raster_target.load(std::memory_order_acquire) > last_frame_processed;
-            });
-            if (!raster_threads_running.load(std::memory_order_relaxed)) break;
-            current_frame         = frame_raster_target.load(std::memory_order_acquire);
-            buf_id                = active_raster_buf_id;
-            active_raster_threads = active_raster_job_thread_count;
-            job_mode              = active_raster_job;
-            last_frame_processed  = current_frame;
-            if (thread_id >= active_raster_threads) continue;
-        }
+    int pool   = active_raster_job_thread_count;
+    int buf_id = active_raster_buf_id;
+    auto& rs = ctx.raster_shared[buf_id];
 
-        auto& rs = ctx.raster_shared[buf_id];
+    while (pool_threads_running.load(std::memory_order_relaxed)) {
+        int P = raster_pass.load(std::memory_order_acquire);
+        if (P >= RASTER_PASS_COUNT) break;
+        RasterJobMode job_mode = (RasterJobMode)P;
 
-        // Luminaire uses a finer strip grid (2x rows, same cols) for
-        // better load balancing on the per-pixel cone work. It has no
-        // per-tile bin lookup so subdividing is free. All other passes
-        // (ShadowDepth, Color, etc.) use the coarse NUM_STRIPS grid
-        // that triangle bins were built against.
+        // Luminaire uses a finer strip grid (2x rows, same cols) for better
+        // load balancing on the per-pixel cone work; it has no per-tile bin
+        // lookup so subdividing is free. All other passes use the coarse
+        // NUM_STRIPS grid the triangle bins were built against.
         bool fine_strips = (job_mode == RasterJobMode::Luminaire);
         int cols_total   = TILE_X_SPLITS;
         int strips_total = fine_strips ? NUM_STRIPS * 2 : NUM_STRIPS;
+        int total_tiles  = strips_total * cols_total;
 
-        // Row-sticky dynamic tile assignment. Each worker's INITIAL row
-        // is spread evenly across [0, strips_total) so two workers
-        // never start on adjacent strips — adjacent strips share L2/L3
-        // working sets on the shadow/color/depth buffers, and shadow
-        // depth in particular thrashes hard when neighbours compete.
-        // After starting, each worker drains its row's columns
-        // left-to-right via the per-row fetch_add, then advances one
-        // row at a time (wrapping) once its current row is exhausted.
-        // Termination is detected by scanning all rows without finding
-        // a claim.
-        int current_row = ((thread_id * strips_total) / active_raster_threads) % strips_total;
+        // Initial row spread so two workers never start on adjacent strips
+        // (adjacent strips share L2/L3 working sets on the shadow/color/depth
+        // buffers; shadow depth in particular thrashes when neighbours
+        // compete). Then drain left-to-right, advancing one row at a time.
+        int current_row  = ((worker_id * strips_total) / pool) % strips_total;
         int rows_scanned = 0;
         while (true) {
-            int tile_col = raster_row_next_col[current_row].fetch_add(1, std::memory_order_acq_rel);
+            int tile_col = raster_row_next_col[P][current_row].fetch_add(1, std::memory_order_acq_rel);
             if (tile_col >= cols_total) {
-                // Row exhausted; advance and try the next one.
                 current_row = (current_row + 1) % strips_total;
                 if (++rows_scanned >= strips_total) break;
                 continue;
             }
             rows_scanned = 0;
             int strip_idx = current_row;
-            // tile_idx indexes the per-tile triangle bins (built by T&L
-            // against the coarse NUM_STRIPS grid). Only the Color and
-            // ShadowDepth passes read these; Luminaire (fine_strips)
-            // doesn't, so the index it would compute is unused.
             int bin_strip = fine_strips ? (strip_idx >> 1) : strip_idx;
             int tile_idx  = tile_col * NUM_STRIPS + bin_strip;
 
-            // Per-tile profiler bracket. Time spent above this point (the
-            // row-scan / fetch_add / claim probing) is intentionally not
-            // captured; that's the "downtime between tiles" we want to
-            // surface as a visible gap in the worker's overlay lane.
             Uint64 tile_start_ts = Platform::PerfCounter();
             Uint64 tile_start_cpu_ns = Platform::ThreadCpuNs();
 
@@ -219,17 +200,34 @@ void raster_worker_main(int thread_id, RendererContext& ctx) {
             Uint64 tile_end_cpu_ns = Platform::ThreadCpuNs();
             Uint64 tile_cpu_ns = tile_end_cpu_ns > tile_start_cpu_ns
                 ? tile_end_cpu_ns - tile_start_cpu_ns : 0;
-            profiler_record_raster(*ctx.profiler, thread_id,
+            profiler_record_raster(*ctx.profiler, worker_id,
                                    tile_start_ts, Platform::PerfCounter(),
                                    tile_cpu_ns, (uint8_t)job_mode);
+
+            // Completing the pass's last tile opens the next pass.
+            int done = raster_pass_tiles_done[P].fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (done >= total_tiles) {
+                int next = P + 1;
+                { std::lock_guard<std::mutex> lk(mtx_pool); raster_pass.store(next, std::memory_order_release); }
+                cv_pool.notify_all();
+                if (next >= RASTER_PASS_COUNT) {
+                    // Raster fully drained: wake main, which blocks on cv_main
+                    // waiting to start its post passes. The empty mtx_main
+                    // critical section closes the predicate-check / wait() race.
+                    { std::lock_guard<std::mutex> lock(mtx_main); }
+                    cv_main.notify_one();
+                }
+            }
         }
 
-        if (raster_workers_done.fetch_add(1, std::memory_order_release) + 1 >= active_raster_threads) {
-            // See matching comment in tl_worker_main: empty critical section
-            // on mtx_main closes the predicate-check / wait() race window so
-            // notify_one() can't be dropped.
-            { std::lock_guard<std::mutex> lock(mtx_main); }
-            cv_main.notify_one();
-        }
+        // No more tiles to claim in pass P. Either it already advanced (loop
+        // re-reads raster_pass and moves on) or stragglers are still finishing
+        // its tiles — block until the completer advances the pass. This is a
+        // real dependency wait, not a spin.
+        std::unique_lock<std::mutex> lk(mtx_pool);
+        cv_pool.wait(lk, [&] {
+            return raster_pass.load(std::memory_order_acquire) > P ||
+                   !pool_threads_running.load(std::memory_order_relaxed);
+        });
     }
 }

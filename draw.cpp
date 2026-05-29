@@ -648,11 +648,10 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
 void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
                       int screen_width, int screen_height, SDL_PixelFormat* format,
                       int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
-    static constexpr int sample_offsets[16][2] = {
+    constexpr int kernel_size = 8;
+    static constexpr int sample_offsets[kernel_size][2] = {
         { 2,  0}, {-2,  0}, { 0,  2}, { 0, -2},
-        { 4,  3}, {-4,  3}, { 4, -3}, {-4, -3},
-        { 7,  1}, {-7,  1}, { 1,  7}, { 1, -7},
-        { 8,  6}, {-8,  6}, { 8, -6}, {-8, -6}
+        { 6,  5}, {-6,  5}, { 6, -5}, {-6, -5}
     };
     constexpr float near_plane = 0.1f;
     constexpr float far_plane  = CAMERA_FAR_PLANE;
@@ -663,10 +662,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
     constexpr float sample_radius2    = sample_radius * sample_radius;
     constexpr float max_occlusion     = 0.9f;
     constexpr float inv_sample_radius = 1.0f / sample_radius;
-    constexpr float inv_sample_count  = 1.0f / 16.0f;
+    constexpr float inv_sample_count  = 1.0f / (float)kernel_size;
     constexpr float inv_angle_range   = 1.0f / (1.0f - angle_bias);
-    int sample_linear_offsets[16];
-    for (int i = 0; i < 16; i++) {
+    int sample_linear_offsets[kernel_size];
+    for (int i = 0; i < kernel_size; i++) {
         sample_linear_offsets[i] = sample_offsets[i][1] * screen_width + sample_offsets[i][0];
     }
     float f      = 1.0f / tanf(60.0f * (float)M_PI / 360.0f);
@@ -729,7 +728,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
             }
 
             float occlusion = 0.0f;
-            for (int i = 0; i < 16; i++) {
+            for (int i = 0; i < kernel_size; i++) {
                 int sx = x + sample_offsets[i][0];
                 int sy = y + sample_offsets[i][1];
                 if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;

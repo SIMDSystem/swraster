@@ -226,7 +226,12 @@ bool PollEvent(Event& out) {
                 int sym = e.key.keysym.sym;
                 // Forward space and printable ASCII letters as their lowercase
                 // character. The renderer's input handler is case-insensitive.
-                if (sym == SDLK_SPACE || (sym >= SDLK_a && sym <= SDLK_z)) {
+                // Also forward the worker-pool control keys (- = [ ]) as their
+                // base ASCII; the handler also accepts the shifted variants
+                // (_ + { }) so either works.
+                if (sym == SDLK_SPACE || (sym >= SDLK_a && sym <= SDLK_z) ||
+                    sym == SDLK_MINUS || sym == SDLK_EQUALS ||
+                    sym == SDLK_LEFTBRACKET || sym == SDLK_RIGHTBRACKET) {
                     out.type = Event::KeyDown;
                     out.key  = sym;
                     return true;

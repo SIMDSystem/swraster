@@ -58,8 +58,7 @@
 #include "scene.h"
 #include "fps.h"
 #include "thread_profiler.h"
-#include "tl_worker.h"
-#include "raster_worker.h"
+#include "pool_worker.h"
 #include "render_loop.h"
 
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
@@ -370,15 +369,14 @@ int main(int argc, char** argv) {
     thread_profiler_init(profiler, launched_tl_threads, launched_raster_threads);
 
     // ----- 9. Spawn workers -----
-    std::vector<std::thread> tl_workers;
-    tl_workers.reserve(launched_tl_threads);
-    for (int i = 0; i < launched_tl_threads; i++) {
-        tl_workers.emplace_back(tl_worker_main, i, std::ref(ctx));
-    }
-    std::vector<std::thread> raster_workers;
-    raster_workers.reserve(launched_raster_threads);
-    for (int i = 0; i < launched_raster_threads; i++) {
-        raster_workers.emplace_back(raster_worker_main, i, std::ref(ctx));
+    // One unified pool. Its size is the (larger) raster thread count; the
+    // first NUM_TL_THREADS of them double as the T&L-preferred subset each
+    // frame. Sizing to hardware concurrency avoids oversubscription.
+    int pool_size = launched_raster_threads;
+    std::vector<std::thread> pool_workers;
+    pool_workers.reserve(pool_size);
+    for (int i = 0; i < pool_size; i++) {
+        pool_workers.emplace_back(pool_worker_main, i, std::ref(ctx));
     }
     std::thread physics_worker(physics_worker_thread, std::ref(physics));
 
@@ -386,12 +384,9 @@ int main(int argc, char** argv) {
     run_render_loop(ctx);
 
     // ----- 11. Shutdown -----
-    tl_threads_running    .store(false);
-    raster_threads_running.store(false);
-    { std::lock_guard<std::mutex> lock(mtx_tl);     cv_tl    .notify_all(); }
-    { std::lock_guard<std::mutex> lock(mtx_raster); cv_raster.notify_all(); }
-    for (auto& t : tl_workers)     if (t.joinable()) t.join();
-    for (auto& t : raster_workers) if (t.joinable()) t.join();
+    pool_threads_running.store(false);
+    { std::lock_guard<std::mutex> lock(mtx_pool); cv_pool.notify_all(); }
+    for (auto& t : pool_workers) if (t.joinable()) t.join();
 
     physics_request_shutdown(physics);
     if (physics_worker.joinable()) physics_worker.join();

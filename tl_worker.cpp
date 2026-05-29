@@ -22,9 +22,17 @@
 
 using namespace Eigen;
 
-void tl_worker_main(int thread_id, RendererContext& ctx) {
-    // Per-thread scratch output. Lives for the worker's lifetime.
-    auto& output = (*ctx.tl_thread_outputs)[thread_id];
+// T&L half of the unified pool. Called once per frame by each T&L-preferred
+// pool worker (worker_id in [0, active_tl_threads)). Transforms / lights /
+// clips / projects / tile-bins this frame's geometry into its private
+// TLThreadOutput, then participates in the phase-1 barrier and the phase-2
+// cross-worker bin merge into the published double-buffer slot. Signals
+// tl_done_counter on the way out so main can merge the flat globals once all
+// T&L-preferred workers are done. The caller (pool_worker_main) then falls
+// through to help raster.
+void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx, int current_frame) {
+    // Per-pool-worker scratch output (only ids [0, active_tl_threads) reach here).
+    auto& output = (*ctx.tl_thread_outputs)[worker_id];
     auto& local_opaque = output.opaque;
     auto& local_trans  = output.trans;
     auto& local_shadow = output.shadow;
@@ -34,28 +42,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
 
     TLSharedData& tl_shared = *ctx.tl_shared;
 
-    int last_frame_processed = 0;
-
-    while (tl_threads_running.load()) {
-        // Wait for main to bump the frame target.
-        int current_frame;
-        int active_tl_threads;
-        {
-            std::unique_lock<std::mutex> lock(mtx_tl);
-            cv_tl.wait(lock, [&] {
-                return !tl_threads_running.load(std::memory_order_relaxed) ||
-                       frame_tl_target.load(std::memory_order_acquire) > last_frame_processed;
-            });
-            if (!tl_threads_running.load(std::memory_order_relaxed)) break;
-            current_frame        = frame_tl_target.load(std::memory_order_acquire);
-            active_tl_threads    = active_tl_job_thread_count;
-            last_frame_processed = current_frame;
-            if (thread_id >= active_tl_threads) {
-                // This thread is over the active count for the current variant —
-                // skip work this frame but still observe future wakeups.
-                continue;
-            }
-        }
+    {
         Uint64 work_start_ts = Platform::PerfCounter();
         Uint64 work_start_cpu_ns = Platform::ThreadCpuNs();
 
@@ -72,7 +59,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
         // Slice the instance list across active workers in thread-id order.
         int num_instances        = (int)tl_shared.sorted_instances->size();
         int instances_per_thread = (num_instances + active_tl_threads - 1) / active_tl_threads;
-        int start_idx            = thread_id * instances_per_thread;
+        int start_idx            = worker_id * instances_per_thread;
         int end_idx              = std::min(start_idx + instances_per_thread, num_instances);
 
         // Helper closures (capture only tl_shared by ref; no heap, no virtual).
@@ -473,7 +460,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
         Uint64 sort_start_cpu_ns = Platform::ThreadCpuNs();
         Uint64 per_instance_cpu_ns = sort_start_cpu_ns > work_start_cpu_ns
             ? sort_start_cpu_ns - work_start_cpu_ns : 0;
-        profiler_record_tl(*ctx.profiler, thread_id, work_start_ts, sort_start_ts, per_instance_cpu_ns,
+        profiler_record_tl(*ctx.profiler, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns,
                            (uint8_t)TLJobTag::PerInstance);
 
         if (ENABLE_RGB_TRIANGLE_SORT) {
@@ -504,14 +491,14 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
         Uint64 phase1_end_cpu_ns = Platform::ThreadCpuNs();
         Uint64 local_sort_cpu_ns = phase1_end_cpu_ns > sort_start_cpu_ns
             ? phase1_end_cpu_ns - sort_start_cpu_ns : 0;
-        profiler_record_tl(*ctx.profiler, thread_id, sort_start_ts, phase1_end_ts, local_sort_cpu_ns,
+        profiler_record_tl(*ctx.profiler, worker_id, sort_start_ts, phase1_end_ts, local_sort_cpu_ns,
                            (uint8_t)TLJobTag::LocalSort);
 
         // Spotlight luminaire cone T&L. Runs on thread 0 only, before the
         // phase-1 barrier so it overlaps the other workers' tail-end
         // per-instance work. Recorded as a separate Spotlight-tagged
         // interval so it shows up in darker blue on the overlay.
-        if (thread_id == 0) {
+        if (worker_id == 0) {
             LuminaireConeBuffer* cone_buf = tl_shared.cone_buf_write;
             if (cone_buf) {
                 if (tl_shared.use_spotlight) {
@@ -528,7 +515,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
                     Uint64 cone_end_cpu_ns = Platform::ThreadCpuNs();
                     Uint64 cone_cpu_ns = cone_end_cpu_ns > cone_start_cpu_ns
                         ? cone_end_cpu_ns - cone_start_cpu_ns : 0;
-                    profiler_record_tl(*ctx.profiler, thread_id,
+                    profiler_record_tl(*ctx.profiler, worker_id,
                                        cone_start_ts, cone_end_ts, cone_cpu_ns,
                                        (uint8_t)TLJobTag::Spotlight);
                 } else {
@@ -593,7 +580,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
                 std::inplace_merge(dst.begin(), dst.begin() + old_size, dst.end(), less_than);
             }
         };
-        for (int s = thread_id; s < NUM_TILE_BINS; s += active_tl_threads) {
+        for (int s = worker_id; s < NUM_TILE_BINS; s += active_tl_threads) {
             auto& dst_opaque = opaque_strip.bins[s];
             auto& dst_trans  = trans_strip .bins[s];
             auto& dst_shadow = shadow_strip.bins[s];
@@ -612,7 +599,7 @@ void tl_worker_main(int thread_id, RendererContext& ctx) {
         Uint64 phase2_end_cpu_ns = Platform::ThreadCpuNs();
         Uint64 phase2_cpu_ns = phase2_end_cpu_ns > phase2_start_cpu_ns
             ? phase2_end_cpu_ns - phase2_start_cpu_ns : 0;
-        profiler_record_tl(*ctx.profiler, thread_id, phase2_start_ts, Platform::PerfCounter(), phase2_cpu_ns,
+        profiler_record_tl(*ctx.profiler, worker_id, phase2_start_ts, Platform::PerfCounter(), phase2_cpu_ns,
                            (uint8_t)TLJobTag::BinMerge);
 
         // Signal completion. Physics for frame N was already triggered by

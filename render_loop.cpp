@@ -90,9 +90,13 @@ static void reset_animation(RendererContext& ctx,
     }
     tl_done_counter.store(0, std::memory_order_relaxed);
     tl_phase1_done_counter.store(0, std::memory_order_relaxed);
-    raster_workers_done.store(0, std::memory_order_relaxed);
-    for (int r = 0; r < NUM_STRIPS * 2; r++) {  // Luminaire uses 2*NUM_STRIPS rows
-        raster_row_next_col[r].store(0, std::memory_order_relaxed);
+    pool_workers_done.store(0, std::memory_order_relaxed);
+    raster_pass.store(RASTER_PASS_COUNT, std::memory_order_relaxed);
+    for (int p = 0; p < RASTER_PASS_COUNT; p++) {
+        raster_pass_tiles_done[p].store(0, std::memory_order_relaxed);
+        for (int r = 0; r < NUM_STRIPS * 2; r++) {  // Luminaire uses 2*NUM_STRIPS rows
+            raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -143,7 +147,12 @@ static void merge_tl_globals(RendererContext& ctx, int tl_buf_idx) {
     auto front_to_back = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; };
     auto back_to_front = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; };
 
-    for (int tid = 0; tid < NUM_TL_THREADS; tid++) {
+    // Only the first k_eff workers ran T&L this frame (see render loop); the
+    // rest never wrote their output slots, so clamp to avoid folding stale data.
+    // active_tl_job_thread_count is exactly this frame's k_eff (published under
+    // mtx_pool before the kick), so it tracks the live g_active_workers count.
+    int k_eff = active_tl_job_thread_count;
+    for (int tid = 0; tid < k_eff; tid++) {
         const auto& out = (*ctx.tl_thread_outputs)[tid];
         if (ENABLE_RGB_TRIANGLE_SORT) {
             append_sorted_limited(ctx.opaque_buffers[tl_buf_idx].triangles, count_opaque, out.opaque, dropped_opaque, front_to_back);
@@ -201,35 +210,6 @@ static void periodic_capacity_shrink(RendererContext& ctx) {
             shrink_if_bloated(out.shadow_bins[s]);
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Dispatch one raster job to the worker pool and wait for it to drain.
-// ---------------------------------------------------------------------------
-static void run_raster_job(RendererContext& /*ctx*/,
-                           RasterJobMode job_mode, int buf_idx) {
-    int expected_raster_workers = NUM_RASTER_THREADS;
-    // Luminaire subdivides the tile grid 2x in both dims, so its workers
-    // consume strip indices [0..2*NUM_STRIPS); reset all the counters
-    // those workers will touch. For other passes the extra resets are
-    // a handful of harmless atomic stores into never-read slots.
-    int strips_to_reset = NUM_STRIPS * 2;
-    {
-        std::lock_guard<std::mutex> lock(mtx_raster);
-        for (int r = 0; r < strips_to_reset; r++) {
-            raster_row_next_col[r].store(0, std::memory_order_relaxed);
-        }
-        raster_workers_done.store(0, std::memory_order_relaxed);
-        active_raster_buf_id           = buf_idx;
-        active_raster_job              = job_mode;
-        active_raster_job_thread_count = expected_raster_workers;
-        frame_raster_target.store(frame_raster_target.load(std::memory_order_relaxed) + 1,
-                                  std::memory_order_release);
-    }
-    cv_raster.notify_all();
-    wait_for_main_thread_predicate([expected_raster_workers] {
-        return raster_workers_done.load(std::memory_order_acquire) >= expected_raster_workers;
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +411,41 @@ void run_render_loop(RendererContext& ctx) {
                             trace_ring_count = 0;
                             trace_ring_head  = 0;
                             trace_ring_sum   = 0.0;
+                        }
+                    }
+                    // Live worker-pool resize. '=' (or '+') adds a worker, '-'
+                    // (or '_') removes one, clamped to [1, launched capacity].
+                    // The render loop reads g_active_workers once per frame so
+                    // the change lands cleanly at the next frame boundary.
+                    if (event.key == '+' || event.key == '=' ||
+                        event.key == '-' || event.key == '_') {
+                        int delta = (event.key == '+' || event.key == '=') ? 1 : -1;
+                        int cur = g_active_workers.load(std::memory_order_relaxed);
+                        int next = cur + delta;
+                        if (next < 1) next = 1;
+                        if (next > NUM_RASTER_THREADS) next = NUM_RASTER_THREADS;
+                        if (next != cur) {
+                            g_active_workers.store(next, std::memory_order_relaxed);
+                            printf("Active workers: %d / %d  (T&L-preferred %d)\n",
+                                   next, NUM_RASTER_THREADS,
+                                   g_tl_workers.load(std::memory_order_relaxed));
+                        }
+                    }
+                    // Live T&L-preferred count. ']' (or '}') raises it, '[' (or
+                    // '{') lowers it, clamped to [1, launched capacity]. The
+                    // effective K is min(this, active workers).
+                    if (event.key == '[' || event.key == '{' ||
+                        event.key == ']' || event.key == '}') {
+                        int delta = (event.key == ']' || event.key == '}') ? 1 : -1;
+                        int cur = g_tl_workers.load(std::memory_order_relaxed);
+                        int next = cur + delta;
+                        if (next < 1) next = 1;
+                        if (next > NUM_RASTER_THREADS) next = NUM_RASTER_THREADS;
+                        if (next != cur) {
+                            g_tl_workers.store(next, std::memory_order_relaxed);
+                            printf("T&L-preferred: %d / %d  (active workers %d)\n",
+                                   next, NUM_RASTER_THREADS,
+                                   g_active_workers.load(std::memory_order_relaxed));
                         }
                     }
                     break;
@@ -747,27 +762,65 @@ void run_render_loop(RendererContext& ctx) {
         // Clear last frame's per-worker profiler logs (safe: workers asleep).
         thread_profiler_begin_frame(*ctx.profiler);
 
-        // Kick T&L for frame N.
-        {
-            std::lock_guard<std::mutex> lock(mtx_tl);
-            active_tl_job_thread_count = NUM_TL_THREADS;
-            frame_tl_target.store(frame_sequence, std::memory_order_release);
+        // ---- Publish the frame's work plan to the unified pool ----
+        // T&L for frame N (this frame's geometry) and raster for frame N-1
+        // (the previous frame's published bins) are data-independent, so the
+        // pool can interleave them freely. The first k_eff workers are
+        // "T&L preferred": they run this frame's T&L (per-instance + bin
+        // merge) first, then fall through to help drain the previous frame's
+        // raster passes. The remaining workers go straight to raster. With
+        // the pool sized to hardware there is no oversubscription, so a
+        // worker that finishes T&L hands its core to raster instead of idling.
+        // Active worker count: the --threadperf sweep drives NUM_RASTER_THREADS
+        // per variant; otherwise it's the live, +/- adjustable g_active_workers
+        // (clamped to the launched capacity). Read once here so the whole frame
+        // sees one consistent value.
+        int pool_active;
+        int tl_pref;
+        if (tp.enabled) {
+            pool_active = NUM_RASTER_THREADS;
+            tl_pref     = NUM_TL_THREADS;
+        } else {
+            pool_active = g_active_workers.load(std::memory_order_relaxed);
+            if (pool_active < 1) pool_active = 1;
+            if (pool_active > NUM_RASTER_THREADS) pool_active = NUM_RASTER_THREADS;
+            tl_pref = g_tl_workers.load(std::memory_order_relaxed);
+            if (tl_pref < 1) tl_pref = 1;
+            if (tl_pref > NUM_RASTER_THREADS) tl_pref = NUM_RASTER_THREADS;
         }
-        cv_tl.notify_all();
+        // Effective T&L-preferred count: can't exceed the active pool.
+        int k_eff = tl_pref < pool_active ? tl_pref : pool_active;
+        {
+            std::lock_guard<std::mutex> lock(mtx_pool);
+            active_tl_job_thread_count     = k_eff;
+            active_raster_job_thread_count = pool_active;
+            active_raster_buf_id           = raster_buf_idx;
+            pool_do_raster                 = do_raster;
+            pool_workers_done.store(0, std::memory_order_relaxed);
+            tl_done_counter.store(0, std::memory_order_relaxed);
+            tl_phase1_done_counter.store(0, std::memory_order_relaxed);
+            for (int p = 0; p < RASTER_PASS_COUNT; p++) {
+                raster_pass_tiles_done[p].store(0, std::memory_order_relaxed);
+                for (int r = 0; r < NUM_STRIPS * 2; r++) { // Luminaire uses 2*NUM_STRIPS rows
+                    raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
+                }
+            }
+            raster_pass.store(do_raster ? 0 : RASTER_PASS_COUNT, std::memory_order_relaxed);
+            frame_pool_target.store(frame_sequence, std::memory_order_release);
+        }
+        cv_pool.notify_all();
 
-        // Wake the physics worker NOW so it runs concurrently with T&L.
+        // Wake the physics worker NOW so it runs concurrently with the pool.
         // It writes pose_snapshots[1 - pose_read_idx] while T&L reads
         // pose_snapshots[pose_read_idx], so there is no slot conflict.
         physics_trigger_after_tl(pp);
 
-        // Raster the previous frame: shadow → color → SSAO → luminaire cones.
+        // Wait for the previous frame's raster (all four passes) to drain
+        // before main touches the framebuffer / depth for the post passes.
         Uint64 raster_phase_start = Platform::PerfCounter();
-        if (do_raster) {
-            run_raster_job(ctx, RasterJobMode::ShadowDepth, raster_buf_idx);
-            run_raster_job(ctx, RasterJobMode::Color,       raster_buf_idx);
-            run_raster_job(ctx, RasterJobMode::Ssao,        raster_buf_idx);
-            run_raster_job(ctx, RasterJobMode::Luminaire,   raster_buf_idx);
-        }
+        wait_for_main_thread_predicate([] {
+            return raster_pass.load(std::memory_order_acquire) >= RASTER_PASS_COUNT;
+        });
         if (do_raster && ctx.raster_shared[raster_buf_idx].use_spotlight) {
             draw_spotlight_luminaire(pixels, pitch, ctx.depth_buffer->data(),
                                      ctx.screen_width, ctx.screen_height, fb->format,
@@ -900,13 +953,16 @@ void run_render_loop(RendererContext& ctx) {
         }
 #endif
 
-        // Wait for T&L's current frame to finish before we merge into the
-        // freshly-written tl_buf_idx slot.
+        // Wait for the whole pool to finish the frame (T&L bin merge + all
+        // raster passes) before we touch the shared buffers it wrote and set
+        // up the next frame's plan. raster already drained above; this also
+        // covers any T&L-preferred worker still finishing its merge after the
+        // present overlapped it.
         {
-            int expected_tl_workers = NUM_TL_THREADS;
+            int expected_workers = pool_active;
             Uint64 tl_wait_start = Platform::PerfCounter();
-            wait_for_main_thread_predicate([expected_tl_workers] {
-                return tl_done_counter.load(std::memory_order_acquire) >= expected_tl_workers;
+            wait_for_main_thread_predicate([expected_workers] {
+                return pool_workers_done.load(std::memory_order_acquire) >= expected_workers;
             });
             Uint64 tl_wait_end = Platform::PerfCounter();
             if (tp.enabled) tp.tl_tail_wait_ms_this_variant += perf_ms(tl_wait_start, tl_wait_end);
@@ -921,8 +977,6 @@ void run_render_loop(RendererContext& ctx) {
 
         if ((frame_num & 0xff) == 0) periodic_capacity_shrink(ctx);
 
-        tl_done_counter.store(0);
-        tl_phase1_done_counter.store(0);
         frame_num++;
         frame_sequence++;
 

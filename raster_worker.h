@@ -1,15 +1,14 @@
 #pragma once
 
-// Raster worker thread entry point.
+// Raster half of the unified worker pool.
 //
-// Each persistent raster thread sleeps on cv_raster until main publishes
-// a new job (shadow depth / color / SSAO / luminaire). Workers are
-// row-sticky: each starts on a row chosen by its thread id, drains the
-// row column-by-column via a per-row atomic claim counter, and only
-// advances to a new row when its current row is exhausted. This keeps
-// each core's L1/L2 hot on the same set of scanlines across the four
-// raster passes. Workers count down raster_workers_done when they exit.
+// Called once per frame by every pool worker (see pool_worker.cpp). All
+// workers cooperatively drain the previous frame's four raster passes
+// (shadow depth -> color -> SSAO -> luminaire) in dependency order via the
+// shared pass state machine in threading.h. Workers are row-sticky for cache
+// locality and block on cv_pool at genuine inter-pass dependencies. Returns
+// once every pass is done (or immediately if pool_do_raster is false).
 
 struct RendererContext;
 
-void raster_worker_main(int thread_id, RendererContext& ctx);
+void raster_worker_frame(int worker_id, RendererContext& ctx);

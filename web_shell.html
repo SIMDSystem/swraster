@@ -90,11 +90,15 @@
           Module._swr_push_key(32);
           return;
         }
-        // Forward printable letters as their lowercase ASCII code.
+        // Forward printable letters as their lowercase ASCII code, plus the
+        // worker-pool control keys (- _ = + [ { ] }) as their literal char.
         if (e.key && e.key.length === 1) {
-          var c = e.key.toLowerCase().charCodeAt(0);
-          if (c >= 97 && c <= 122) {
-            Module._swr_push_key(c);
+          var lc = e.key.toLowerCase().charCodeAt(0);
+          if (lc >= 97 && lc <= 122) {
+            Module._swr_push_key(lc);
+          } else if ('-_=+[{]}'.indexOf(e.key) !== -1) {
+            e.preventDefault();
+            Module._swr_push_key(e.key.charCodeAt(0));
           }
         }
       });

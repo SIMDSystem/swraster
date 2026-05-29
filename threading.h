@@ -21,26 +21,56 @@
 #include "platform.h"
 
 // ---------------------------------------------------------------------------
-// T&L pool
+// Unified worker pool
 // ---------------------------------------------------------------------------
-extern std::atomic<bool>      tl_threads_running;
-extern std::mutex             mtx_tl;
-extern std::condition_variable cv_tl;
-extern std::atomic<int>       frame_tl_target;
-extern int                    active_tl_job_thread_count; // protected by mtx_tl
+// One homogeneous pool replaces the old split T&L / raster pools. Sizing the
+// pool to (roughly) hardware concurrency removes the oversubscription that
+// made the old design fight the OS scheduler. Each frame, main publishes a
+// work plan and wakes every worker once. Workers self-orchestrate via a
+// userspace policy (no OS priority games): worker ids [0, K) are "T&L
+// preferred" — they run the frame's T&L (per-instance + bin merge) first,
+// then fall through to help raster; the remaining workers go straight to
+// raster. Both then drain the previous frame's raster passes from a shared
+// pass state machine, so a T&L worker that finishes hands its core to raster
+// instead of idling. K = active_tl_job_thread_count.
+extern std::atomic<bool>      pool_threads_running;
+extern std::mutex             mtx_pool;
+extern std::condition_variable cv_pool;
+extern std::atomic<int>       frame_pool_target;     // bumped by main to wake the pool
+extern std::atomic<int>       pool_workers_done;     // workers fully done with the frame
 
-// ---------------------------------------------------------------------------
-// Raster pool
-// ---------------------------------------------------------------------------
-extern std::atomic<bool>      raster_threads_running;
-extern std::mutex             mtx_raster;
-extern std::condition_variable cv_raster;
-extern std::atomic<int>       frame_raster_target;
-extern int                    active_raster_job_thread_count; // protected by mtx_raster
-extern int                    active_raster_buf_id;           // protected by mtx_raster
+extern int active_tl_job_thread_count;     // K: T&L-preferred worker count this frame
+extern int active_raster_job_thread_count; // active pool size this frame
+extern int active_raster_buf_id;           // buffer slot the pool rasters this frame
+extern bool pool_do_raster;                // false on the first frame (nothing to raster yet)
 
-enum class RasterJobMode { ShadowDepth, Color, Ssao, Luminaire };
-extern RasterJobMode active_raster_job;
+// Runtime-adjustable active worker count. The pool is *launched* with
+// NUM_RASTER_THREADS threads (the capacity ceiling), but only the first
+// g_active_workers of them participate each frame; the rest sit the frame out.
+// Starts at the core count and is nudged live with -/= (clamped to
+// [1, NUM_RASTER_THREADS]). Read once per frame by the render loop, so changes
+// take effect cleanly at the next frame boundary.
+extern std::atomic<int> g_active_workers;
+
+// Runtime-adjustable T&L-preferred worker count (K). Of the g_active_workers
+// running a frame, the first K run this frame's T&L before falling through to
+// raster; the rest go straight to raster. Adjusted live with [ / ] (clamped to
+// [1, NUM_RASTER_THREADS]); the effective K is min(g_tl_workers, active). Read
+// once per frame by the render loop.
+extern std::atomic<int> g_tl_workers;
+
+enum class RasterJobMode { ShadowDepth = 0, Color = 1, Ssao = 2, Luminaire = 3 };
+constexpr int RASTER_PASS_COUNT = 4;
+
+// Raster pass state machine, driven entirely inside the pool. raster_pass is
+// the index of the pass currently claimable (0..3); RASTER_PASS_COUNT means
+// all passes are done. A pass is gated on the previous one fully draining
+// (shadow depth must complete before color samples the shadow map; SSAO sits
+// between color and the spotlight luminaire). The worker that completes the
+// last tile of a pass advances raster_pass and wakes anyone blocked waiting
+// for the next pass.
+extern std::atomic<int> raster_pass;
+extern std::atomic<int> raster_pass_tiles_done[RASTER_PASS_COUNT];
 
 // ---------------------------------------------------------------------------
 // Main-thread wakeup
@@ -48,38 +78,29 @@ extern RasterJobMode active_raster_job;
 extern std::mutex             mtx_main;
 extern std::condition_variable cv_main;
 
-extern std::atomic<int> tl_done_counter;
-// Phase-1 barrier inside T&L workers. Each worker bumps this after writing its
-// thread-local outputs; once all active workers have hit the barrier they
-// safely fan back out to do their assigned slice of the per-tile bin merge
-// directly into the published double-buffer slot. Hoisting the merge into
-// the worker tail keeps the post-Present gap (between blit-end and the next
-// T&L kick) free of merge work, and the bin-clear that used to live there
-// is folded into each worker's phase-2 sweep.
+extern std::atomic<int> tl_done_counter;        // T&L-preferred workers done with T&L
+// Phase-1 barrier inside the T&L portion. Each T&L-preferred worker bumps this
+// after writing its thread-local outputs; once all K have hit the barrier they
+// fan back out to merge per-tile bins into the published double-buffer slot.
 extern std::atomic<int> tl_phase1_done_counter;
-// Blocking barrier primitives for the phase-1 -> phase-2 hand-off. The pool is
-// deliberately oversubscribed (NUM_TL + NUM_RASTER > hw_concurrency) and the
-// previous frame's raster pool drains concurrently, so a finished T&L worker
-// that busy-spins here just steals a core from the straggler still holding the
-// barrier (and from the raster pool). Instead each early arrival sleeps on this
-// condvar; the OS reclaims the core and the straggler runs sooner. The last
-// arrival notifies all.
+// Blocking barrier primitives for the T&L phase-1 -> phase-2 hand-off. Early
+// arrivals sleep on this condvar so the OS reclaims the core; the last arrival
+// notifies all. The increment is done under the mutex to close the lost-wakeup
+// window.
 extern std::mutex              mtx_tl_barrier;
 extern std::condition_variable cv_tl_barrier;
-extern std::atomic<int> raster_workers_done;  // workers fully out of the current raster job
 
-// Per-row dynamic claim counters. Each row's counter walks 0..TILE_X_SPLITS;
-// when it reaches TILE_X_SPLITS the row is exhausted. Workers stay sticky on
-// a row until it's drained, then advance, so each core keeps the same set of
-// framebuffer + depth-buffer + shadow-map scanlines hot in L1/L2 across the
-// per-frame shadow / color / SSAO / luminaire passes. Sized to a fixed upper
-// bound so we don't pay a heap allocation. The renderer resets these to zero
-// inside mtx_raster before each raster job is published.
-// Caps the per-row claim-counter array. Must be >= 2 * NUM_STRIPS because
-// the Luminaire pass doubles the strip count for finer-grain work
-// stealing on the spotlight cone post-pass.
+// Per-(pass,row) dynamic claim counters. Each row's counter walks
+// 0..TILE_X_SPLITS; when it reaches TILE_X_SPLITS the row is exhausted.
+// Workers stay sticky on a row until it's drained, then advance, keeping a
+// core's framebuffer / depth / shadow scanlines hot in L1/L2. Indexed by pass
+// so advancing a pass never has to reset a counter another worker might be
+// mid-fetch_add on — every pass owns its own row counters, all zeroed once at
+// frame setup. Sized to a fixed upper bound (no heap).
+// MAX_RASTER_STRIPS must be >= 2 * NUM_STRIPS because the Luminaire pass
+// doubles the strip count for finer-grain work stealing.
 constexpr int MAX_RASTER_STRIPS = 96;
-extern std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS];
+extern std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS];
 
 // Wait for a predicate that worker threads will eventually set true. On native
 // we use a plain condition variable. On Emscripten's PROXY_TO_PTHREAD build,

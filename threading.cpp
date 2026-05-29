@@ -10,20 +10,22 @@
 #include <sys/resource.h>
 #endif
 
-// ---- Pool sync primitives ----
-std::atomic<bool>      tl_threads_running{true};
-std::mutex             mtx_tl;
-std::condition_variable cv_tl;
-std::atomic<int>       frame_tl_target{0};
-int                    active_tl_job_thread_count = 0;
+// ---- Unified pool sync primitives ----
+std::atomic<bool>      pool_threads_running{true};
+std::mutex             mtx_pool;
+std::condition_variable cv_pool;
+std::atomic<int>       frame_pool_target{0};
+std::atomic<int>       pool_workers_done{0};
 
-std::atomic<bool>      raster_threads_running{true};
-std::mutex             mtx_raster;
-std::condition_variable cv_raster;
-std::atomic<int>       frame_raster_target{0};
-int                    active_raster_job_thread_count = 0;
-int                    active_raster_buf_id           = 0;
-RasterJobMode          active_raster_job              = RasterJobMode::Color;
+int                    active_tl_job_thread_count     = 0;
+int                    active_raster_job_thread_count  = 0;
+int                    active_raster_buf_id            = 0;
+bool                   pool_do_raster                  = false;
+std::atomic<int>       g_active_workers{0};            // set in init_thread_counts()
+std::atomic<int>       g_tl_workers{0};                // set in init_thread_counts()
+
+std::atomic<int> raster_pass{RASTER_PASS_COUNT};
+std::atomic<int> raster_pass_tiles_done[RASTER_PASS_COUNT] = {};
 
 std::mutex              mtx_main;
 std::condition_variable cv_main;
@@ -32,8 +34,7 @@ std::atomic<int> tl_done_counter{0};
 std::atomic<int> tl_phase1_done_counter{0};
 std::mutex              mtx_tl_barrier;
 std::condition_variable cv_tl_barrier;
-std::atomic<int> raster_workers_done{0};
-std::atomic<int> raster_row_next_col[MAX_RASTER_STRIPS] = {};
+std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS] = {};
 
 // ---- Thread-count config (definitions; declared extern in render_config.h) ----
 int NUM_TL_THREADS;
@@ -44,13 +45,28 @@ int NUM_TILE_BINS;
 void init_thread_counts() {
     int hw = (int)std::thread::hardware_concurrency();
     if (hw < 2) hw = 2;
-    // Tuned for the current scene: T&L is light, raster/fill dominates.
-    NUM_TL_THREADS     = DEFAULT_TL_THREADS;
-    NUM_RASTER_THREADS = DEFAULT_RASTER_THREADS;
+    // One unified pool. NUM_RASTER_THREADS is the *capacity* (how many threads
+    // we launch, hard-capped at 20); g_active_workers is how many actually run
+    // each frame (live, -/=). g_tl_workers is how many of those prefer T&L
+    // (live, [/]). We launch headroom above the core count so '=' can push past
+    // hardware concurrency, but start active at the core count with every active
+    // worker T&L-preferred. Per-worker T&L scratch, the globals merge, and the
+    // profiler lanes all size off the capacity, so every thread that can ever
+    // run is captured. DEFAULT_RASTER_THREADS / DEFAULT_TL_THREADS are unused
+    // now (kept for the --threadperf sweep, which overrides these per variant).
+    constexpr int POOL_CAPACITY_MAX = 20;
+    int cap = 2 * hw;
+    if (cap > POOL_CAPACITY_MAX) cap = POOL_CAPACITY_MAX;
+    NUM_RASTER_THREADS = cap;                              // launched capacity ceiling
+    NUM_TL_THREADS     = NUM_RASTER_THREADS;              // sizing: capacity covers all
+    int start_active = hw < cap ? hw : cap;
+    g_active_workers.store(start_active, std::memory_order_relaxed); // start at core count
+    g_tl_workers.store(cap, std::memory_order_relaxed);   // all active prefer T&L initially
     NUM_STRIPS         = 16;
     NUM_TILE_BINS      = NUM_STRIPS * TILE_X_SPLITS;
-    printf("Threads: %d T&L, %d raster, %d strips, %d tiles (hw_concurrency=%d)\n",
-           NUM_TL_THREADS, NUM_RASTER_THREADS, NUM_STRIPS, NUM_TILE_BINS, hw);
+    printf("Threads: pool capacity %d, active %d, T&L-preferred %d (hw=%d), %d strips, %d tiles\n"
+           "  keys: -/= adjust active workers, [/] adjust T&L-preferred\n",
+           NUM_RASTER_THREADS, start_active, cap, hw, NUM_STRIPS, NUM_TILE_BINS);
 }
 
 // ---- Perf timing ----
