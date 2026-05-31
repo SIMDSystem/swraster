@@ -89,7 +89,6 @@ static void reset_animation(RendererContext& ctx,
         }
     }
     tl_done_counter.store(0, std::memory_order_relaxed);
-    tl_phase1_done_counter.store(0, std::memory_order_relaxed);
     pool_workers_done.store(0, std::memory_order_relaxed);
     raster_pass.store(RASTER_PASS_COUNT, std::memory_order_relaxed);
     for (int p = 0; p < RASTER_PASS_COUNT; p++) {
@@ -337,7 +336,7 @@ void run_render_loop(RendererContext& ctx) {
     // still runs on the last-published pose, so the profiler bars
     // reflect the cost of those repeated frames).
     bool  profiler_unfreeze   = false;
-    // 'T' toggle (only meaningful while the profiler overlay is on, i.e. 'P'
+    // 'T' toggle (only meaningful while the profiler overlay is on, i.e. 'S'
     // is enabled). When trace_mode is on we keep a rolling ring buffer of
     // the last 10 frame deltas (the orange-bar position relative to the
     // previous frame's blit start) and maintain a running sum so the average
@@ -350,6 +349,12 @@ void run_render_loop(RendererContext& ctx) {
     int           trace_ring_count  = 0;
     int           trace_ring_head   = 0;
     double        trace_ring_sum    = 0.0;
+    // Set on unpause so the watchdog drops the first resumed frame. While
+    // paused the profiler is frozen, so present_history[0] stops advancing;
+    // the first resumed frame's delta therefore spans the entire pause and
+    // would instantly re-trigger the watchdog. We skip that one frame (and
+    // clear the ring) so the baseline rebuilds from fresh post-resume frames.
+    bool          trace_skip_next   = false;
     [[maybe_unused]] bool  camera_orbiting = false;
     float camera_yaw      = 0.0f;
     float camera_pitch    = asinf(8.0f / sqrtf(8.0f * 8.0f + 21.7f * 21.7f));
@@ -394,8 +399,19 @@ void run_render_loop(RendererContext& ctx) {
                     last_physics_time = Platform::TicksMs();
                     break;
                 case Platform::Event::KeyDown:
-                    if (event.key == ' ') paused = !paused;
-                    if (event.key == 'p' || event.key == 'P') {
+                    if (event.key == ' ') {
+                        paused = !paused;
+                        if (!paused) {
+                            // Resuming: clear the trace watchdog state and drop
+                            // the first resumed frame so the pause-spanning
+                            // delta can't instantly re-trigger a pause.
+                            trace_ring_count = 0;
+                            trace_ring_head  = 0;
+                            trace_ring_sum   = 0.0;
+                            trace_skip_next  = true;
+                        }
+                    }
+                    if (event.key == 's' || event.key == 'S') {
                         bool was = ctx.profiler->enabled.load(std::memory_order_relaxed);
                         ctx.profiler->enabled.store(!was, std::memory_order_relaxed);
                     }
@@ -411,6 +427,7 @@ void run_render_loop(RendererContext& ctx) {
                             trace_ring_count = 0;
                             trace_ring_head  = 0;
                             trace_ring_sum   = 0.0;
+                            trace_skip_next  = false;
                         }
                     }
                     // Live worker-pool resize. '=' (or '+') adds a worker, '-'
@@ -615,10 +632,23 @@ void run_render_loop(RendererContext& ctx) {
 
         int tl_buf_idx     = frame_num % 2;
         int raster_buf_idx = (frame_num + 1) % 2;
-        // The T&L target slot's bins are cleared and re-filled by the T&L
-        // workers themselves in their phase-2 tail (see tl_worker.cpp).
-        // No clear() loop on main; the gap-time work is just the kick
-        // below and the wait/merge_globals after Present.
+        // Scatter-merge: each T&L worker appends its sorted local bins directly
+        // into the published slot under per-tile locks, with no per-tile owner
+        // to do a clearing pass. So main clears the target slot here, once,
+        // before waking the pool. Safe because the pool is asleep at this point
+        // and this slot's previous raster consumer finished on the prior frame.
+        // clear() keeps capacity (size=0 for trivially-destructible triangles),
+        // so this is cheap and never reallocates.
+        {
+            auto& ob = ctx.opaque_strip_buffers[tl_buf_idx].bins;
+            auto& tb = ctx.trans_strip_buffers [tl_buf_idx].bins;
+            auto& sb = ctx.shadow_strip_buffers[tl_buf_idx].bins;
+            for (int s = 0; s < NUM_TILE_BINS; s++) {
+                ob[s].clear();
+                tb[s].clear();
+                sb[s].clear();
+            }
+        }
 
         // Publish T&L inputs.
         TLSharedData& tl_shared = *ctx.tl_shared;
@@ -798,7 +828,6 @@ void run_render_loop(RendererContext& ctx) {
             pool_do_raster                 = do_raster;
             pool_workers_done.store(0, std::memory_order_relaxed);
             tl_done_counter.store(0, std::memory_order_relaxed);
-            tl_phase1_done_counter.store(0, std::memory_order_relaxed);
             for (int p = 0; p < RASTER_PASS_COUNT; p++) {
                 raster_pass_tiles_done[p].store(0, std::memory_order_relaxed);
                 for (int r = 0; r < NUM_STRIPS * 2; r++) { // Luminaire uses 2*NUM_STRIPS rows
@@ -892,7 +921,7 @@ void run_render_loop(RendererContext& ctx) {
         // FPS counter in the top-right corner (safe now: raster is fully drained).
         ctx.fps_counter->draw(pixels, pitch, fb->w, fb->format);
 
-        // Concurrency timeline overlay (toggle with 'P'). The orange line
+        // Concurrency timeline overlay (toggle with 'S'). The orange line
         // it paints sits exactly at draw_end_ts (captured here, just
         // before drawing the overlay itself).
         Uint64 draw_end_ts = Platform::PerfCounter();
@@ -904,7 +933,14 @@ void run_render_loop(RendererContext& ctx) {
         // because the Present below is what advances it.
         if (trace_mode && !paused && ctx.profiler->enabled.load(std::memory_order_relaxed)) {
             Uint64 prev_blit_start = ctx.profiler->present_history[0].start_ts;
-            if (prev_blit_start != 0) {
+            if (trace_skip_next) {
+                // First frame after a resume: present_history[0] still holds
+                // the pre-pause blit start (frozen during the pause), so this
+                // frame's delta spans the whole pause. Drop it entirely — no
+                // trigger, no record — and resync on the next frame once
+                // present_history has advanced.
+                trace_skip_next = false;
+            } else if (prev_blit_start != 0) {
                 double delta_ms = perf_ms(prev_blit_start, draw_end_ts);
                 if (trace_ring_count >= trace_window_size) {
                     double avg_ms = trace_ring_sum * (1.0 / trace_window_size);

@@ -2,13 +2,17 @@
 
 // Per-thread concurrency overlay.
 //
-// Each worker (physics, T&L, raster) records busy intervals as PerfCounter
-// tick pairs into a per-thread vector. Once a frame finishes, the renderer
-// draws a small 2D timeline pinned to the top-left of the framebuffer:
+// Each worker (physics + the unified pool) records busy intervals as
+// PerfCounter tick pairs into a per-thread vector. Once a frame finishes, the
+// renderer draws a small 2D timeline pinned to the top-left of the framebuffer:
 //
-//   top red bars     = physics worker busy intervals
-//   blue bars below  = each T&L thread busy interval
-//   green bars below = each raster worker busy interval per pass
+//   top red bars  = physics worker busy intervals (its own thread, own row)
+//   rows below    = one row per active pool worker. Because a pool worker runs
+//                   its T&L then its raster on the same physical thread, both
+//                   its T&L bars (cyan/blue) and raster bars (yellow/green/
+//                   purple) share that one row, mutually exclusive in time.
+//                   Idle workers get no row; the panel is only as tall as the
+//                   workers that did work.
 //
 // The panel is left-anchored. The previous frame's Platform::Present()
 // blit window is shown by two vertical purple lines on the left:
@@ -20,7 +24,7 @@
 // vertical line on the right (= the PerfCounter tick captured right
 // before this overlay is itself drawn). Bars run left → right at 100
 // pixels per millisecond. The whole thing is gated by an atomic flag so
-// production runs pay nothing; press P in the renderer to toggle it.
+// production runs pay nothing; press S in the renderer to toggle it.
 
 #include <atomic>
 #include <cstdint>

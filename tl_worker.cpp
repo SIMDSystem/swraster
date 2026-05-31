@@ -484,9 +484,9 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
         }
 
-        // Close the local-sort interval here so any time spent spinning on
-        // the barrier below is visible as a gap in this worker's profiler
-        // lane (its phase-2 interval starts immediately after the spin).
+        // Close the local-sort interval here; the scatter-merge (dark blue)
+        // begins immediately after, with no barrier in between, so it can run
+        // while other workers are still in their per-instance sweep.
         Uint64 phase1_end_ts = Platform::PerfCounter();
         Uint64 phase1_end_cpu_ns = Platform::ThreadCpuNs();
         Uint64 local_sort_cpu_ns = phase1_end_cpu_ns > sort_start_cpu_ns
@@ -524,47 +524,24 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
         }
 
-        // ----- Phase-2 barrier -----------------------------------------
-        // All per-thread T&L output (globals + bins) must be fully written
-        // and locally sorted before any worker reads other workers' bin
-        // outputs to merge them into the published slot.
+        // ----- Scatter-merge (no barrier) ------------------------------
+        // The instant this worker has finished its own per-instance sweep and
+        // local sort, it merges *its* sorted local bins straight into the
+        // published slot — concurrent with any slower worker still in its
+        // per-instance transform. There is no global phase barrier, so this
+        // worker's merge (dark blue) overlaps the stragglers' transform (cyan).
         //
-        // This machine is intentionally oversubscribed (NUM_TL + NUM_RASTER
-        // > hw_concurrency) and the raster pool for the *previous* frame is
-        // draining concurrently with this T&L pass. If one T&L worker is
-        // preempted mid-phase-1 it arrives at the barrier late and holds it.
-        // A busy-spin (even pause/yield) here burns a core on every worker
-        // that already finished, starving both the straggler and the raster
-        // pool and pushing the phase-2 merge dangerously late. So early
-        // arrivals block on a condvar: the OS deschedules them and hands the
-        // core to whoever still has work, and the last arrival wakes them.
-        // The increment is done under the barrier mutex so the last arrival's
-        // notify cannot slip into the gap between a waiter's predicate check
-        // and its descent into wait() (the classic lost-wakeup).
-        {
-            std::unique_lock<std::mutex> lock(mtx_tl_barrier);
-            int arrived = tl_phase1_done_counter.fetch_add(1, std::memory_order_acq_rel) + 1;
-            if (arrived >= active_tl_threads) {
-                lock.unlock();
-                cv_tl_barrier.notify_all();
-            } else {
-                cv_tl_barrier.wait(lock, [&] {
-                    return tl_phase1_done_counter.load(std::memory_order_acquire) >= active_tl_threads;
-                });
-            }
-        }
+        // Each published tile bin is guarded by its own lock (tile_bin_locks).
+        // main cleared the whole target slot before the kick (pool was asleep),
+        // so workers only ever append. With each worker's local bin already
+        // sorted from the local-sort step above, a single inplace_merge per
+        // append keeps the published bin sorted as contributions accumulate in
+        // arbitrary worker order. Workers start scanning at a staggered tile so
+        // they don't march through the tiles in lockstep and collide on locks.
         Uint64 phase2_start_ts = Platform::PerfCounter();
         Uint64 phase2_start_cpu_ns = Platform::ThreadCpuNs();
 
-        // ----- Phase-2 bin merge ---------------------------------------
-        // Each worker owns the bins where (bin_idx % active_tl_threads ==
-        // thread_id), clears the destination, then concatenates every
-        // worker's local contribution (in deterministic tid order) into
-        // the published bins[tl_buf_idx]. With the locals already sorted
-        // from phase 1, a single inplace_merge per appended chunk keeps
-        // the destination sorted without re-sorting from scratch.
         int     tl_buf_idx = current_frame % 2;
-        auto&   thread_outputs = *ctx.tl_thread_outputs;
         auto&   opaque_strip   = ctx.opaque_strip_buffers[tl_buf_idx];
         auto&   trans_strip    = ctx.trans_strip_buffers [tl_buf_idx];
         auto&   shadow_strip   = ctx.shadow_strip_buffers[tl_buf_idx];
@@ -580,20 +557,19 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 std::inplace_merge(dst.begin(), dst.begin() + old_size, dst.end(), less_than);
             }
         };
-        for (int s = worker_id; s < NUM_TILE_BINS; s += active_tl_threads) {
-            auto& dst_opaque = opaque_strip.bins[s];
-            auto& dst_trans  = trans_strip .bins[s];
-            auto& dst_shadow = shadow_strip.bins[s];
-            // Capacity is preserved; clear() is just size=0 for trivial T.
-            dst_opaque.clear();
-            dst_trans .clear();
-            dst_shadow.clear();
-            for (int w = 0; w < active_tl_threads; w++) {
-                const auto& src = thread_outputs[w];
-                append_bin(dst_opaque, src.opaque_bins[s], ENABLE_RGB_TRIANGLE_SORT,    front_to_back);
-                append_bin(dst_trans,  src.trans_bins [s], ENABLE_RGB_TRIANGLE_SORT,    back_to_front);
-                append_bin(dst_shadow, src.shadow_bins[s], ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
-            }
+        int scatter_start = active_tl_threads > 0
+            ? (worker_id * NUM_TILE_BINS) / active_tl_threads : 0;
+        for (int j = 0; j < NUM_TILE_BINS; j++) {
+            int s = scatter_start + j;
+            if (s >= NUM_TILE_BINS) s -= NUM_TILE_BINS;
+            const auto& src_opaque = local_opaque_bins[s];
+            const auto& src_trans  = local_trans_bins [s];
+            const auto& src_shadow = local_shadow_bins[s];
+            if (src_opaque.empty() && src_trans.empty() && src_shadow.empty()) continue;
+            std::lock_guard<std::mutex> tile_lock(tile_bin_locks[s]);
+            append_bin(opaque_strip.bins[s], src_opaque, ENABLE_RGB_TRIANGLE_SORT,    front_to_back);
+            append_bin(trans_strip .bins[s], src_trans,  ENABLE_RGB_TRIANGLE_SORT,    back_to_front);
+            append_bin(shadow_strip.bins[s], src_shadow, ENABLE_SHADOW_TRIANGLE_SORT, front_to_back);
         }
 
         Uint64 phase2_end_cpu_ns = Platform::ThreadCpuNs();

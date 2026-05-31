@@ -79,16 +79,15 @@ extern std::mutex             mtx_main;
 extern std::condition_variable cv_main;
 
 extern std::atomic<int> tl_done_counter;        // T&L-preferred workers done with T&L
-// Phase-1 barrier inside the T&L portion. Each T&L-preferred worker bumps this
-// after writing its thread-local outputs; once all K have hit the barrier they
-// fan back out to merge per-tile bins into the published double-buffer slot.
-extern std::atomic<int> tl_phase1_done_counter;
-// Blocking barrier primitives for the T&L phase-1 -> phase-2 hand-off. Early
-// arrivals sleep on this condvar so the OS reclaims the core; the last arrival
-// notifies all. The increment is done under the mutex to close the lost-wakeup
-// window.
-extern std::mutex              mtx_tl_barrier;
-extern std::condition_variable cv_tl_barrier;
+
+// Per-tile bin locks for the scatter-merge. As soon as a T&L worker finishes
+// its own per-instance sweep + local sort, it merges its sorted local bins
+// directly into the published slot under the matching tile lock — so a fast
+// worker's merge (dark blue) overlaps a slower worker's transform (cyan), with
+// no phase barrier between them. main clears the target slot before the kick
+// (the pool is asleep then), so workers only ever append. One lock per tile;
+// sized to NUM_TILE_BINS in init_thread_counts().
+extern std::vector<std::mutex> tile_bin_locks;
 
 // Per-(pass,row) dynamic claim counters. Each row's counter walks
 // 0..TILE_X_SPLITS; when it reaches TILE_X_SPLITS the row is exhausted.

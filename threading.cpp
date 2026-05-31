@@ -31,9 +31,7 @@ std::mutex              mtx_main;
 std::condition_variable cv_main;
 
 std::atomic<int> tl_done_counter{0};
-std::atomic<int> tl_phase1_done_counter{0};
-std::mutex              mtx_tl_barrier;
-std::condition_variable cv_tl_barrier;
+std::vector<std::mutex> tile_bin_locks;        // sized in init_thread_counts()
 std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS] = {};
 
 // ---- Thread-count config (definitions; declared extern in render_config.h) ----
@@ -64,6 +62,9 @@ void init_thread_counts() {
     g_tl_workers.store(cap, std::memory_order_relaxed);   // all active prefer T&L initially
     NUM_STRIPS         = 16;
     NUM_TILE_BINS      = NUM_STRIPS * TILE_X_SPLITS;
+    // One lock per tile bin for the scatter-merge (vector move-assign works
+    // even though std::mutex isn't movable — it only transfers the buffer).
+    tile_bin_locks = std::vector<std::mutex>(NUM_TILE_BINS);
     printf("Threads: pool capacity %d, active %d, T&L-preferred %d (hw=%d), %d strips, %d tiles\n"
            "  keys: -/= adjust active workers, [/] adjust T&L-preferred\n",
            NUM_RASTER_THREADS, start_active, cap, hw, NUM_STRIPS, NUM_TILE_BINS);

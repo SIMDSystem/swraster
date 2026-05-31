@@ -111,15 +111,32 @@ void thread_profiler_draw(ThreadProfiler& p,
     const double window_ms = (double)(right_edge - left_edge) / p.pixels_per_ms;
     const int    stride    = p.lane_height_px + p.lane_gap_px;
 
-    // Background strip behind the timeline so bars are readable on bright
-    // scene pixels. A single semi-dark rectangle covering all lanes.
-    const int num_tl = (int)p.tl_intervals.size();
-    int num_raster = 0;
-    for (size_t i = 0; i < p.raster_intervals.size(); i++) {
-        if (!p.raster_intervals[i].empty()) num_raster = (int)i + 1;
+    // Lanes are now per *physical pool worker*: with the unified pool, worker
+    // i's T&L and raster intervals are produced by the same thread (T&L first,
+    // then raster), so they share one row and never overlap in time. Only
+    // workers that did work this frame or last get a lane, and the panel is
+    // sized to exactly those lanes so idle capacity adds no height.
+    const int num_workers = (int)std::max(p.tl_intervals.size(), p.raster_intervals.size());
+    auto worker_has_work = [&](int i) -> bool {
+        bool tl = (i < (int)p.tl_intervals.size()      && !p.tl_intervals[i].empty()) ||
+                  (i < (int)p.tl_intervals_prev.size() && !p.tl_intervals_prev[i].empty());
+        bool rs = (i < (int)p.raster_intervals.size()      && !p.raster_intervals[i].empty()) ||
+                  (i < (int)p.raster_intervals_prev.size() && !p.raster_intervals_prev[i].empty());
+        return tl || rs;
+    };
+    int active_worker_count = 0;
+    for (int i = 0; i < num_workers; i++) if (worker_has_work(i)) active_worker_count++;
+
+    bool physics_has_work;
+    {
+        std::lock_guard<std::mutex> lock(p.physics_mtx);
+        physics_has_work = !p.physics_intervals.empty() || !p.physics_intervals_prev.empty();
     }
-    if (num_raster < (int)p.raster_intervals.size()) num_raster = (int)p.raster_intervals.size();
-    const int total_lanes = 1 + num_tl + num_raster;
+
+    // Background strip behind the timeline so bars are readable on bright
+    // scene pixels. A single semi-dark rectangle covering only the used lanes.
+    const int total_lanes = (physics_has_work ? 1 : 0) + active_worker_count;
+    if (total_lanes == 0) return;
     const int panel_y0 = p.top_y - 1;
     const int panel_y1 = p.top_y + total_lanes * stride;
     const uint32_t bg_color = pack_rgb_fast(format, 16, 16, 16);
@@ -190,32 +207,11 @@ void thread_profiler_draw(ThreadProfiler& p,
         }
     };
 
-    int lane = 0;
-
-    // Physics lane (red). Read under the mutex; bars are short and few.
-    // Both prev-frame and current-frame intervals are placed by their
-    // absolute start_ts, so a single lane carries both.
-    {
-        std::lock_guard<std::mutex> lock(p.physics_mtx);
-        const uint32_t physics_color = pack_rgb_fast(format, 255, 64, 64);
-        if (have_prev_frame) {
-            draw_lane(lane, p.physics_intervals_prev,
-                      [&](const ProfilerInterval&) { return physics_color; });
-        }
-        draw_lane(lane++, p.physics_intervals,
-                  [&](const ProfilerInterval&) { return physics_color; });
-    }
-
-    // T&L lanes, colored per TLJobTag so the functionally distinct
-    // sub-passes are visually separable:
+    // T&L color family (cyan/blue), shared by the merged worker lanes:
     //   PerInstance — phase-1 per-instance T&L sweep (cyan).
-    //   Spotlight   — once-per-frame cone fan T&L on thread 0; folded into
-    //                 cyan because it's tiny and adjacent to phase 1 there.
-    //   LocalSort   — phase-1 tail: each worker sorts its own local bins
-    //                 (light blue).
-    //   BinMerge    — phase-2 cross-worker bin merge (dark blue).
-    // The gap between the light-blue local sort and the dark-blue merge is
-    // the phase-1 barrier spin-wait.
+    //   Spotlight   — once-per-frame cone fan T&L on worker 0; folded into cyan.
+    //   LocalSort   — phase-1 tail: each worker sorts its own local bins (light blue).
+    //   BinMerge    — scatter-merge into the published bins (dark blue).
     const uint32_t tl_color_per_inst  = pack_rgb_fast(format,  60, 200, 220); // cyan
     const uint32_t tl_color_spotlight = tl_color_per_inst;                    // same as PerInstance
     const uint32_t tl_color_sort      = pack_rgb_fast(format, 120, 160, 255); // light blue
@@ -229,23 +225,48 @@ void thread_profiler_draw(ThreadProfiler& p,
             default:                  return tl_color_per_inst;
         }
     };
-    for (int i = 0; i < num_tl; i++) {
+
+    int lane = 0;
+
+    // Physics lane (red): a separate async thread, so it keeps its own row.
+    // Both prev-frame and current-frame intervals are placed by absolute
+    // start_ts, so a single lane carries both.
+    if (physics_has_work) {
+        std::lock_guard<std::mutex> lock(p.physics_mtx);
+        const uint32_t physics_color = pack_rgb_fast(format, 255, 64, 64);
+        if (have_prev_frame) {
+            draw_lane(lane, p.physics_intervals_prev,
+                      [&](const ProfilerInterval&) { return physics_color; });
+        }
+        draw_lane(lane, p.physics_intervals,
+                  [&](const ProfilerInterval&) { return physics_color; });
+        lane++;
+    }
+
+    // One lane per active pool worker. Because the unified pool runs a worker's
+    // T&L (cyan/blue) and then its raster (yellow/green/purple) on the same
+    // physical thread, both kinds of bars land on the SAME row and never
+    // overlap in time. Both ping-pong buffers (this frame + last) are painted
+    // at their absolute positions so the two frames share the row.
+    for (int i = 0; i < num_workers; i++) {
+        if (!worker_has_work(i)) continue;
         if (have_prev_frame && i < (int)p.tl_intervals_prev.size()) {
             draw_lane(lane, p.tl_intervals_prev[i],
                       [&](const ProfilerInterval& iv) { return tl_color_for(iv.tag); });
         }
-        draw_lane(lane++, p.tl_intervals[i],
-                  [&](const ProfilerInterval& iv) { return tl_color_for(iv.tag); });
-    }
-
-    // Raster lanes colored per RasterJobMode tag.
-    for (size_t i = 0; i < p.raster_intervals.size(); i++) {
-        if (have_prev_frame && i < p.raster_intervals_prev.size()) {
+        if (i < (int)p.tl_intervals.size()) {
+            draw_lane(lane, p.tl_intervals[i],
+                      [&](const ProfilerInterval& iv) { return tl_color_for(iv.tag); });
+        }
+        if (have_prev_frame && i < (int)p.raster_intervals_prev.size()) {
             draw_lane(lane, p.raster_intervals_prev[i],
                       [&](const ProfilerInterval& iv) { return raster_color_for(iv.tag); });
         }
-        draw_lane(lane++, p.raster_intervals[i],
-                  [&](const ProfilerInterval& iv) { return raster_color_for(iv.tag); });
+        if (i < (int)p.raster_intervals.size()) {
+            draw_lane(lane, p.raster_intervals[i],
+                      [&](const ProfilerInterval& iv) { return raster_color_for(iv.tag); });
+        }
+        lane++;
     }
 
     // Vertical markers. With both ping-pong buffers visible we paint two
