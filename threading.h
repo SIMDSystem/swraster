@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "platform.h"
+#include "render_config.h"  // TILE_X_SPLITS, NUM_STRIPS
 
 // ---------------------------------------------------------------------------
 // Unified worker pool
@@ -72,6 +73,14 @@ constexpr int RASTER_PASS_COUNT = 4;
 extern std::atomic<int> raster_pass;
 extern std::atomic<int> raster_pass_tiles_done[RASTER_PASS_COUNT];
 
+// Hard pass-barrier toggle (the 'b' key). When false (default) the raster pipe
+// runs opportunistically: SSAO overlaps the Color pass (each tile pulls its own
+// SSAO once its 8 neighbors' Color tiles are done) and Luminaire overlaps SSAO
+// (each completed SSAO tile runs its own two cone tiles). When true, every pass
+// drains fully before the next begins — SSAO runs only in the SSAO pass and
+// Luminaire only in the Luminaire pass — for clean, strictly-ordered profiling.
+extern std::atomic<bool> raster_hard_barrier;
+
 // ---------------------------------------------------------------------------
 // Main-thread wakeup
 // ---------------------------------------------------------------------------
@@ -100,6 +109,39 @@ extern std::vector<std::mutex> tile_bin_locks;
 // doubles the strip count for finer-grain work stealing.
 constexpr int MAX_RASTER_STRIPS = 96;
 extern std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS];
+
+// ---------------------------------------------------------------------------
+// Color/SSAO overlap
+// ---------------------------------------------------------------------------
+// SSAO no longer waits on a hard barrier after the whole Color pass. Color and
+// SSAO share the same TILE_X_SPLITS x NUM_STRIPS tile grid, and an SSAO pixel
+// reads the depth buffer no further than one tile away, so an SSAO tile is
+// safe to run as soon as its own Color tile and its in-bounds 8-neighbor Color
+// tiles are finished (off-edge neighbors count as ready). Workers therefore
+// fold SSAO into the tail of the Color pass: each Color tile, on completion,
+// sets its color_tile_done flag and opportunistically runs any now-unblocked
+// SSAO tiles in its 3x3 neighborhood; idle workers drain any other eligible
+// SSAO tiles. ssao_tile_claimed arbitrates one worker per SSAO tile.
+// color_tile_done / ssao_tile_claimed are indexed [strip * TILE_X_SPLITS + col]
+// on the coarse NUM_STRIPS grid; reset each frame.
+//
+// The same cascade continues into the Luminaire pass: the spotlight cone stays
+// within its own tile (reads depth, writes only its tile's pixels, no depth
+// write), so a Luminaire tile may run as soon as *its* tile's SSAO is done —
+// no neighbor checks. Luminaire uses the finer 2*NUM_STRIPS grid; a fine tile
+// (col, fstrip) maps to coarse SSAO tile (col, fstrip>>1). ssao_tile_done gates
+// it; lum_tile_claimed arbitrates one worker per fine tile. So each completed
+// SSAO tile opportunistically launches the two Luminaire fine tiles above it.
+// Single-buffered, reset each frame before the raster kick. These gate the
+// single RGB framebuffer (rs.pixels / depth_buffer), which is written one frame
+// at a time — main waits for raster to finish before kicking the next frame, so
+// only one frame's raster is ever in flight. (Only the T&L triangle buffers are
+// double-buffered, so T&L of frame N can run concurrently with raster of N-1.)
+constexpr int MAX_RASTER_TILES = MAX_RASTER_STRIPS * TILE_X_SPLITS;
+extern std::atomic<uint8_t> color_tile_done[MAX_RASTER_TILES];
+extern std::atomic<uint8_t> ssao_tile_claimed[MAX_RASTER_TILES];
+extern std::atomic<uint8_t> ssao_tile_done[MAX_RASTER_TILES];   // coarse grid
+extern std::atomic<uint8_t> lum_tile_claimed[MAX_RASTER_TILES]; // fine grid
 
 // Wait for a predicate that worker threads will eventually set true. On native
 // we use a plain condition variable. On Emscripten's PROXY_TO_PTHREAD build,

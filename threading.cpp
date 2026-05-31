@@ -26,6 +26,7 @@ std::atomic<int>       g_tl_workers{0};                // set in init_thread_cou
 
 std::atomic<int> raster_pass{RASTER_PASS_COUNT};
 std::atomic<int> raster_pass_tiles_done[RASTER_PASS_COUNT] = {};
+std::atomic<bool> raster_hard_barrier{false};
 
 std::mutex              mtx_main;
 std::condition_variable cv_main;
@@ -33,6 +34,11 @@ std::condition_variable cv_main;
 std::atomic<int> tl_done_counter{0};
 std::vector<std::mutex> tile_bin_locks;        // sized in init_thread_counts()
 std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS] = {};
+
+std::atomic<uint8_t> color_tile_done[MAX_RASTER_TILES] = {};
+std::atomic<uint8_t> ssao_tile_claimed[MAX_RASTER_TILES] = {};
+std::atomic<uint8_t> ssao_tile_done[MAX_RASTER_TILES] = {};
+std::atomic<uint8_t> lum_tile_claimed[MAX_RASTER_TILES] = {};
 
 // ---- Thread-count config (definitions; declared extern in render_config.h) ----
 int NUM_TL_THREADS;

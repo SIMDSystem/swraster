@@ -97,6 +97,14 @@ static void reset_animation(RendererContext& ctx,
             raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
         }
     }
+    for (int t = 0; t < NUM_STRIPS * TILE_X_SPLITS; t++) {
+        color_tile_done[t].store(0, std::memory_order_relaxed);
+        ssao_tile_claimed[t].store(0, std::memory_order_relaxed);
+        ssao_tile_done[t].store(0, std::memory_order_relaxed);
+    }
+    for (int t = 0; t < NUM_STRIPS * 2 * TILE_X_SPLITS; t++) {
+        lum_tile_claimed[t].store(0, std::memory_order_relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -417,6 +425,15 @@ void run_render_loop(RendererContext& ctx) {
                     }
                     if (event.key == 'f' || event.key == 'F') {
                         profiler_unfreeze = !profiler_unfreeze;
+                    }
+                    if (event.key == 'b' || event.key == 'B') {
+                        // Toggle the hard raster pass-barrier. Off (default) =
+                        // opportunistic SSAO/Luminaire overlap; on = each pass
+                        // drains fully before the next for clean profiling.
+                        bool was = raster_hard_barrier.load(std::memory_order_relaxed);
+                        raster_hard_barrier.store(!was, std::memory_order_relaxed);
+                        printf("Raster hard barrier: %s\n", !was ? "ON (passes serialized)"
+                                                                  : "OFF (opportunistic overlap)");
                     }
                     if (event.key == 't' || event.key == 'T') {
                         // Trace mode only makes sense while the profiler
@@ -833,6 +850,14 @@ void run_render_loop(RendererContext& ctx) {
                 for (int r = 0; r < NUM_STRIPS * 2; r++) { // Luminaire uses 2*NUM_STRIPS rows
                     raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
                 }
+            }
+            for (int t = 0; t < NUM_STRIPS * TILE_X_SPLITS; t++) {
+                color_tile_done[t].store(0, std::memory_order_relaxed);
+                ssao_tile_claimed[t].store(0, std::memory_order_relaxed);
+                ssao_tile_done[t].store(0, std::memory_order_relaxed);
+            }
+            for (int t = 0; t < NUM_STRIPS * 2 * TILE_X_SPLITS; t++) {
+                lum_tile_claimed[t].store(0, std::memory_order_relaxed);
             }
             raster_pass.store(do_raster ? 0 : RASTER_PASS_COUNT, std::memory_order_relaxed);
             frame_pool_target.store(frame_sequence, std::memory_order_release);

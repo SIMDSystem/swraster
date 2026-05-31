@@ -65,9 +65,25 @@ extern int NUM_RASTER_THREADS;
 extern int NUM_STRIPS;
 extern int NUM_TILE_BINS;
 
+// Canonical 1-D tile split. Divides [0,extent) into `splits` contiguous tiles
+// with one floor-division formula used by EVERY framebuffer pass (RGB/depth
+// fill, SSAO fill, Luminaire fill) and the shadow pass, so they can never
+// disagree on a tile boundary. Tile `idx` covers pixels [lo, hi] inclusive.
+//
+// Coarse (NUM_STRIPS) and fine (2*NUM_STRIPS) row splits nest exactly: the two
+// fine tiles 2r and 2r+1 tile coarse tile r with no gap or overlap, because
+// floor((2r)*h / (2R)) == floor(r*h / R) and likewise at the top edge. This is
+// what lets the per-tile completion flags on the coarse grid correctly gate the
+// fine Luminaire tiles drawn on top of them.
+static inline void tile_span(int extent, int splits, int idx, int& lo, int& hi) {
+    lo = (idx * extent) / splits;
+    hi = (((idx + 1) * extent) / splits) - 1;
+    if (lo < 0) lo = 0;
+    if (hi >= extent) hi = extent - 1;
+}
+
 static inline void tile_column_range(int width, int col, int& x_min, int& x_max) {
-    x_min = (col * width) / TILE_X_SPLITS;
-    x_max = (((col + 1) * width) / TILE_X_SPLITS) - 1;
+    tile_span(width, TILE_X_SPLITS, col, x_min, x_max);
 }
 
 static inline int tile_column_for_x(int width, int x) {
