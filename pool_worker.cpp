@@ -38,17 +38,26 @@ void pool_worker_main(int worker_id, RendererContext& ctx) {
         // relaunching threads). They still observe future wakeups.
         if (worker_id >= pool_active) continue;
 
+        // Shadow-depth pre-pass: every active worker first drains the previous
+        // frame's shadow-map raster (non-blocking — it returns the moment no
+        // shadow tile is left to claim). The Color pass hard-depends on the
+        // finished shadow map, so prioritizing it here lets Color start the
+        // instant T&L frees a worker, overlapping the remaining T&L instead of
+        // serializing behind the shadow dependency. No-op on frame 0 / when
+        // there's nothing to raster.
+        raster_worker_frame(worker_id, ctx, /*shadow_only=*/true);
+
         // T&L-preferred workers run this frame's T&L (per-instance sweep,
-        // phase-1 barrier, phase-2 bin merge) first, signalling tl_done_counter
-        // on the way out. The barrier inside only waits on the k_eff workers
-        // that actually reach it.
+        // phase-1 barrier, phase-2 bin merge), signalling tl_done_counter on
+        // the way out. The barrier inside only waits on the k_eff workers that
+        // actually reach it.
         if (worker_id < k_eff) {
             tl_worker_frame(worker_id, k_eff, ctx, current_frame);
         }
 
-        // Every active worker then helps drain the previous frame's raster
-        // passes (no-op fast return if there's nothing to raster yet, or if
-        // raster already finished while this worker was busy with T&L).
+        // Every active worker then drains the rest of the previous frame's
+        // raster passes (Color -> SSAO -> Luminaire), helping finish any shadow
+        // tiles still outstanding from the pre-pass first.
         raster_worker_frame(worker_id, ctx);
 
         // This worker is done with the frame.

@@ -52,7 +52,7 @@
 // not a busy-wait).
 //
 // Profiler: one ProfilerInterval per tile, bracketing just the tile's work.
-void raster_worker_frame(int worker_id, RendererContext& ctx) {
+void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) {
     if (!pool_do_raster) return;
 
     int pool   = active_raster_job_thread_count;
@@ -298,6 +298,10 @@ void raster_worker_frame(int worker_id, RendererContext& ctx) {
         if (P >= RASTER_PASS_COUNT) break;
         RasterJobMode job_mode = (RasterJobMode)P;
 
+        // shadow_only pre-pass: bail the instant the shadow-depth pass is done
+        // (pass has advanced past it). We never run Color/SSAO/Luminaire here.
+        if (shadow_only && job_mode != RasterJobMode::ShadowDepth) break;
+
         if (job_mode == RasterJobMode::Ssao) {
             // Color fully drained: every remaining SSAO tile is now eligible.
             // Finish SSAO only; Luminaire waits for the dedicated pass (entered
@@ -436,6 +440,12 @@ void raster_worker_frame(int worker_id, RendererContext& ctx) {
         // Under the hard barrier we skip this so SSAO is confined to its pass.
         // Then block until the pass advances.
         if (job_mode == RasterJobMode::Color && !hard_barrier) { ssao_drain(); }
+
+        // shadow_only pre-pass: we've drained every claimable shadow tile (the
+        // remainder are owned by other workers). Return rather than block so the
+        // caller can move on to T&L while the last shadow tiles finish.
+        if (shadow_only) return;
+
         std::unique_lock<std::mutex> lk(mtx_pool);
         cv_pool.wait(lk, [&] {
             return raster_pass.load(std::memory_order_acquire) > P ||
