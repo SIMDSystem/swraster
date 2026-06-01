@@ -1,6 +1,6 @@
 // macOS native backend for the Platform layer (Objective-C++ / Cocoa).
 //
-// Replaces SDL on the desktop. We own the framebuffer as a small ring of
+// The native desktop backend. We own the framebuffer as a small ring of
 // IOSurfaces (shared CPU/GPU memory the window server can composite directly),
 // drive a Cocoa window + layer-backed view, and pump events with a
 // non-blocking nextEventMatchingMask poll so the renderer keeps its own loop.

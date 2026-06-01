@@ -10,7 +10,7 @@ TARGET = raster
 APP_NAME = Raster.app
 # Backend-independent + web sources. The web target uses exactly this list.
 SOURCES = main.cpp geometry.cpp platform.cpp pixel.cpp texture.cpp clip.cpp shadow.cpp draw.cpp threading.cpp physics_setup.cpp physics_pipeline.cpp scene.cpp tl_worker.cpp raster_worker.cpp pool_worker.cpp render_loop.cpp thread_profiler.cpp
-# Native (macOS) adds the Cocoa backend and links its frameworks. No SDL.
+# Native (macOS) adds the Cocoa backend and links its frameworks.
 NATIVE_SOURCES = $(SOURCES) platform_mac.mm
 NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework CoreGraphics -framework IOSurface
 ICON_PNG = icon.png
@@ -25,8 +25,8 @@ WEB_RASTER_THREADS ?= 14
 WEB_JOLT_WORKER_THREADS ?= 1
 WEB_PTHREAD_POOL_SIZE ?= 24
 WEB_MEMORY ?= 268435456
-# Web build deliberately does NOT link SDL. main.cpp's Platform layer talks
-# straight to the <canvas> + emscripten input/timing APIs on the web target.
+# The Platform layer talks straight to the <canvas> + emscripten input/timing
+# APIs on the web target.
 WEB_CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O2 -g2 -fno-omit-frame-pointer -fstrict-aliasing \
   -msimd128 -msse4.2 \
   -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) \

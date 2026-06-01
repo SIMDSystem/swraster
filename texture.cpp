@@ -20,7 +20,7 @@ std::unique_ptr<PackedTexture> make_packed_texture(Surface* src) {
     if (!src || !src->pixels || !src->format) return nullptr;
     auto tex = std::make_unique<PackedTexture>();
 
-    // Unpack into a canonical 0x00RRGGBB layout regardless of the SDL surface format.
+    // Unpack into a canonical 0x00RRGGBB layout regardless of the source surface format.
     PackedTextureLevel source;
     source.w = src->w;
     source.h = src->h;
