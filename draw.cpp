@@ -208,7 +208,11 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
         float dy = (float)y + 0.5f - ly;
         for (int x = x_min; x <= x_max; x++) {
             size_t idx = (size_t)y * screen_width + x;
-            if (lz > depth_buffer[idx] + 0.002f) continue;
+            // Same depth function as the scene and the cone
+            // (draw_triangle_barycentric_strip): keep only fragments strictly
+            // in front of the stored surface, no bias. A positive NDC bias here
+            // let the glare bleed through occluding geometry.
+            if (lz >= depth_buffer[idx]) continue;
             float dx = (float)x + 0.5f - lx;
             float d2 = dx * dx + dy * dy;
             if (d2 > disk_radius * disk_radius) continue;
