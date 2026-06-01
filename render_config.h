@@ -28,9 +28,10 @@ constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
 
 // Shadow map sizing + the 16-bit depth representation we store in the shadow
 // buffer. SHADOW_DEPTH_BIAS_U16 is the constant slope-independent bias added
-// to comparator samples to fight self-shadow acne; tuned empirically.
+// to comparator samples. We cast back faces into the map, so there's no
+// self-shadow acne to fight; the bias is kept small to minimize peter-panning.
 constexpr int          SHADOW_MAP_SIZE       = 1024;
-constexpr float        SHADOW_DEPTH_BIAS     = 0.0025f;
+constexpr float        SHADOW_DEPTH_BIAS     = 0.00125f;
 using ShadowDepth = uint16_t;
 constexpr ShadowDepth  SHADOW_DEPTH_CLEAR    = 0xffff;
 constexpr ShadowDepth  SHADOW_DEPTH_BIAS_U16 =
