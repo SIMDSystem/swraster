@@ -71,7 +71,7 @@ static inline void fill_rect(uint8_t* pixels, int pitch,
 void thread_profiler_draw(ThreadProfiler& p,
                           uint8_t* pixels, int pitch,
                           int surface_w, int surface_h,
-                          SDL_PixelFormat* format,
+                          PixelFormat* format,
                           Uint64 draw_end_ts) {
     if (!p.enabled.load(std::memory_order_relaxed)) return;
     if (!format) return;

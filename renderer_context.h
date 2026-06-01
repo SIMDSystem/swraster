@@ -28,7 +28,7 @@ struct ThreadProfiler;
 
 struct RendererContext {
     // ----- Window / framebuffer -----
-    SDL_Surface* fb              = nullptr; // re-fetched per-frame by the loop
+    Surface* fb                  = nullptr; // re-fetched per-frame by the loop
     int          screen_width    = 0;
     int          screen_height   = 0;
 

@@ -97,7 +97,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                                   const Eigen::Vector3f& p0_eye, float inv_w0,
                                   int x1, int y1, float z1,
                                   const Eigen::Vector3f& p1_eye, float inv_w1,
-                                  int w, int h, SDL_PixelFormat* format,
+                                  int w, int h, PixelFormat* format,
                                   const ShadowDepth* shadow_depth, int shadow_size,
                                   const Eigen::Vector3f& light_pos,
                                   const Eigen::Vector3f& spot_dir,
@@ -106,7 +106,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
 
 // Soft additive disk for the spotlight bulb. Depth-tested but not depth-writing.
 void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
-                              int screen_width, int screen_height, SDL_PixelFormat* format,
+                              int screen_width, int screen_height, PixelFormat* format,
                               const Eigen::Matrix4f& projection,
                               const Eigen::Vector3f& light_pos);
 
@@ -116,7 +116,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                      int screen_width, int screen_height,
                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2,
-                                     SDL_PixelFormat* format, const PackedTexture* texture,
+                                     PixelFormat* format, const PackedTexture* texture,
                                      const Eigen::Vector3f& light_dir,
                                      const Eigen::Vector3f& light_pos,
                                      const Eigen::Vector3f& spot_dir,
@@ -148,7 +148,7 @@ void build_luminaire_cone_tl(LuminaireConeBuffer& out,
 // position / direction / cone angle are still needed by the per-pixel
 // LuminaireCone shader for the rim falloff.
 void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
-                               int screen_width, int screen_height, SDL_PixelFormat* format,
+                               int screen_width, int screen_height, PixelFormat* format,
                                const LuminaireConeBuffer& cone,
                                const Eigen::Vector3f& light_pos,
                                const Eigen::Vector3f& spot_dir, float spot_outer_cos,
@@ -158,6 +158,6 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
 // Screen-space ambient occlusion modulated multiplicatively over the color
 // buffer using the live depth buffer as input.
 void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
-                      int screen_width, int screen_height, SDL_PixelFormat* format,
+                      int screen_width, int screen_height, PixelFormat* format,
                       int x_tile_min, int x_tile_max,
                       int y_strip_min, int y_strip_max);

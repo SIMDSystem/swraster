@@ -513,7 +513,7 @@ void run_render_loop(RendererContext& ctx) {
             continue;
         }
 
-        SDL_Surface* fb = Platform::GetFramebuffer();
+        Surface* fb = Platform::GetFramebuffer();
         if (!fb || !fb->format || fb->format->BytesPerPixel != 4) {
             camera_orbiting = false;
             last_physics_time = Platform::TicksMs();

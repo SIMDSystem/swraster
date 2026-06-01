@@ -19,7 +19,7 @@ const uint8_t font_5x7[10][7] = {
 } // anon
 
 void draw_digit(uint8_t* pixels, int pitch, int x, int y, int digit,
-                uint32_t color, SDL_PixelFormat* format) {
+                uint32_t color, PixelFormat* format) {
     if (digit < 0 || digit > 9) return;
     int bpp = format->BytesPerPixel;
     for (int row = 0; row < 7; row++) {
@@ -36,7 +36,7 @@ void draw_digit(uint8_t* pixels, int pitch, int x, int y, int digit,
 }
 
 void draw_number(uint8_t* pixels, int pitch, int x, int y, int number,
-                 uint8_t r, uint8_t g, uint8_t b, SDL_PixelFormat* format) {
+                 uint8_t r, uint8_t g, uint8_t b, PixelFormat* format) {
     uint32_t color = pack_rgb_fast(format, r, g, b);
     char buf[32];
     snprintf(buf, sizeof(buf), "%d", number);

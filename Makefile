@@ -8,9 +8,11 @@ CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -fl
 LDFLAGS = -flto=thin
 TARGET = raster
 APP_NAME = Raster.app
+# Backend-independent + web sources. The web target uses exactly this list.
 SOURCES = main.cpp geometry.cpp platform.cpp pixel.cpp texture.cpp clip.cpp shadow.cpp draw.cpp threading.cpp physics_setup.cpp physics_pipeline.cpp scene.cpp tl_worker.cpp raster_worker.cpp pool_worker.cpp render_loop.cpp thread_profiler.cpp
-SDL2_CFLAGS = $(shell sdl2-config --cflags)
-SDL2_LIBS = $(shell sdl2-config --libs)
+# Native (macOS) adds the Cocoa backend and links its frameworks. No SDL.
+NATIVE_SOURCES = $(SOURCES) platform_mac.mm
+NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework CoreGraphics -framework IOSurface
 ICON_PNG = icon.png
 WEB_BUILD_DIR = web_build
 JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/jolt_release
@@ -71,8 +73,8 @@ $(JOLT_LIB):
 	@mkdir -p $(JOLT_BUILD_DIR)
 	@cd $(JOLT_BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . --target Jolt
 
-$(TARGET): $(SOURCES) $(JOLT_LIB)
-	$(CXX) $(CXXFLAGS) $(SDL2_CFLAGS) -o $(TARGET) $(SOURCES) $(SDL2_LIBS) $(JOLT_LIB) $(LDFLAGS) -pthread
+$(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB)
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(NATIVE_SOURCES) $(JOLT_LIB) $(LDFLAGS) -pthread $(NATIVE_FRAMEWORKS)
 
 # Separate Emscripten/WebAssembly build. Native `all` and `app` targets are unchanged.
 $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt

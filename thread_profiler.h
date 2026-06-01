@@ -33,7 +33,7 @@
 
 #include "platform.h"
 
-struct SDL_PixelFormat;
+struct PixelFormat;
 
 struct ProfilerInterval {
     Uint64  start_ts;
@@ -181,5 +181,5 @@ inline void profiler_record_physics(ThreadProfiler& p,
 void thread_profiler_draw(ThreadProfiler& p,
                           uint8_t* pixels, int pitch,
                           int surface_w, int surface_h,
-                          SDL_PixelFormat* format,
+                          PixelFormat* format,
                           Uint64 draw_end_ts);

@@ -105,7 +105,7 @@ void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
 void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
                                   int x0, int y0, float z0, const Vector3f& p0_eye_in, float inv_w0,
                                   int x1, int y1, float z1, const Vector3f& p1_eye_in, float inv_w1,
-                                  int w, int h, SDL_PixelFormat* format,
+                                  int w, int h, PixelFormat* format,
                                   const ShadowDepth* shadow_depth, int shadow_size,
                                   const Vector3f& light_pos, const Vector3f& spot_dir,
                                   bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
@@ -191,7 +191,7 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
 }
 
 void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
-                              int screen_width, int screen_height, SDL_PixelFormat* format,
+                              int screen_width, int screen_height, PixelFormat* format,
                               const Matrix4f& projection, const Vector3f& light_pos) {
     float lx, ly, lz;
     if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
@@ -224,7 +224,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                      int screen_width, int screen_height,
                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2,
-                                     SDL_PixelFormat* format, const PackedTexture* texture,
+                                     PixelFormat* format, const PackedTexture* texture,
                                      const Vector3f& light_dir, const Vector3f& light_pos, const Vector3f& spot_dir,
                                      bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                      const ShadowDepth* shadow_depth, int shadow_size,
@@ -620,7 +620,7 @@ void build_luminaire_cone_tl(LuminaireConeBuffer& out,
 }
 
 void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
-                               int screen_width, int screen_height, SDL_PixelFormat* format,
+                               int screen_width, int screen_height, PixelFormat* format,
                                const LuminaireConeBuffer& cone,
                                const Vector3f& light_pos,
                                const Vector3f& spot_dir, float spot_outer_cos,
@@ -646,7 +646,7 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
 }
 
 void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
-                      int screen_width, int screen_height, SDL_PixelFormat* format,
+                      int screen_width, int screen_height, PixelFormat* format,
                       int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
     constexpr int kernel_size = 8;
     static constexpr int sample_offsets[kernel_size][2] = {

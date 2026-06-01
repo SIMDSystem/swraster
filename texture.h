@@ -21,12 +21,12 @@ struct PackedTexture {
     std::vector<PackedTextureLevel> levels;
 };
 
-// Build a mipmapped RGB texture from an SDL surface. The base level is
+// Build a mipmapped RGB texture from a Platform Surface. The base level is
 // resampled (nearest) to the largest power-of-two dimensions that fit in the
 // source, and subsequent mips are box-filtered. Returned via unique_ptr
 // because the texture is allocated once at scene setup and then borrowed by
 // instances by const PackedTexture*.
-std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src);
+std::unique_ptr<PackedTexture> make_packed_texture(Surface* src);
 
 static inline uint32_t sample_texture_bilinear(const PackedTextureLevel& level, float u, float v) {
     float fx = u * level.w - 0.5f;

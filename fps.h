@@ -34,7 +34,7 @@ struct FpsCounter {
     }
 
     // Draw the cached count in the top-right corner of the surface.
-    void draw(uint8_t* pixels, int pitch, int surface_w, SDL_PixelFormat* format) const {
+    void draw(uint8_t* pixels, int pitch, int surface_w, PixelFormat* format) const {
         const int fps_x = surface_w - 50;
         const int fps_y = 20;
         draw_number(pixels, pitch, fps_x, fps_y, fps, 255, 255, 255, format);

@@ -23,7 +23,7 @@
 //   - raster_worker.* : raster worker thread main
 //   - render_loop.*   : the per-frame loop body and reset_animation
 //   - clip / draw / shadow / texture / pixel : pure render math
-//   - platform.*      : SDL/Emscripten abstraction (windowing, input, blit, BMP)
+//   - platform.*      : windowing/input/blit/BMP abstraction (macOS Cocoa, web canvas)
 //   - geometry.*      : primitive generators (cube, sphere, torus, teapot)
 //   - renderer_context.h : the by-ref struct shared with workers and the loop
 //   - fps.h           : on-screen FPS counter
@@ -64,14 +64,14 @@
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 #include <mach-o/dyld.h>
 #include <limits.h>
-#endif
+    #endif
 
 using namespace JPH;
 using namespace Eigen;
 
 // macOS app-bundle aware texture loader. Tries bundled Resources first,
 // then falls back to ../Resources/ and the CWD for command-line runs.
-static SDL_Surface* load_texture(const char* basename) {
+static Surface* load_texture(const char* basename) {
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
     {
         char exe_path[PATH_MAX];
@@ -84,16 +84,16 @@ static SDL_Surface* load_texture(const char* basename) {
                     *macos_pos = '\0';
                     char texture_path[PATH_MAX];
                     snprintf(texture_path, PATH_MAX, "%s.app/Contents/Resources/%s", real_path, basename);
-                    SDL_Surface* s = Platform::LoadBMP(texture_path);
+                    Surface* s = Platform::LoadBMP(texture_path);
                     if (s) return s;
+                }
                 }
             }
         }
-    }
 #endif
     char path[256];
     snprintf(path, sizeof(path), "../Resources/%s", basename);
-    if (SDL_Surface* s = Platform::LoadBMP(path)) return s;
+    if (Surface* s = Platform::LoadBMP(path)) return s;
     return Platform::LoadBMP(basename);
 }
 
@@ -128,12 +128,12 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Platform::Init failed\n");
         return 1;
     }
-    SDL_Surface* fb = Platform::GetFramebuffer();
+    Surface* fb = Platform::GetFramebuffer();
 
     // ----- 3. Textures -----
-    SDL_Surface* surface_baboon = load_texture("baboon.bmp");
-    SDL_Surface* surface_lenna  = load_texture("lenna.bmp");
-    SDL_Surface* surface_tiles  = load_texture("tiles.bmp");
+    Surface* surface_baboon = load_texture("baboon.bmp");
+    Surface* surface_lenna  = load_texture("lenna.bmp");
+    Surface* surface_tiles  = load_texture("tiles.bmp");
     std::unique_ptr<PackedTexture> texture_baboon = make_packed_texture(surface_baboon);
     std::unique_ptr<PackedTexture> texture_lenna  = make_packed_texture(surface_lenna);
     std::unique_ptr<PackedTexture> texture_tiles  = make_packed_texture(surface_tiles);
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
     // ----- 5. Jolt physics + scene -----
     register_jolt_callbacks();
     JoltScope jolt_scope;
-
+    
     constexpr JPH::uint cMaxBodies             = 2048;
     constexpr JPH::uint cNumBodyMutexes        = 0;
     constexpr JPH::uint cMaxBodyPairs          = 65536;
@@ -185,11 +185,11 @@ int main(int argc, char** argv) {
                         broad_phase_layer_interface, object_vs_broadphase_layer_filter, object_vs_object_layer_filter);
     BodyInterface& body_interface = physics_system.GetBodyInterface();
     printf("Jolt: Physics Initialized\n");
-
+    
     std::vector<WallData> walls;
     build_tumbling_walls(body_interface, box_half, wall_thick, /*bounce=*/0.9f, walls);
     printf("Jolt: Tumbling container box created\n");
-
+    
     ShapeRefC torus_shape  = build_torus_compound_shape(1.0f, 0.36f, 12, 0.2f);
     ShapeRefC teapot_shape = build_teapot_compound_shape(0.5f, 8);
 
@@ -203,7 +203,7 @@ int main(int argc, char** argv) {
                              ground_y, instances);
     printf("Jolt: Created %zu physics bodies\n", instances.size());
     physics_system.OptimizeBroadPhase();
-
+    
     std::vector<InitialInstanceState> initial_instance_states =
         capture_initial_instance_states(instances, body_interface);
 

@@ -1,34 +1,34 @@
 #pragma once
-// Thin portable platform layer. The renderer talks to this header only.
-// On native we alias SDL2's types and forward to SDL2; on web we define our
-// own SDL_PixelFormat / SDL_Surface (matching SDL2's layout) and talk to
-// the browser canvas + the JS-side input pump directly.
+// Thin portable platform layer. The renderer talks to this header only. No
+// third-party windowing dependency: we own the pixel format + framebuffer
+// surface types outright, and each backend (macOS Cocoa, web <canvas>) fills
+// an RGBA8 buffer we hand to the renderer and blits it in Present().
+//
+// PixelFormat is a self-describing channel layout (masks/shifts/loss) so the
+// rasterizer's pack/unpack stay backend-agnostic — a backend picks whatever
+// byte order its present path wants and the renderer just follows the masks.
 
 #include <cstdint>
 
-#ifdef __EMSCRIPTEN__
 using Uint8  = uint8_t;
 using Uint32 = uint32_t;
 using Uint64 = uint64_t;
 
-struct SDL_PixelFormat {
+struct PixelFormat {
     int      BytesPerPixel;
     uint8_t  Rloss, Gloss, Bloss;
     uint8_t  Rshift, Gshift, Bshift;
     uint32_t Rmask, Gmask, Bmask, Amask;
 };
 
-struct SDL_Surface {
-    int              w;
-    int              h;
-    int              pitch;
-    void*            pixels;
-    SDL_PixelFormat* format;
-    bool             owns_pixels;
+struct Surface {
+    int          w;
+    int          h;
+    int          pitch;
+    void*        pixels;
+    PixelFormat* format;
+    bool         owns_pixels;
 };
-#else
-#include <SDL.h>
-#endif
 
 namespace Platform {
 
@@ -54,11 +54,10 @@ struct Event {
 bool Init(int w, int h, const char* title);
 void Shutdown();
 
-// The renderer's RGBA8 framebuffer surface. On native this is the SDL window's
-// surface; on web it's an in-memory buffer we own and blit to the canvas in
-// Present().
-SDL_Surface* GetFramebuffer();
-void         Present();
+// The renderer's RGBA8 framebuffer surface. We own this buffer on every
+// backend; Present() blits it to the platform's window/canvas.
+Surface* GetFramebuffer();
+void     Present();
 
 bool IsRenderable();
 bool PollEvent(Event& out);
@@ -73,7 +72,7 @@ Uint64 PerfFrequency();
 Uint64 ThreadCpuNs();
 void   Delay(Uint32 ms);
 
-SDL_Surface* LoadBMP(const char* path);
-void         FreeSurface(SDL_Surface* s);
+Surface* LoadBMP(const char* path);
+void     FreeSurface(Surface* s);
 
 } // namespace Platform

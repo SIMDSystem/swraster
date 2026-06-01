@@ -125,7 +125,7 @@ struct TLSharedData {
     float time;
     int   screen_width;
     int   screen_height;
-    SDL_PixelFormat* format;
+    PixelFormat* format;
     // Eye-space occluder list (type 0/1 instances), precomputed by main once
     // per frame. T&L workers consume read-only when running small-ball
     // (type 4) occlusion checks; the test cost is then O(occluders) per
@@ -172,7 +172,7 @@ struct RasterSharedData {
     float*   depth_buffer;
     int      screen_width;
     int      screen_height;
-    SDL_PixelFormat* format;
+    PixelFormat* format;
     uint32_t clear_color;
     Eigen::Matrix4f projection;
     Eigen::Vector3f light_dir;

@@ -16,7 +16,7 @@ int previous_power_of_two(int v) {
 }
 } // anon
 
-std::unique_ptr<PackedTexture> make_packed_texture(SDL_Surface* src) {
+std::unique_ptr<PackedTexture> make_packed_texture(Surface* src) {
     if (!src || !src->pixels || !src->format) return nullptr;
     auto tex = std::make_unique<PackedTexture>();
 

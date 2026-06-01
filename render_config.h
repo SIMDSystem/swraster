@@ -1,7 +1,7 @@
 #pragma once
 // Shared compile-time configuration and small POD typedefs used across the
-// rasterizer modules. No allocations, no Eigen, no SDL — keep this header
-// cheap to include from anywhere.
+// rasterizer modules. No allocations, no Eigen, no platform deps — keep this
+// header cheap to include from anywhere.
 
 #include <cstdint>
 #include <cmath>
@@ -37,7 +37,7 @@ constexpr ShadowDepth  SHADOW_DEPTH_BIAS_U16 =
     (ShadowDepth)(SHADOW_DEPTH_BIAS * 65535.0f + 1.0f);
 
 // 32-bpp pixel alias. The __may_alias__ attribute is needed under strict
-// aliasing because we reinterpret the SDL surface as a Pixel32 buffer.
+// aliasing because we reinterpret the framebuffer surface as a Pixel32 buffer.
 #if defined(__GNUC__) || defined(__clang__)
 typedef uint32_t Pixel32 __attribute__((may_alias));
 #else
