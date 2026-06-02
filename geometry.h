@@ -32,6 +32,13 @@ extern const float teapot_data[32][4][4][3];
 // Geometry generation functions
 void generate_cube(RenderVertexList& vertices, std::vector<Face>& faces);
 void generate_sphere(float radius, int slices, int stacks, RenderVertexList& vertices, std::vector<Face>& faces);
+// Sphere shell with a circular cap removed around the +Y pole, leaving an
+// opening of `opening_half_angle_deg`. The opening (+Y local axis) is meant to
+// be oriented along the spotlight beam so the lamp housing's mouth faces the
+// light direction.
+void generate_spotlight_housing(float radius, int slices, int stacks,
+                                float opening_half_angle_deg,
+                                RenderVertexList& vertices, std::vector<Face>& faces);
 void generate_torus(float main_radius, float tube_radius, int slices, int stacks, RenderVertexList& vertices, std::vector<Face>& faces);
 void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces);
 

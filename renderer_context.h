@@ -45,6 +45,8 @@ struct RendererContext {
     const std::vector<Face>* smallball_faces    = nullptr;
     const RenderVertexList* ground_vertices     = nullptr;
     const std::vector<Face>* ground_faces       = nullptr;
+    const RenderVertexList* lamp_vertices       = nullptr; // spotlight housing shell
+    const std::vector<Face>* lamp_faces         = nullptr;
 
     // ----- Per-type bounding sphere radii (constants once scene is built) -----
     float cube_bound_radius       = 0.0f;
@@ -53,6 +55,12 @@ struct RendererContext {
     float teapot_bound_radius     = 0.0f;
     float smallball_bound_radius  = 0.0f;
     float ground_bound_radius     = 0.0f;
+    float lamp_bound_radius       = 0.0f;
+
+    // Index into `instances` of the render-only spotlight-housing instance,
+    // or -1 if none (e.g. directional light). Its pose is injected analytically
+    // each frame in render_loop to track the moving light.
+    int   lamp_instance_index     = -1;
 
     // ----- Scene -----
     std::vector<CubeInstance>*               instances               = nullptr;

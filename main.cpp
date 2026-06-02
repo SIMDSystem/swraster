@@ -142,13 +142,16 @@ int main(int argc, char** argv) {
     if (surface_tiles)  Platform::FreeSurface(surface_tiles);
 
     // ----- 4. Geometry -----
-    RenderVertexList cube_vertices, sphere_vertices, torus_vertices, teapot_vertices, smallball_vertices, ground_vertices;
-    std::vector<Face>  cube_faces,    sphere_faces,    torus_faces,    teapot_faces,    smallball_faces,    ground_faces;
+    RenderVertexList cube_vertices, sphere_vertices, torus_vertices, teapot_vertices, smallball_vertices, ground_vertices, lamp_vertices;
+    std::vector<Face>  cube_faces,    sphere_faces,    torus_faces,    teapot_faces,    smallball_faces,    ground_faces,    lamp_faces;
     generate_cube  (cube_vertices,   cube_faces);
     generate_sphere(1.3f, 16, 16,    sphere_vertices, sphere_faces);
     generate_torus (1.0f, 0.4f, 32, 10, torus_vertices, torus_faces);
     generate_teapot(teapot_vertices, teapot_faces);
     generate_sphere(0.3f, 8, 6,      smallball_vertices, smallball_faces);
+    // Small spotlight housing: a sphere shell with a 35-deg opening carved at
+    // the +Y pole (the local beam axis). Oriented along the spotlight each frame.
+    generate_spotlight_housing(0.5f, 20, 12, 35.0f, lamp_vertices, lamp_faces);
 
     const float box_half   = 6.0f;
     const float wall_thick = 1.0f;
@@ -162,6 +165,7 @@ int main(int argc, char** argv) {
     const float teapot_bound_radius    = compute_bound_radius(teapot_vertices);
     const float smallball_bound_radius = compute_bound_radius(smallball_vertices);
     const float ground_bound_radius    = compute_bound_radius(ground_vertices);
+    const float lamp_bound_radius      = compute_bound_radius(lamp_vertices);
 
     // ----- 5. Jolt physics + scene -----
     register_jolt_callbacks();
@@ -203,7 +207,26 @@ int main(int argc, char** argv) {
                              ground_y, instances);
     printf("Jolt: Created %zu physics bodies\n", instances.size());
     physics_system.OptimizeBroadPhase();
-    
+
+    // Render-only spotlight housing (no physics body). Its pose is overwritten
+    // analytically each frame to sit at the light and aim its opening along the
+    // beam. Added before the initial-state capture / pose-snapshot init so the
+    // pose arrays are sized to include it.
+    int lamp_instance_index = -1;
+    if (USE_SPOTLIGHT) {
+        CubeInstance lamp;
+        lamp.tx = 0.0f; lamp.ty = 0.0f; lamp.tz = 0.0f;
+        lamp.rot_speed_x = lamp.rot_speed_y = lamp.rot_speed_z = 0.0f;
+        lamp.qx = lamp.qy = lamp.qz = 0.0f; lamp.qw = 1.0f;
+        lamp.texture = nullptr;
+        lamp.type = 6;
+        lamp.color_r = 0.85f; lamp.color_g = 0.85f; lamp.color_b = 0.90f;
+        lamp.shadow_screendoor_mask = -1;
+        lamp.body_id = JPH::BodyID();
+        lamp_instance_index = (int)instances.size();
+        instances.push_back(lamp);
+    }
+
     std::vector<InitialInstanceState> initial_instance_states =
         capture_initial_instance_states(instances, body_interface);
 
@@ -317,6 +340,7 @@ int main(int argc, char** argv) {
     ctx.teapot_vertices    = &teapot_vertices;    ctx.teapot_faces    = &teapot_faces;
     ctx.smallball_vertices = &smallball_vertices; ctx.smallball_faces = &smallball_faces;
     ctx.ground_vertices    = &ground_vertices;    ctx.ground_faces    = &ground_faces;
+    ctx.lamp_vertices      = &lamp_vertices;      ctx.lamp_faces      = &lamp_faces;
 
     ctx.cube_bound_radius      = cube_bound_radius;
     ctx.sphere_bound_radius    = sphere_bound_radius;
@@ -324,6 +348,8 @@ int main(int argc, char** argv) {
     ctx.teapot_bound_radius    = teapot_bound_radius;
     ctx.smallball_bound_radius = smallball_bound_radius;
     ctx.ground_bound_radius    = ground_bound_radius;
+    ctx.lamp_bound_radius      = lamp_bound_radius;
+    ctx.lamp_instance_index    = lamp_instance_index;
 
     ctx.instances               = &instances;
     ctx.initial_instance_states = &initial_instance_states;

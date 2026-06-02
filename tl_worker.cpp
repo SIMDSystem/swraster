@@ -121,6 +121,7 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 case 2: src_vertices = tl_shared.torus_vertices;     src_faces = tl_shared.torus_faces;     src_bound_radius = ctx.torus_bound_radius;     break;
                 case 3: src_vertices = tl_shared.teapot_vertices;    src_faces = tl_shared.teapot_faces;    src_bound_radius = ctx.teapot_bound_radius;    break;
                 case 4: src_vertices = tl_shared.smallball_vertices; src_faces = tl_shared.smallball_faces; src_bound_radius = ctx.smallball_bound_radius; break;
+                case 6: src_vertices = tl_shared.lamp_vertices;      src_faces = tl_shared.lamp_faces;      src_bound_radius = ctx.lamp_bound_radius;      break;
                 default: src_vertices = tl_shared.ground_vertices;   src_faces = tl_shared.ground_faces;    src_bound_radius = ctx.ground_bound_radius;    break;
             }
 
@@ -220,7 +221,11 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 const Vertex3D& v0_eye = eye_space_vertices[face.v0];
                 const Vertex3D& v1_eye = eye_space_vertices[face.v1];
                 const Vertex3D& v2_eye = eye_space_vertices[face.v2];
-                Vector3f base_color = (inst.texture == nullptr)
+                // Untextured instances use their uniform tint, EXCEPT the
+                // spotlight housing (type 6) which carries per-face colour
+                // (purple outer skin / white inner lining) authored in the
+                // geometry. Textured instances always use the per-face colour.
+                Vector3f base_color = (inst.texture == nullptr && inst.type != 6)
                     ? Vector3f(inst.color_r, inst.color_g, inst.color_b)
                     : Vector3f(face.r, face.g, face.b);
 

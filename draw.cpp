@@ -204,8 +204,20 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     float lx, ly, lz;
     if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
 
+    // Size the glare in 3D rather than as a fixed pixel radius: project a point
+    // offset from the light by a world radius slightly smaller than the
+    // spotlight housing sphere (radius 0.5), so the glow tracks the lamp's
+    // apparent size and shrinks with distance.
+    constexpr float glare_radius_3d = 0.42f;
+    float ex, ey, ez;
+    if (!project_eye_point(projection, light_pos + Vector3f(glare_radius_3d, 0.0f, 0.0f),
+                           screen_width, screen_height, ex, ey, ez)) {
+        return;
+    }
+    float disk_radius = fabsf(ex - lx);
+    if (disk_radius < 1.0f) disk_radius = 1.0f;
+
     // Depth-tested additive Gaussian lamp disk.
-    const float disk_radius = 14.0f;
     int x_min = std::max(0, (int)floorf(lx - disk_radius));
     int x_max = std::min(screen_width  - 1, (int)ceilf(lx + disk_radius));
     int y_min = std::max(0, (int)floorf(ly - disk_radius));

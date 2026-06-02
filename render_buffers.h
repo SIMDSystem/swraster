@@ -101,6 +101,8 @@ struct TLSharedData {
     const std::vector<Face>* smallball_faces;
     const RenderVertexList* ground_vertices;
     const std::vector<Face>* ground_faces;
+    const RenderVertexList* lamp_vertices;
+    const std::vector<Face>* lamp_faces;
     std::vector<RenderTriangle>* opaque_triangles;
     std::vector<RenderTriangle>* trans_triangles;
     std::vector<RenderTriangle>* shadow_triangles;

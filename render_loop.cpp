@@ -496,7 +496,7 @@ void run_render_loop(RendererContext& ctx) {
                     }
                     break;
                 case Platform::Event::MouseWheel:
-                    camera_distance *= powf(0.88f, (float)event.wheel_y);
+                    camera_distance *= powf(0.97f, (float)event.wheel_y);
                     if (camera_distance <  4.0f) camera_distance =  4.0f;
                     if (camera_distance > 80.0f) camera_distance = 80.0f;
                     break;
@@ -596,6 +596,22 @@ void run_render_loop(RendererContext& ctx) {
             Vector3f light_target_eye = (view_matrix * Vector4f(light_target_world.x(), light_target_world.y(), light_target_world.z(), 1.0f)).head<3>();
             spot_dir_eye = (light_target_eye - light_pos_eye).normalized();
             light_dir = spot_dir_eye;
+
+            // Park the render-only spotlight housing at the light, with its
+            // local +Y opening aimed down the beam. We write the pose into the
+            // slot T&L reads this frame (pose_read_idx); the physics worker only
+            // ever writes the opposite ring slot, so this is race-free. This
+            // also lands before the occlusion/sort loop below, so the housing
+            // sorts with a correct eye-space depth.
+            if (ctx.lamp_instance_index >= 0) {
+                Vector3f beam = (light_target_world - light_pos_world).normalized();
+                Eigen::Quaternionf q;
+                q.setFromTwoVectors(Vector3f(0.0f, 1.0f, 0.0f), beam);
+                InstancePose& lp = pp.pose_snapshots[pose_read_idx].poses[ctx.lamp_instance_index];
+                lp.tx = light_pos_world.x(); lp.ty = light_pos_world.y(); lp.tz = light_pos_world.z();
+                lp.qx = q.x(); lp.qy = q.y(); lp.qz = q.z(); lp.qw = q.w();
+            }
+
             Matrix4f light_view_world = lookAt(light_pos_world, light_target_world, Vector3f(0.0f, 1.0f, 0.0f));
             shadow_view_matrix = light_view_world * view_matrix.inverse();
             shadow_matrix = build_spot_shadow_tex_matrix(shadow_view_matrix, 60.0f, shadow_near, shadow_far);
@@ -683,6 +699,8 @@ void run_render_loop(RendererContext& ctx) {
         tl_shared.smallball_faces     = ctx.smallball_faces;
         tl_shared.ground_vertices     = ctx.ground_vertices;
         tl_shared.ground_faces        = ctx.ground_faces;
+        tl_shared.lamp_vertices       = ctx.lamp_vertices;
+        tl_shared.lamp_faces          = ctx.lamp_faces;
         tl_shared.opaque_triangles    = &ctx.opaque_buffers[tl_buf_idx].triangles;
         tl_shared.trans_triangles     = &ctx.trans_buffers [tl_buf_idx].triangles;
         tl_shared.shadow_triangles    = &ctx.shadow_buffers[tl_buf_idx].triangles;

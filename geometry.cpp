@@ -152,7 +152,7 @@ void generate_sphere(float radius, int slices, int stacks, RenderVertexList& ver
         for (int j = 0; j < slices; ++j) {
             int first = (i * (slices + 1)) + j;
             int second = first + slices + 1;
-            
+
             // Triangle 1
             Face f1;
             f1.v0 = first;
@@ -160,7 +160,7 @@ void generate_sphere(float radius, int slices, int stacks, RenderVertexList& ver
             f1.v2 = second;    // Swapped
             f1.r = 1.0f; f1.g = 1.0f; f1.b = 1.0f; f1.a = 1.0f;
             faces.push_back(f1);
-            
+
             // Triangle 2
             Face f2;
             f2.v0 = second;
@@ -168,6 +168,72 @@ void generate_sphere(float radius, int slices, int stacks, RenderVertexList& ver
             f2.v2 = second + 1; // Swapped
             f2.r = 1.0f; f2.g = 1.0f; f2.b = 1.0f; f2.a = 1.0f;
             faces.push_back(f2);
+        }
+    }
+}
+
+void generate_spotlight_housing(float radius, int slices, int stacks,
+                                float opening_half_angle_deg,
+                                RenderVertexList& vertices, std::vector<Face>& faces) {
+    vertices.clear();
+    faces.clear();
+
+    // Two-sided shell built as two stacked vertex blocks sharing the same
+    // UV-sphere layout (poles along Y, y = -cos(phi) so phi = PI is the +Y
+    // pole; the opening is carved around +Y, the local beam axis):
+    //   block 0 [0, vcount)        outward normals -> outer skin   (purple)
+    //   block 1 [vcount, 2*vcount) inward  normals -> inner lining (white)
+    // The renderer back-face culls, so emitting both blocks (the inner one
+    // reverse-wound) makes the housing visible from outside AND through the
+    // mouth, with no two-sided rasterizer support needed.
+    const int ring   = slices + 1;
+    const int vcount = (stacks + 1) * ring;
+    for (int block = 0; block < 2; ++block) {
+        float nsign = (block == 0) ? 1.0f : -1.0f;
+        for (int i = 0; i <= stacks; ++i) {
+            float v = (float)i / (float)stacks;
+            float phi = v * (float)M_PI;
+            for (int j = 0; j <= slices; ++j) {
+                float u = (float)j / (float)slices;
+                float theta = u * 2.0f * (float)M_PI;
+                float x = -cosf(theta) * sinf(phi);
+                float y = -cosf(phi);
+                float z = sinf(theta) * sinf(phi);
+                Vertex3D vert(x * radius, y * radius, z * radius);
+                vert.normal = Vector3f(nsign * x, nsign * y, nsign * z);
+                vert.u = u;
+                vert.v = v;
+                vertices.push_back(vert);
+            }
+        }
+    }
+
+    // Purple outer skin, white inner lining (carried as per-face colour; the
+    // T&L lamp path reads face colour rather than the uniform instance tint).
+    const float out_r = 0.55f, out_g = 0.08f, out_b = 0.85f;
+    const float in_r  = 1.0f,  in_g  = 1.0f,  in_b  = 1.0f;
+
+    // Drop every quad whose entire span lies inside the opening cone around the
+    // +Y pole. A vertex's angle from +Y has cosine equal to its unit y, so the
+    // opening is { y > cos(open_half_angle) }. The topmost (max-y) row of quad i
+    // is row i+1, so the quad survives only when row i+1 is at or below the rim.
+    float open_cos = cosf(opening_half_angle_deg * (float)M_PI / 180.0f);
+    for (int i = 0; i < stacks; ++i) {
+        float phi_top = (float)(i + 1) / (float)stacks * (float)M_PI;
+        float y_top   = -cosf(phi_top);
+        if (y_top > open_cos) continue; // quad falls within the carved opening
+        for (int j = 0; j < slices; ++j) {
+            int first  = (i * ring) + j;
+            int second = first + ring;
+
+            // Outer skin: outward normals, original winding -> purple.
+            faces.push_back(Face{first,  first + 1, second,     out_r, out_g, out_b, 1.0f});
+            faces.push_back(Face{second, first + 1, second + 1, out_r, out_g, out_b, 1.0f});
+
+            // Inner lining: inward-normal block, reverse winding -> white.
+            int fi = first + vcount, si = second + vcount;
+            faces.push_back(Face{fi, si,     fi + 1, in_r, in_g, in_b, 1.0f});
+            faces.push_back(Face{si, si + 1, fi + 1, in_r, in_g, in_b, 1.0f});
         }
     }
 }
