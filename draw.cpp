@@ -34,6 +34,14 @@ RasterTriangleSetup build_raster_triangle_setup(const VertexVaryings& v0,
     setup.A1 = v0.y - v2.y; setup.B1 = v2.x - v0.x;
     setup.A2 = v1.y - v0.y; setup.B2 = v0.x - v1.x;
 
+    // Edge values at the shared origin (pixel-center of pixel (0,0) = (0.5,0.5)),
+    // so per-tile seeding is w_i(x_min,y_min) = A_i*x_min + B_i*y_min + K_i with
+    // x_min/y_min the integer tile origin. Computed once per triangle; the huge
+    // (near-hither) vertex coordinate is absorbed here, not re-subtracted per tile.
+    setup.K0 = setup.A0 * (0.5f - v2.x) + setup.B0 * (0.5f - v2.y);
+    setup.K1 = setup.A1 * (0.5f - v0.x) + setup.B1 * (0.5f - v0.y);
+    setup.K2 = setup.A2 * (0.5f - v1.x) + setup.B2 * (0.5f - v1.y);
+
     setup.u0_w  = v0.u  * v0.inv_w; setup.u1_w  = v1.u  * v1.inv_w; setup.u2_w  = v2.u  * v2.inv_w;
     setup.v0_w  = v0.v  * v0.inv_w; setup.v1_w  = v1.v  * v1.inv_w; setup.v2_w  = v2.v  * v2.inv_w;
     setup.nx0_w = v0.nx * v0.inv_w; setup.nx1_w = v1.nx * v1.inv_w; setup.nx2_w = v2.nx * v2.inv_w;
@@ -264,11 +272,16 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     float A1 = setup->A1, B1 = setup->B1;
     float A2 = setup->A2, B2 = setup->B2;
 
-    float px0 = (float)x_min + 0.5f;
-    float py0 = (float)y_min + 0.5f;
-    float w0_row = A0 * (px0 - v2.x) + B0 * (py0 - v2.y);
-    float w1_row = A1 * (px0 - v0.x) + B1 * (py0 - v0.y);
-    float w2_row = A2 * (px0 - v1.x) + B2 * (py0 - v1.y);
+    // Seed the row accumulators from the triangle's shared edge constants and
+    // the integer tile origin: w_i = A_i*x_min + B_i*y_min + K_i. K_i already
+    // includes the pixel-center (+0.5) offset and the vertex anchor, computed
+    // once per triangle, so the edge value at a pixel is the same no matter
+    // which tile evaluates it (watertight shared edges near the near plane).
+    float fx0 = (float)x_min;
+    float fy0 = (float)y_min;
+    float w0_row = A0 * fx0 + B0 * fy0 + setup->K0;
+    float w1_row = A1 * fx0 + B1 * fy0 + setup->K1;
+    float w2_row = A2 * fx0 + B2 * fy0 + setup->K2;
 
     // Per-vertex attributes pre-multiplied by 1/w for perspective-correct interpolation.
     float u0_w  = setup->u0_w,  u1_w  = setup->u1_w,  u2_w  = setup->u2_w;

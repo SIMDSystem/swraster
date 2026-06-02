@@ -6,8 +6,12 @@
 #include <cstdint>
 #include <cmath>
 
-// Near/far clip planes for the camera projection matrix.
-constexpr float NEAR_PLANE       = 0.1f;
+// Near/far clip planes for the camera projection matrix. NEAR_PLANE also drives
+// the geometry near-clip (clip_triangle_near) and the per-instance clip gate.
+// Held at 1.0 (not the usual 0.1) to cap 1/w on near-clipped vertices at ~1
+// instead of ~10, shrinking the worst-case projected screen coordinate ~10x and
+// the resulting edge-function precision error on hither-grazing triangles.
+constexpr float NEAR_PLANE       = 1.0f;
 constexpr float CAMERA_FAR_PLANE = 200.0f;
 
 // Render feature toggles. Flat constexpr instead of macros so the compiler

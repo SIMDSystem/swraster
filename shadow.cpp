@@ -245,11 +245,19 @@ void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
         A2 = -A2; B2 = -B2;
     }
 
-    float px0 = (float)x_min + 0.5f;
-    float py0 = (float)y_min + 0.5f;
-    float w0_row = A0 * (px0 - v2.x) + B0 * (py0 - v2.y);
-    float w1_row = A1 * (px0 - v0.x) + B1 * (py0 - v0.y);
-    float w2_row = A2 * (px0 - v1.x) + B2 * (py0 - v1.y);
+    // Seed the row accumulators from shared edge constants + the integer tile
+    // origin: w_i = A_i*x_min + B_i*y_min + K_i, where K_i is the edge function
+    // at the pixel-center of pixel (0,0). Computed once per triangle, so the
+    // edge value at a pixel is the same regardless of which tile evaluates it —
+    // watertight shared edges. Avoids folding the (near-hither, large) vertex
+    // coordinate into a per-tile subtraction, which rounded differently per
+    // tile and cracked shared edges near the shadow near plane.
+    float K0 = A0 * (0.5f - v2.x) + B0 * (0.5f - v2.y);
+    float K1 = A1 * (0.5f - v0.x) + B1 * (0.5f - v0.y);
+    float K2 = A2 * (0.5f - v1.x) + B2 * (0.5f - v1.y);
+    float w0_row = A0 * (float)x_min + B0 * (float)y_min + K0;
+    float w1_row = A1 * (float)x_min + B1 * (float)y_min + K1;
+    float w2_row = A2 * (float)x_min + B2 * (float)y_min + K2;
 
     // Inside the (sign-normalized) triangle w0+w1+w2 == |area_signed|. Each
     // w_i is -2*signed_area(P, v_j, v_k) (then sign-flipped for CCW), and the

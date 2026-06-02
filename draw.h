@@ -27,6 +27,14 @@ struct RasterTriangleSetup {
     int  x_min = 0, x_max = -1, y_min = 0, y_max = -1;
     float area = 0.0f;
     float A0 = 0.0f, B0 = 0.0f, A1 = 0.0f, B1 = 0.0f, A2 = 0.0f, B2 = 0.0f;
+    // Edge functions evaluated once at a single shared origin (pixel-center of
+    // pixel (0,0)): w_i(x,y) = A_i*x + B_i*y + K_i. Every tile seeds its row
+    // accumulator from these common constants plus the integer tile origin, so
+    // the edge value at a given pixel is independent of which tile drew it.
+    // This avoids folding the (possibly huge, near-hither) vertex coordinate
+    // into a per-tile subtraction, which rounded differently per tile and
+    // cracked shared edges (e.g. the ground quad) near the near plane.
+    float K0 = 0.0f, K1 = 0.0f, K2 = 0.0f;
     float u0_w  = 0.0f, u1_w  = 0.0f, u2_w  = 0.0f;
     float v0_w  = 0.0f, v1_w  = 0.0f, v2_w  = 0.0f;
     float nx0_w = 0.0f, nx1_w = 0.0f, nx2_w = 0.0f;
