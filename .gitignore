@@ -1,13 +1,9 @@
-# Build outputs
-raster
+# Build outputs (everything lands under build/)
+build/
+out/
 *.o
 *.d
 *.dSYM/
-build/
-out/
-
-# Generated app bundle
-Raster.app/
 
 # Temporary icon generation output
 *.iconset/

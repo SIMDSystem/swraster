@@ -20,7 +20,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--bind", default="127.0.0.1")
-    ap.add_argument("--dir",  default="web_build")
+    ap.add_argument("--dir",  default="build/web_build")
     args = ap.parse_args()
     serve_dir = Path(args.dir).resolve()
 
