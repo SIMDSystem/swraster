@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <vector>
 
 #include "pixel.h"
 #include "shadow.h"
@@ -246,6 +247,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
 // This is the renderer's main pixel shader; it's kept in one flat function
 // so the inner loop stays predictable to the optimizer.
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                                     float* normal_buffer, float* linear_z,
                                      int screen_width, int screen_height,
                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2,
                                      PixelFormat* format, const PackedTexture* texture,
@@ -570,7 +572,36 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
             }
 
             row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
-            if (depth_write) row_depth[x] = z;
+            if (depth_write) {
+                row_depth[x] = z;
+                // Final linear eye-space depth for SSAO: eye_depth = 1/inv_w.
+                // inv_w is the screen-affine interpolated 1/w already formed for
+                // perspective-correct attributes, so this is just one reciprocal
+                // + store on the winning fragment — no NDC->eye work in SSAO.
+                if (linear_z) linear_z[(size_t)y * screen_width + x] = 1.0f / inv_w;
+                // Stash the smooth eye-space shading normal for SSAO so it
+                // orients its hemisphere off the interpolated vertex normal
+                // (no faceting) rather than a depth-derivative normal.
+                if (normal_buffer) {
+                    float nnx, nny, nnz;
+                    if (perspective_correct_normals) {
+                        nnx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
+                        nny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
+                        nnz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+                    } else {
+                        nnx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
+                        nny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
+                        nnz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
+                    }
+                    float nl2 = nnx * nnx + nny * nny + nnz * nnz;
+                    if (nl2 > 1e-12f) {
+                        float invn = 1.0f / sqrtf(nl2);
+                        nnx *= invn; nny *= invn; nnz *= invn;
+                    }
+                    float* nb = normal_buffer + ((size_t)y * screen_width + x) * 3;
+                    nb[0] = nnx; nb[1] = nny; nb[2] = nnz;
+                }
+            }
 
             w0 += A0; w1 += A1; w2 += A2;
         }
@@ -662,7 +693,7 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
         // Inert (failed-projection) slots have zero inv_w on all vertices —
         // draw_triangle_barycentric_strip's degenerate-area check rejects
         // them cheaply, so no extra guard needed here.
-        draw_triangle_barycentric_strip(pixels, pitch, depth_buffer,
+        draw_triangle_barycentric_strip(pixels, pitch, depth_buffer, nullptr, nullptr,
                                         screen_width, screen_height,
                                         tri.v0, tri.v1, tri.v2,
                                         format, nullptr,
@@ -674,116 +705,151 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
     }
 }
 
-void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
+void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
+                      const float* normal_buffer,
                       int screen_width, int screen_height, PixelFormat* format,
-                      int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max) {
-    constexpr int kernel_size = 8;
-    static constexpr int sample_offsets[kernel_size][2] = {
-        { 2,  0}, {-2,  0}, { 0,  2}, { 0, -2},
-        { 6,  5}, {-6,  5}, { 6, -5}, {-6, -5}
-    };
-    constexpr float near_plane = 0.1f;
-    constexpr float far_plane  = CAMERA_FAR_PLANE;
-    constexpr float proj_a = (far_plane + near_plane) / (near_plane - far_plane);
-    constexpr float proj_b = (2.0f * far_plane * near_plane) / (near_plane - far_plane);
-    constexpr float angle_bias        = 0.12f;
-    constexpr float sample_radius     = 3.25f;
-    constexpr float sample_radius2    = sample_radius * sample_radius;
-    constexpr float max_occlusion     = 0.9f;
-    constexpr float inv_sample_radius = 1.0f / sample_radius;
-    constexpr float inv_sample_count  = 1.0f / (float)kernel_size;
-    constexpr float inv_angle_range   = 1.0f / (1.0f - angle_bias);
-    int sample_linear_offsets[kernel_size];
-    for (int i = 0; i < kernel_size; i++) {
-        sample_linear_offsets[i] = sample_offsets[i][1] * screen_width + sample_offsets[i][0];
-    }
-    float f      = 1.0f / tanf(60.0f * (float)M_PI / 360.0f);
-    float aspect = (float)screen_width / (float)screen_height;
-    float x_scale = aspect / f;
-    float y_scale = 1.0f / f;
+                      int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max,
+                      uint32_t frame_index,
+                      float proj00, float proj11) {
+    // Canonical hemisphere SSAO (the LearnOpenGL / Crytek-lineage estimator):
+    // for each pixel we reconstruct its eye-space position P and read the
+    // *smooth* eye-space shading normal N stashed by the Color pass (using the
+    // depth-derivative normal here is what "polygonized" low-poly surfaces).
+    // We place a kernel of points in the unit hemisphere around N, scaled by a
+    // world-space radius, PROJECT each back to the screen, read the depth there
+    // and ask "is the real surface in front of my sample point?". A smoothstep
+    // range check fades out occluders that are too far in depth (kills halos).
+    //
+    // Depth comes from the linear eye-Z G-buffer the Color pass already wrote
+    // (= 1/inv_w per pixel), so SSAO reads eye depth directly — no NDC->eye
+    // linearization, no per-tile scratch copy. The kernel reaches at most
+    // ssao_max_radius_px (capped below), which is why an SSAO tile only needs
+    // its 8 Color-neighbours done to overlap the Color pass.
+    constexpr int   kernel_size  = 8;
+    constexpr float world_radius = 0.7f;   // hemisphere radius, world units
+    constexpr float depth_bias   = 0.03f;  // world units, kills self-occlusion acne
+    constexpr float ao_intensity = 1.25f;
+    constexpr float max_occlusion = 0.92f;
+    constexpr int   ssao_max_radius_px = 16;          // hard cap on screen reach
+    constexpr float min_eye_clamp      = world_radius * 1.5f;
+    constexpr float sky_z              = LINEAR_Z_SKY * 0.5f; // >= this => background
+
+    // Hemisphere kernel in tangent space (+z = normal), points clustered toward
+    // the centre (more weight on near occluders) via a squared-distance ramp.
+    struct KernelTable { float x[kernel_size], y[kernel_size], z[kernel_size]; };
+    static const KernelTable kern = []{
+        KernelTable t{};
+        uint32_t s = 0x9e3779b9u;
+        auto rnd = [&]{ s ^= s << 13; s ^= s >> 17; s ^= s << 5; return (s & 0xffffffu) / 16777216.0f; };
+        for (int i = 0; i < kernel_size; i++) {
+            float vx = rnd() * 2.0f - 1.0f;
+            float vy = rnd() * 2.0f - 1.0f;
+            float vz = rnd();                 // hemisphere: z >= 0
+            float l  = sqrtf(vx*vx + vy*vy + vz*vz);
+            if (l < 1e-4f) { vx = 0; vy = 0; vz = 1; l = 1; }
+            vx /= l; vy /= l; vz /= l;
+            float f = (float)i / (float)kernel_size;
+            float scale = 0.1f + 0.9f * f * f;  // cluster near origin
+            t.x[i] = vx * scale; t.y[i] = vy * scale; t.z[i] = vz * scale;
+        }
+        return t;
+    }();
+
+    float x_scale = 1.0f / proj00;
+    float y_scale = 1.0f / proj11;
     float inv_screen_width  = 1.0f / (float)screen_width;
     float inv_screen_height = 1.0f / (float)screen_height;
-
-    auto linear_eye_depth = [](float ndc_z) {
-        return proj_b / (ndc_z + proj_a);
-    };
-    auto reconstruct_position = [&](int x, int y, float ndc_z, float& px, float& py, float& pz) {
-        float depth = linear_eye_depth(ndc_z);
-        float ndc_x = (((float)x + 0.5f) * inv_screen_width)  * 2.0f - 1.0f;
-        float ndc_y = 1.0f - (((float)y + 0.5f) * inv_screen_height) * 2.0f;
-        px = ndc_x * depth * x_scale;
-        py = ndc_y * depth * y_scale;
-        pz = -depth;
-    };
+    // Vertical focal length in pixels: projects a world radius to a screen
+    // radius via focal_px / eye_depth.
+    float focal_px = 0.5f * (float)screen_height * proj11;
 
     for (int y = y_strip_min; y <= y_strip_max; y++) {
         Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
         size_t   row_base   = (size_t)y * screen_width;
-        const float* row_depth = depth_buffer + row_base;
+        const float* lz_row = linear_z + row_base;
         for (int x = x_tile_min; x <= x_tile_max; x++) {
-            size_t center_idx = row_base + x;
-            float  center_z   = row_depth[x];
-            if (center_z >= 0.999f) continue;
-            float cx, cy, cz;
-            reconstruct_position(x, y, center_z, cx, cy, cz);
+            float eye_depth = lz_row[x];
+            if (eye_depth >= sky_z) continue;       // sky / background
 
-            int xl = std::max(0, x - 1);
-            int xr = std::min(screen_width  - 1, x + 1);
-            int yu = std::max(0, y - 1);
-            int yd = std::min(screen_height - 1, y + 1);
-            float zl = row_depth[xl];
-            float zr = row_depth[xr];
-            float zu = depth_buffer[center_idx - (y > 0 ? screen_width : 0)];
-            float zd = depth_buffer[center_idx + (y + 1 < screen_height ? screen_width : 0)];
-            if (zl >= 0.999f || zr >= 0.999f || zu >= 0.999f || zd >= 0.999f) continue;
+            // Center eye-space position straight from the linear-Z G-buffer.
+            float cz = -eye_depth;
+            float ndc_x = (((float)x + 0.5f) * inv_screen_width)  * 2.0f - 1.0f;
+            float ndc_y = 1.0f - (((float)y + 0.5f) * inv_screen_height) * 2.0f;
+            float cx = ndc_x * eye_depth * x_scale;
+            float cy = ndc_y * eye_depth * y_scale;
 
-            float plx, ply, plz, prx, pry, prz, pux, puy, puz, pdx, pdy, pdz;
-            reconstruct_position(xl, y,  zl, plx, ply, plz);
-            reconstruct_position(xr, y,  zr, prx, pry, prz);
-            reconstruct_position(x,  yu, zu, pux, puy, puz);
-            reconstruct_position(x,  yd, zd, pdx, pdy, pdz);
+            // Smooth eye-space normal from the G-buffer, oriented toward the eye.
+            const float* nb = normal_buffer + ((size_t)row_base + x) * 3;
+            float nx = nb[0], ny = nb[1], nz = nb[2];
+            if (nx * nx + ny * ny + nz * nz < 0.25f) continue; // unwritten / degenerate
+            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) { nx = -nx; ny = -ny; nz = -nz; }
 
-            float dx_x = prx - plx, dx_y = pry - ply, dx_z = prz - plz;
-            float dy_x = pdx - pux, dy_y = pdy - puy, dy_z = pdz - puz;
-            float nx = dy_y * dx_z - dy_z * dx_y;
-            float ny = dy_z * dx_x - dy_x * dx_z;
-            float nz = dy_x * dx_y - dy_y * dx_x;
-            float normal_len2 = nx * nx + ny * ny + nz * nz;
-            if (normal_len2 <= 0.000001f) continue;
-            float inv_normal_len = 1.0f / sqrtf(normal_len2);
-            nx *= inv_normal_len; ny *= inv_normal_len; nz *= inv_normal_len;
-            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) {
-                nx = -nx; ny = -ny; nz = -nz;
-            }
+            // Per-pixel rotation angle (interleaved gradient noise), advanced
+            // every frame so the dither is spatial + temporal.
+            float fphase = 5.588238f * (float)(frame_index & 63u);
+            float na = 0.06711056f * (float)x + 0.00583715f * (float)y + fphase;
+            na = 52.9829189f * (na - floorf(na));
+            float ang = (na - floorf(na)) * 6.28318531f;
+            float rcos = cosf(ang), rsin = sinf(ang);
+
+            // Build a TBN from N and the rotated in-plane direction.
+            float rvx = rcos, rvy = rsin, rvz = 0.0f;
+            float rdotn = rvx * nx + rvy * ny + rvz * nz;
+            float tx = rvx - nx * rdotn, ty = rvy - ny * rdotn, tz = rvz - nz * rdotn;
+            float tl2 = tx * tx + ty * ty + tz * tz;
+            if (tl2 < 1e-6f) { tx = 1.0f - nx * nx; ty = -nx * ny; tz = -nx * nz; tl2 = tx*tx+ty*ty+tz*tz; }
+            float invt = 1.0f / sqrtf(tl2);
+            tx *= invt; ty *= invt; tz *= invt;
+            float bx = ny * tz - nz * ty;
+            float by = nz * tx - nx * tz;
+            float bz = nx * ty - ny * tx;
+
+            float clamped_depth = eye_depth < min_eye_clamp ? min_eye_clamp : eye_depth;
+            float radius = world_radius * (eye_depth / clamped_depth); // shrink only when extremely close
+            // Cap the kernel's screen reach to ssao_max_radius_px: closer
+            // surfaces clamp the world radius down so a tile never samples more
+            // than one tile away (keeps the 3x3 opportunistic overlap valid).
+            float max_world = (float)ssao_max_radius_px * eye_depth / focal_px;
+            if (radius > max_world) radius = max_world;
 
             float occlusion = 0.0f;
             for (int i = 0; i < kernel_size; i++) {
-                int sx = x + sample_offsets[i][0];
-                int sy = y + sample_offsets[i][1];
+                float kx = kern.x[i], ky = kern.y[i], kz = kern.z[i];
+                // Tangent-space kernel sample -> eye space, offset from P.
+                float ox = tx * kx + bx * ky + nx * kz;
+                float oy = ty * kx + by * ky + ny * kz;
+                float oz = tz * kx + bz * ky + nz * kz;
+                float spx = cx + ox * radius;
+                float spy = cy + oy * radius;
+                float spz = cz + oz * radius;
+                if (spz >= -0.0001f) continue;          // behind / at the eye
+
+                // Project the eye-space sample to a pixel (perspective divide).
+                float clip_w = -spz;                    // proj(3,2) = -1
+                float s_ndc_x = (proj00 * spx) / clip_w;
+                float s_ndc_y = (proj11 * spy) / clip_w;
+                int sx = (int)lrintf((s_ndc_x + 1.0f) * 0.5f * (float)screen_width  - 0.5f);
+                int sy = (int)lrintf((1.0f - s_ndc_y) * 0.5f * (float)screen_height - 0.5f);
                 if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
 
-                size_t sample_idx = (size_t)((ptrdiff_t)center_idx + sample_linear_offsets[i]);
-                float  sample_z   = depth_buffer[sample_idx];
-                if (sample_z >= 0.999f) continue;
+                // Real surface eye z at the sample pixel, read directly from the
+                // linear-Z G-buffer. Background reads LINEAR_Z_SKY -> geom_z very
+                // negative -> never counts as an occluder in front of the sample.
+                float geom_z = -linear_z[(size_t)sy * screen_width + sx];
 
-                float spx, spy, spz;
-                reconstruct_position(sx, sy, sample_z, spx, spy, spz);
-                float dx = spx - cx;
-                float dy = spy - cy;
-                float dz = spz - cz;
-                float dist2 = dx * dx + dy * dy + dz * dz;
-                if (dist2 > 0.000001f && dist2 < sample_radius2) {
-                    float dist     = sqrtf(dist2);
-                    float inv_dist = 1.0f / dist;
-                    float hemisphere = (nx * dx + ny * dy + nz * dz) * inv_dist;
-                    if (hemisphere > angle_bias) {
-                        float normal_weight = (hemisphere - angle_bias) * inv_angle_range;
-                        occlusion += normal_weight * (1.0f - dist * inv_sample_radius);
-                    }
+                // Occluded when the real surface sits in front of the sample
+                // point (closer to the eye => larger, less-negative z).
+                if (geom_z >= spz + depth_bias) {
+                    float range_check = world_radius / fabsf(cz - geom_z);
+                    if (range_check > 1.0f) range_check = 1.0f;
+                    range_check = range_check * range_check * (3.0f - 2.0f * range_check); // smoothstep
+                    occlusion += range_check;
                 }
             }
 
-            float ao = 1.0f - fminf(max_occlusion, (occlusion * inv_sample_count) * max_occlusion * 1.8f);
+            float ao = 1.0f - (occlusion / (float)kernel_size) * ao_intensity;
+            float ao_floor = 1.0f - max_occlusion;
+            if (ao < ao_floor) ao = ao_floor;
             if (ao >= 0.999f) continue;
 
             uint8_t r, g, b;

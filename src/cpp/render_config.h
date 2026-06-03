@@ -14,6 +14,11 @@
 constexpr float NEAR_PLANE       = 1.0f;
 constexpr float CAMERA_FAR_PLANE = 200.0f;
 
+// Sky/background sentinel for the linear eye-Z G-buffer (written by the Color
+// pass, read by SSAO). Far larger than any real eye depth so a sample landing
+// on background fails the occlusion test naturally.
+constexpr float LINEAR_Z_SKY     = 1e30f;
+
 // Render feature toggles. Flat constexpr instead of macros so the compiler
 // can const-fold them and dead-strip disabled paths without leaking #ifdef
 // branches across the codebase.

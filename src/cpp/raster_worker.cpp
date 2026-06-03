@@ -111,11 +111,14 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             std::fill(rs.depth_buffer + (size_t)y * rs.screen_width + x_min,
                       rs.depth_buffer + (size_t)y * rs.screen_width + x_max + 1,
                       1.0f);
+            std::fill(rs.linear_z + (size_t)y * rs.screen_width + x_min,
+                      rs.linear_z + (size_t)y * rs.screen_width + x_max + 1,
+                      LINEAR_Z_SKY);
         }
 
         auto draw_color_tri = [&](const RenderTriangle& tri, bool depth_write) {
             draw_triangle_barycentric_strip(rs.pixels, rs.pitch,
-                                            rs.depth_buffer,
+                                            rs.depth_buffer, rs.normal_buffer, rs.linear_z,
                                             rs.screen_width, rs.screen_height,
                                             tri.v0, tri.v1, tri.v2,
                                             rs.format, tri.texture,
@@ -167,9 +170,10 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
         int x_min, x_max, y_min, y_max;
         cs_tile_rect(tile_col, strip_idx, x_min, x_max, y_min, y_max);
         if (ENABLE_SSAO) {
-            apply_ssao_strip(rs.pixels, rs.pitch, rs.depth_buffer,
+            apply_ssao_strip(rs.pixels, rs.pitch, rs.linear_z, rs.normal_buffer,
                              rs.screen_width, rs.screen_height, rs.format,
-                             x_min, x_max, y_min, y_max);
+                             x_min, x_max, y_min, y_max, rs.frame_index,
+                             rs.projection(0, 0), rs.projection(1, 1));
         }
         Uint64 c1 = Platform::ThreadCpuNs();
         profiler_record_raster(*ctx.profiler, worker_id, t0, Platform::PerfCounter(),
@@ -240,8 +244,10 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
     auto color_done = [&](int c, int r) {
         return color_tile_done[r * X + c].load(std::memory_order_acquire) != 0;
     };
-    // An SSAO tile is eligible once it and all its in-bounds 8-neighbors have
-    // their Color tile done. Off-edge neighbors don't exist, so they're ready.
+    // SSAO's kernel is capped at SSAO_MAX_RADIUS_PX (16px) of screen reach, so
+    // a tile reads depth at most one tile away. An SSAO tile is therefore
+    // eligible as soon as it + its in-bounds 8 neighbours are Color-done
+    // (off-edge neighbours are ready by definition) — no whole-pass barrier.
     auto ssao_eligible = [&](int c, int r) {
         for (int dr = -1; dr <= 1; dr++)
             for (int dc = -1; dc <= 1; dc++) {
@@ -351,20 +357,24 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
 
             if (job_mode == RasterJobMode::Color) {
                 do_color_tile(tile_col, strip_idx);
-                // Publish completion (release). Then, unless the hard barrier is
-                // on, opportunistically run THIS tile's OWN SSAO — but only if
-                // its 8 neighbors are already Color-complete (the pull test in
-                // run_ssao_tile). We do NOT trigger neighbors' SSAO: every tile
-                // owns its own eligibility test and runs itself. Tiles whose
-                // neighbors aren't done yet are swept up later by ssao_drain
-                // (which also re-tests each tile against its own neighbors).
+                // Publish completion (release), then opportunistically fire any
+                // SSAO tile this completion just unblocked. With the 16px kernel
+                // cap a tile is eligible once it + its 8 neighbours are
+                // Color-done, so trying the whole 3x3 neighbourhood means the
+                // tile that finishes a neighbourhood last runs that SSAO tile
+                // immediately — SSAO overlaps the Color pass, not just its tail.
                 color_tile_done[strip_idx * X + tile_col].store(1, std::memory_order_release);
-                if (!hard_barrier &&
-                    !ssao_tile_claimed[strip_idx * X + tile_col].load(std::memory_order_relaxed)) {
-                    run_ssao_tile(tile_col, strip_idx);
-                }
                 int done = raster_pass_tiles_done[P].fetch_add(1, std::memory_order_acq_rel) + 1;
                 if (done >= total_tiles) advance_pass_to(P + 1);
+                if (!hard_barrier) {
+                    for (int dr = -1; dr <= 1; dr++)
+                        for (int dc = -1; dc <= 1; dc++) {
+                            int nc = tile_col + dc, nr = strip_idx + dr;
+                            if (nc < 0 || nc >= X || nr < 0 || nr >= R) continue;
+                            if (!ssao_tile_claimed[nr * X + nc].load(std::memory_order_relaxed))
+                                run_ssao_tile(nc, nr);
+                        }
+                }
                 continue;
             }
 
@@ -433,13 +443,12 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             if (done >= total_tiles) advance_pass_to(P + 1);
         }
 
-        // Out of claimable tiles for pass P. In opportunistic mode, if we were
-        // rastering Color, help drain any SSAO already unblocked while other
-        // workers finish their last Color tiles (SSAO overlaps Color). Each
-        // drained SSAO tile runs its own Luminaire tiles via run_ssao_tile.
-        // Under the hard barrier we skip this so SSAO is confined to its pass.
-        // Then block until the pass advances.
-        if (job_mode == RasterJobMode::Color && !hard_barrier) { ssao_drain(); }
+        // Out of claimable Color tiles. Instead of idling while other workers
+        // finish the pass, help drain any SSAO tiles already unblocked by the
+        // Color tiles done so far (eligible once a tile + its 8 neighbours are
+        // Color-done). This is the bulk of the Color/SSAO overlap; the per-tile
+        // trigger above just lowers latency. Disabled under the hard barrier.
+        if (job_mode == RasterJobMode::Color && !hard_barrier) ssao_drain();
 
         // shadow_only pre-pass: we've drained every claimable shadow tile (the
         // remainder are owned by other workers). Return rather than block so the

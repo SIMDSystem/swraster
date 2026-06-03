@@ -92,6 +92,15 @@ struct RendererContext {
 
     std::vector<ShadowDepth>* shadow_depth_buffers = nullptr; // [2]
     std::vector<float>*       depth_buffer         = nullptr;
+    // Eye-space shading normal G-buffer, 3 floats/pixel (nx,ny,nz). Written by
+    // the opaque Color pass and consumed by SSAO so it orients its hemisphere
+    // off the smooth interpolated vertex normal instead of a faceted
+    // depth-derivative normal (which "polygonized" low-poly surfaces).
+    std::vector<float>*       normal_buffer        = nullptr;
+    // Final linear eye-space depth (= 1/inv_w), 1 float/pixel. The Color pass
+    // already forms 1/inv_w for perspective-correct attributes, so writing it is
+    // ~free; SSAO reads it directly, skipping any NDC->eye linearization.
+    std::vector<float>*       linear_z_buffer      = nullptr;
 
     // ----- T&L worker IO -----
     TLSharedData*                tl_shared            = nullptr;

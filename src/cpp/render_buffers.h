@@ -172,6 +172,12 @@ struct RasterSharedData {
     uint8_t* pixels;
     int      pitch;
     float*   depth_buffer;
+    // Eye-space normals (3 floats/pixel) written by the opaque Color pass,
+    // read by SSAO. See RenderContext::normal_buffer.
+    float*   normal_buffer;
+    // Final linear eye-space depth (1 float/pixel), written by the Color pass,
+    // read directly by SSAO. See RenderContext::linear_z_buffer.
+    float*   linear_z;
     int      screen_width;
     int      screen_height;
     PixelFormat* format;
@@ -188,6 +194,8 @@ struct RasterSharedData {
     int                shadow_size;
     const ShadowBoxBuffer* shadow_box;
     bool depth_write_enabled;
+    // Monotonic frame counter, used by SSAO for temporal sample-jitter.
+    uint32_t frame_index;
     // Pre-T&L'd spotlight cone fan from the previous frame's T&L pass.
     // Null / !valid when the spotlight is off; otherwise the Luminaire
     // raster job iterates this buffer per tile (no per-tile T&L work).

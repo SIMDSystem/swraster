@@ -94,6 +94,9 @@ static Surface* load_texture(const char* basename) {
     char path[256];
     snprintf(path, sizeof(path), "../Resources/%s", basename);
     if (Surface* s = Platform::LoadBMP(path)) return s;
+    // Command-line runs from the repo root: assets live in assets/.
+    snprintf(path, sizeof(path), "assets/%s", basename);
+    if (Surface* s = Platform::LoadBMP(path)) return s;
     return Platform::LoadBMP(basename);
 }
 
@@ -312,6 +315,8 @@ int main(int argc, char** argv) {
     int screen_width  = fb->w;
     int screen_height = fb->h;
     std::vector<float> depth_buffer((size_t)screen_width * (size_t)screen_height);
+    std::vector<float> normal_buffer((size_t)screen_width * (size_t)screen_height * 3);
+    std::vector<float> linear_z_buffer((size_t)screen_width * (size_t)screen_height);
     std::vector<ShadowDepth> shadow_depth_buffers[2];
     shadow_depth_buffers[0].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
     shadow_depth_buffers[1].resize(SHADOW_MAP_SIZE * SHADOW_MAP_SIZE);
@@ -377,6 +382,8 @@ int main(int argc, char** argv) {
     ctx.time_buffers          = time_buffers;
     ctx.shadow_depth_buffers  = shadow_depth_buffers;
     ctx.depth_buffer          = &depth_buffer;
+    ctx.normal_buffer         = &normal_buffer;
+    ctx.linear_z_buffer       = &linear_z_buffer;
 
     ctx.tl_shared              = &tl_shared;
     ctx.tl_thread_outputs      = &tl_thread_outputs;

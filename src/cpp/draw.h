@@ -122,6 +122,7 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
 // interpolation, optional Phong shading, shadow PCF, and a few alternate
 // shaders selected via TriangleShader.
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
+                                     float* normal_buffer, float* linear_z,
                                      int screen_width, int screen_height,
                                      VertexVaryings v0, VertexVaryings v1, VertexVaryings v2,
                                      PixelFormat* format, const PackedTexture* texture,
@@ -164,8 +165,16 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                int y_strip_min, int y_strip_max);
 
 // Screen-space ambient occlusion modulated multiplicatively over the color
-// buffer using the live depth buffer as input.
-void apply_ssao_strip(uint8_t* pixels, int pitch, const float* depth_buffer,
+// buffer using the live depth buffer as input. frame_index drives temporal
+// jitter of the sample kernel. The four projection coefficients (proj(0,0),
+// proj(1,1), proj(2,2), proj(2,3)) are taken from the *actual* camera
+// projection so the NDC-z -> linear-eye-depth inversion and the eye-space
+// position reconstruction are exact (perspective-correct) rather than
+// re-derived from hardcoded FOV/near/far that could drift out of sync.
+void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
+                      const float* normal_buffer,
                       int screen_width, int screen_height, PixelFormat* format,
                       int x_tile_min, int x_tile_max,
-                      int y_strip_min, int y_strip_max);
+                      int y_strip_min, int y_strip_max,
+                      uint32_t frame_index,
+                      float proj00, float proj11);

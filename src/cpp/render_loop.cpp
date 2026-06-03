@@ -524,6 +524,8 @@ void run_render_loop(RendererContext& ctx) {
             ctx.screen_width  = fb->w;
             ctx.screen_height = fb->h;
             ctx.depth_buffer->assign((size_t)ctx.screen_width * (size_t)ctx.screen_height, 1.0f);
+            ctx.normal_buffer->assign((size_t)ctx.screen_width * (size_t)ctx.screen_height * 3, 0.0f);
+            ctx.linear_z_buffer->assign((size_t)ctx.screen_width * (size_t)ctx.screen_height, LINEAR_Z_SKY);
             last_physics_time = Platform::TicksMs();
         }
         ctx.fb = fb;
@@ -784,6 +786,8 @@ void run_render_loop(RendererContext& ctx) {
             rs.pixels                  = pixels;
             rs.pitch                   = pitch;
             rs.depth_buffer            = ctx.depth_buffer->data();
+            rs.normal_buffer           = ctx.normal_buffer->data();
+            rs.linear_z                = ctx.linear_z_buffer->data();
             rs.screen_width            = ctx.screen_width;
             rs.screen_height           = ctx.screen_height;
             rs.format                  = fb->format;
@@ -801,6 +805,7 @@ void run_render_loop(RendererContext& ctx) {
             rs.shadow_box              = &ctx.shadow_box_buffers  [raster_buf_idx];
             rs.cone_buf_read           = &ctx.cone_buffers         [raster_buf_idx];
             rs.depth_write_enabled     = true;
+            rs.frame_index             = (uint32_t)frame_num;
         }
 
         // Mirror pause into the profiler so the live snapshot freezes on pause.
