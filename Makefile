@@ -6,14 +6,23 @@ EMCMAKE ?= emcmake
 SRC_DIR   = src/cpp
 ASSET_DIR = assets
 BUILD_DIR = build
+# Per-toolchain output folders so the C++, Zig, and web builds never clobber
+# each other inside build/. Each native toolchain mirrors the same shape:
+#   build/<tool>/bin/raster   — raw executable
+#   build/<tool>/Raster.app   — signed app bundle (icon, no console)
+CPP_BUILD_DIR = $(BUILD_DIR)/cpp
+ZIG_BUILD_DIR = $(BUILD_DIR)/zig
 JOLT_DIR  = third_party/JoltPhysics
 
 JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
-CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_ENABLE_ASSERTS
+# NOTE: keep the JPH_* defines in sync with how $(JOLT_LIB) is built below
+# (plain Release, no USE_ASSERTS). Defining JPH_ENABLE_ASSERTS here without
+# building Jolt with asserts leaves JPH::AssertFailed undefined at link time.
+CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
 LDFLAGS = -flto=thin
-TARGET = $(BUILD_DIR)/raster
-APP_NAME = $(BUILD_DIR)/Raster.app
+TARGET = $(CPP_BUILD_DIR)/bin/raster
+APP_NAME = $(CPP_BUILD_DIR)/Raster.app
 # Backend-independent + web sources (filenames relative to $(SRC_DIR)).
 # The web target uses exactly this list.
 SRC_NAMES = main.cpp geometry.cpp platform.cpp pixel.cpp texture.cpp clip.cpp shadow.cpp draw.cpp threading.cpp physics_setup.cpp physics_pipeline.cpp scene.cpp tl_worker.cpp raster_worker.cpp pool_worker.cpp render_loop.cpp thread_profiler.cpp
@@ -22,8 +31,10 @@ SOURCES = $(addprefix $(SRC_DIR)/,$(SRC_NAMES))
 NATIVE_SOURCES = $(SOURCES) $(SRC_DIR)/platform_mac.mm
 NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework CoreGraphics -framework IOSurface
 ICON_PNG  = $(ASSET_DIR)/icon.png
+# Shared icon intermediate: both the C++ and Zig app bundles copy this in, so it
+# lives at the build root rather than inside one toolchain's folder.
 ICON_ICNS = $(BUILD_DIR)/icon.icns
-WEB_BUILD_DIR = $(BUILD_DIR)/web_build
+WEB_BUILD_DIR = $(BUILD_DIR)/web
 JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/jolt_release
 JOLT_WEB_LIB = $(JOLT_WEB_BUILD_DIR)/libJolt.a
 WEB_TARGET = $(WEB_BUILD_DIR)/raster.html
@@ -58,6 +69,25 @@ WEB_JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release -DUSE_ASSERTS=ON \
   -DINTERPROCEDURAL_OPTIMIZATION=OFF -DCROSS_PLATFORM_DETERMINISTIC=ON \
   -DENABLE_ALL_WARNINGS=OFF -DCMAKE_CXX_FLAGS="-pthread -g2 -msimd128 -msse4.2"
 
+# --- Zig native build -------------------------------------------------------
+# Toolchain + caches live under tools/ (not build/, which is output only).
+ZIG ?= tools/zig-toolchain/zig-aarch64-macos-0.16.0/zig
+ZIG_CACHE = tools/zig-cache
+ZIG_SRC_DIR = src/zig
+ZIG_OPT ?= ReleaseFast
+ZIG_BIN = $(ZIG_BUILD_DIR)/bin/raster
+ZIG_APP = $(ZIG_BUILD_DIR)/Raster.app
+ZIG_SOURCES = $(wildcard $(ZIG_SRC_DIR)/*.zig)
+# C wrapper that bridges Jolt's C++ API to the jph_* C ABI the Zig port calls.
+# Flags must match the libJolt.a it links against (same defines / no rtti / no
+# exceptions) or the BroadPhaseLayerInterface vtables won't line up.
+JOLTC_DIR = $(ZIG_BUILD_DIR)/joltc
+JOLTC_LIB = $(JOLTC_DIR)/libjoltc.a
+JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
+  -faligned-allocation -arch arm64 -DNDEBUG \
+  -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
+  -I$(JOLT_DIR) -I$(SRC_DIR)
+
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
 
@@ -91,7 +121,7 @@ $(JOLT_LIB):
 	@cd $(JOLT_BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . --target Jolt
 
 $(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB)
-	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(CPP_BUILD_DIR)/bin
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(NATIVE_SOURCES) $(JOLT_LIB) $(LDFLAGS) -pthread $(NATIVE_FRAMEWORKS)
 
 # Separate Emscripten/WebAssembly build. Native `all` and `app` targets are unchanged.
@@ -110,45 +140,73 @@ $(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile
 web: $(WEB_TARGET)
 	@echo "Web build written to $(WEB_BUILD_DIR)/"
 
-# App bundle depends on executable - will rebuild exe if source changes
-# IMPORTANT: Check if exe in bundle is older than source exe and copy if needed
-# This ensures app bundle always has the latest executable
-$(APP_NAME): $(TARGET) Info.plist $(ICON_ICNS) $(ASSET_FILES)
-	@echo "Updating app bundle..."
-	@mkdir -p $(APP_NAME)/Contents/MacOS
-	@mkdir -p $(APP_NAME)/Contents/Resources
-	@if [ ! -f $(APP_NAME)/Contents/MacOS/raster ] || [ $(TARGET) -nt $(APP_NAME)/Contents/MacOS/raster ]; then \
-		echo "Copying updated executable..."; \
-		cp $(TARGET) $(APP_NAME)/Contents/MacOS/raster; \
-	fi
-	@cp Info.plist $(APP_NAME)/Contents/Info.plist
-	@if [ -f $(ICON_ICNS) ] && [ -s $(ICON_ICNS) ]; then \
-		cp $(ICON_ICNS) $(APP_NAME)/Contents/Resources/icon.icns; \
-	fi
+# Assemble + sign a macOS .app bundle. Used by both the C++ and Zig builds so
+# each toolchain produces a first-class, icon-decorated, console-free app.
+#   $(call make_app_bundle,<exe-path>,<app-path>)
+# NOTE: the leading '+' is not needed; the strip-quarantine step matters because
+# asset BMPs downloaded via a browser carry com.apple.quarantine, which makes
+# Launch Services refuse to register the signed bundle (AppKit then aborts in
+# _RegisterApplication when launched from Finder).
+define make_app_bundle
+	@echo "Bundling $(2)..."
+	@mkdir -p $(2)/Contents/MacOS $(2)/Contents/Resources
+	@cp $(1) $(2)/Contents/MacOS/raster
+	@cp Info.plist $(2)/Contents/Info.plist
+	@if [ -f $(ICON_ICNS) ] && [ -s $(ICON_ICNS) ]; then cp $(ICON_ICNS) $(2)/Contents/Resources/icon.icns; fi
 	@for a in $(ASSET_NAMES); do \
-		if [ -f $(ASSET_DIR)/$$a ]; then \
-			cp $(ASSET_DIR)/$$a $(APP_NAME)/Contents/Resources/$$a && \
-			echo "Copied $$a to app bundle Resources"; \
-		else \
-			echo "Error: $(ASSET_DIR)/$$a not found!"; \
-			exit 1; \
-		fi; \
+		if [ -f $(ASSET_DIR)/$$a ]; then cp $(ASSET_DIR)/$$a $(2)/Contents/Resources/$$a; \
+		else echo "Error: $(ASSET_DIR)/$$a not found!"; exit 1; fi; \
 	done
-	@echo "APPL????" > $(APP_NAME)/Contents/PkgInfo
-	@# Strip com.apple.quarantine from every file in the bundle BEFORE
-	@# code-signing. Asset BMPs are often downloaded with a browser, which
-	@# tags them with com.apple.quarantine; if those tags survive into the
-	@# signed bundle, Launch Services refuses to register the process and
-	@# AppKit aborts in _RegisterApplication when launched from Finder.
-	@xattr -dr com.apple.quarantine $(APP_NAME) 2>/dev/null || true
-	@codesign --force --deep --sign - $(APP_NAME) >/dev/null 2>&1
+	@echo "APPL????" > $(2)/Contents/PkgInfo
+	@xattr -dr com.apple.quarantine $(2) 2>/dev/null || true
+	@codesign --force --deep --sign - $(2) >/dev/null 2>&1
+	@echo "  -> $(2)/Contents/MacOS/raster"
+endef
+
+$(APP_NAME): $(TARGET) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(TARGET),$(APP_NAME))
 
 app: $(APP_NAME)
+
+# --- Zig native build -------------------------------------------------------
+# joltc C wrapper -> static archive the Zig binary links against.
+$(JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h
+	@echo "Building joltc wrapper..."
+	@mkdir -p $(JOLTC_DIR)
+	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/joltc.cpp -o $(JOLTC_DIR)/joltc.o
+	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/physics_setup.cpp -o $(JOLTC_DIR)/physics_setup.o
+	ar rcs $@ $(JOLTC_DIR)/joltc.o $(JOLTC_DIR)/physics_setup.o
+
+# Zig drives its own compile/cache; we just point it at absolute paths so the
+# binary lands in build/zig/bin and reuses the prebuilt Jolt + joltc archives.
+$(ZIG_BIN): $(ZIG_SOURCES) $(ZIG_SRC_DIR)/build.zig $(ZIG_SRC_DIR)/build.zig.zon $(JOLT_LIB) $(JOLTC_LIB)
+	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG). Set ZIG=/path/to/zig."; exit 1; }
+	@echo "Building Zig rasterizer ($(ZIG_OPT))..."
+	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build \
+		--prefix $(abspath $(ZIG_BUILD_DIR)) \
+		--cache-dir $(abspath $(ZIG_CACHE))/local \
+		--global-cache-dir $(abspath $(ZIG_CACHE))/global \
+		-Doptimize=$(ZIG_OPT) \
+		-Djolt-lib=$(abspath $(JOLT_LIB)) \
+		-Djoltc-lib=$(abspath $(JOLTC_LIB))
+
+$(ZIG_APP): $(ZIG_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(ZIG_BIN),$(ZIG_APP))
+
+zig-bin: $(ZIG_BIN)
+
+zig: $(ZIG_APP)
 
 clean:
 	rm -rf $(BUILD_DIR)
 
+clean-cpp:
+	rm -rf $(CPP_BUILD_DIR)
+
+clean-zig:
+	rm -rf $(ZIG_BUILD_DIR)
+
 clean-web:
 	rm -rf $(WEB_BUILD_DIR)
 
-.PHONY: clean clean-web app all web
+.PHONY: clean clean-cpp clean-zig clean-web app all web zig zig-bin
