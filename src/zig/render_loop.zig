@@ -5,6 +5,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const la = @import("linalg.zig");
 const config = @import("render_config.zig");
+const dbg = @import("dbg.zig");
 const platform = @import("platform.zig");
 const buffers = @import("render_buffers.zig");
 const scene = @import("scene.zig");
@@ -158,7 +159,7 @@ fn merge_tl_globals(ctx: *RendererContext, tl_buf_idx: usize) void {
 
     if (dropped_opaque != 0 or dropped_trans != 0 or dropped_shadow != 0) {
         if (!merge_warned) {
-            std.debug.print("Warning: dropped triangles: opaque={d} trans={d} shadow={d}\n", .{ dropped_opaque, dropped_trans, dropped_shadow });
+            dbg.print("Warning: dropped triangles: opaque={d} trans={d} shadow={d}\n", .{ dropped_opaque, dropped_trans, dropped_shadow });
             merge_warned = true;
         }
     }
@@ -255,7 +256,7 @@ fn threadperf_advance_variant(ctx: *RendererContext, sim_time: *f32, frame_num: 
         tp.physics_sync_ms_this_variant = 0.0;
         reset_animation(ctx, sim_time, frame_num, last_physics_time);
         tp.variant_start_ticks = platform.TicksMs();
-        std.debug.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
+        dbg.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
     }
 }
 
@@ -325,7 +326,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         reset_animation(ctx, &sim_time, &frame_num, &last_physics_time);
         tp.search_start_ticks = platform.TicksMs();
         tp.variant_start_ticks = tp.search_start_ticks;
-        std.debug.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
+        dbg.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
     }
     var window_renderable = platform.IsRenderable();
 
@@ -356,12 +357,12 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                     if (event.key == 'q' or event.key == 'Q') {
                         const was = draw.g_quad_path_enabled.load(.monotonic);
                         draw.g_quad_path_enabled.store(!was, .monotonic);
-                        std.debug.print("Quad raster path: {s}\n", .{if (!was) "ON (4-wide + scalar fallback)" else "OFF (scalar only)"});
+                        dbg.print("Quad raster path: {s}\n", .{if (!was) "ON (4-wide + scalar fallback)" else "OFF (scalar only)"});
                     }
                     if (event.key == 'b' or event.key == 'B') {
                         const was = threading.raster_hard_barrier.load(.monotonic);
                         threading.raster_hard_barrier.store(!was, .monotonic);
-                        std.debug.print("Raster hard barrier: {s}\n", .{if (!was) "ON (passes serialized)" else "OFF (opportunistic overlap)"});
+                        dbg.print("Raster hard barrier: {s}\n", .{if (!was) "ON (passes serialized)" else "OFF (opportunistic overlap)"});
                     }
                     if (event.key == 't' or event.key == 'T') {
                         if (ctx.profiler.?.enabled.load(.monotonic)) {
@@ -380,7 +381,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                         if (next > config.NUM_RASTER_THREADS) next = config.NUM_RASTER_THREADS;
                         if (next != cur) {
                             threading.g_active_workers.store(next, .monotonic);
-                            std.debug.print("Active workers: {d} / {d}  (T&L-preferred {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_tl_workers.load(.monotonic) });
+                            dbg.print("Active workers: {d} / {d}  (T&L-preferred {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_tl_workers.load(.monotonic) });
                         }
                     }
                     if (event.key == '[' or event.key == '{' or event.key == ']' or event.key == '}') {
@@ -391,7 +392,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                         if (next > config.NUM_RASTER_THREADS) next = config.NUM_RASTER_THREADS;
                         if (next != cur) {
                             threading.g_tl_workers.store(next, .monotonic);
-                            std.debug.print("T&L-preferred: {d} / {d}  (active workers {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_active_workers.load(.monotonic) });
+                            dbg.print("T&L-preferred: {d} / {d}  (active workers {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_active_workers.load(.monotonic) });
                         }
                     }
                 },

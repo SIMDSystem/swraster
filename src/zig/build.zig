@@ -56,7 +56,31 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    b.installArtifact(exe);
+    // Install the raw executable to <prefix>/bin/raster.
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
+
+    // macOS: assemble + sign a first-class .app bundle as part of the default
+    // build, so `zig build` (any prefix) produces a runnable, icon-decorated,
+    // console-free <prefix>/Raster.app with no external script/Make step. The
+    // .icns is generated once from assets/icon.png and cached at <prefix>.
+    if (os == .macos) {
+        const build_root_path = b.build_root.path orelse ".";
+        const repo_root = std.fs.path.resolve(b.allocator, &.{ build_root_path, "..", ".." }) catch @panic("build: cannot resolve repo root");
+        const plist_path = b.pathJoin(&.{ repo_root, "Info.plist" });
+        const assets_dir = b.pathJoin(&.{ repo_root, "assets" });
+        const app_path = b.getInstallPath(.prefix, "Raster.app");
+        const icon_cache = b.getInstallPath(.prefix, "icon.icns");
+
+        const bundle = b.addSystemCommand(&.{ "bash", "-c", mac_bundle_script, "swraster-bundle" });
+        bundle.addArtifactArg(exe); // $1 = built executable
+        bundle.addArg(app_path); // $2 = .app path
+        bundle.addArg(plist_path); // $3 = Info.plist
+        bundle.addArg(assets_dir); // $4 = assets dir (icon.png + *.bmp)
+        bundle.addArg(icon_cache); // $5 = cached .icns
+        bundle.step.dependOn(&install_exe.step);
+        b.getInstallStep().dependOn(&bundle.step);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -64,19 +88,67 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the rasterizer");
     run_step.dependOn(&run_cmd.step);
 
-    // Web (emscripten) target placeholder. The C++ build drove em++ directly;
-    // the Zig equivalent compiles to wasm32-emscripten and lets emcc link.
-    const web_step = b.step("web", "Build the emscripten/wasm target (requires emsdk sysroot)");
-    const web_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .emscripten });
+    // Web (emscripten): compile the Zig rasterizer to a static archive that
+    // emcc links into the final .wasm/.js/.html (see the Makefile `web-zig`
+    // target). Three things make the wasm threaded build work:
+    //   * link_libc: routes std.start through emscripten's __main_argc_argv
+    //     entry instead of the bare wasm `_start` (which rejects this target).
+    //   * atomics + bulk_memory: required for the shared-memory pthread build
+    //     that mirrors the native worker pool (emcc -pthread / SharedArrayBuffer).
+    //   * -Demscripten-sysroot: emscripten's libc headers, passed by the Makefile.
+    const web_step = b.step("web", "Build the Zig wasm static library for emcc to link");
+    var web_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .emscripten };
+    web_query.cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory });
+    const web_target = b.resolveTargetQuery(web_query);
     const web_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = web_target,
         .optimize = optimize,
+        .link_libc = true,
+        .single_threaded = false,
     });
-    const web_obj = b.addObject(.{
+    const emsdk_sysroot = b.option([]const u8, "emscripten-sysroot", "Path to the emscripten sysroot include dir (cache/sysroot/include)") orelse "";
+    if (emsdk_sysroot.len > 0) web_mod.addSystemIncludePath(.{ .cwd_relative = emsdk_sysroot });
+    const web_lib = b.addLibrary(.{
         .name = "swraster_web",
         .root_module = web_mod,
+        .linkage = .static,
     });
-    const web_install = b.addInstallBinFile(web_obj.getEmittedBin(), "swraster_web.o");
+    const web_install = b.addInstallArtifact(web_lib, .{});
     web_step.dependOn(&web_install.step);
 }
+
+// Assemble + sign a macOS .app bundle. Mirrors the Makefile's make_app_bundle:
+// copy the exe, Info.plist, icon, and runtime BMPs into the bundle, drop the
+// quarantine xattr (browser-downloaded BMPs carry it, which blocks Launch
+// Services from registering the signed bundle), then ad-hoc codesign.
+// Args: $1 exe, $2 app path, $3 Info.plist, $4 assets dir, $5 cached .icns.
+const mac_bundle_script =
+    \\set -e
+    \\EXE="$1"; APP="$2"; PLIST="$3"; ASSETS="$4"; ICON="$5"
+    \\rm -rf "$APP"
+    \\mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+    \\cp "$EXE" "$APP/Contents/MacOS/raster"
+    \\cp "$PLIST" "$APP/Contents/Info.plist"
+    \\# Build the .icns once from assets/icon.png and cache it for later builds.
+    \\if [ ! -s "$ICON" ] && [ -f "$ASSETS/icon.png" ]; then
+    \\  ISET="$(dirname "$ICON")/icon.iconset"; rm -rf "$ISET"; mkdir -p "$ISET"
+    \\  sips -z 1024 1024 "$ASSETS/icon.png" --out "$ISET/icon_512x512@2x.png" >/dev/null 2>&1 \
+    \\    || sips -s format png "$ASSETS/icon.png" --out "$ISET/icon_512x512@2x.png" >/dev/null 2>&1
+    \\  for spec in 512:icon_512x512 512:icon_256x256@2x 256:icon_256x256 256:icon_128x128@2x \
+    \\              128:icon_128x128 64:icon_32x32@2x 32:icon_32x32 32:icon_16x16@2x 16:icon_16x16; do
+    \\    sz="${spec%%:*}"; nm="${spec##*:}"
+    \\    sips -z "$sz" "$sz" "$ISET/icon_512x512@2x.png" --out "$ISET/$nm.png" >/dev/null 2>&1
+    \\  done
+    \\  iconutil -c icns "$ISET" -o "$ICON" >/dev/null 2>&1 || true
+    \\  rm -rf "$ISET"
+    \\fi
+    \\[ -s "$ICON" ] && cp "$ICON" "$APP/Contents/Resources/icon.icns" || true
+    \\for a in baboon.bmp lenna.bmp tiles.bmp; do
+    \\  cp "$ASSETS/$a" "$APP/Contents/Resources/$a"
+    \\done
+    \\printf 'APPL????' > "$APP/Contents/PkgInfo"
+    \\xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
+    \\codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || true
+    \\echo "  -> $APP/Contents/MacOS/raster"
+;

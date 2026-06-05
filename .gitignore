@@ -8,6 +8,7 @@ out/
 # Zig build output + downloaded toolchain/caches (tools/ holds the ~580MB SDK)
 zig-out/
 tools/
+.zig-cache/
 
 # Logs
 *.log

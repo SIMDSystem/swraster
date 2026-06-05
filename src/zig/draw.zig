@@ -1065,7 +1065,6 @@ pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]
     const max_occlusion: f32 = 0.92;
     const ssao_max_radius_px: i32 = 16;
     const min_eye_clamp: f32 = world_radius * 1.5;
-    const sky_z: f32 = config.LINEAR_Z_SKY * 0.5;
 
     const x_scale = 1.0 / proj00;
     const y_scale = 1.0 / proj11;
@@ -1081,7 +1080,7 @@ pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]
         var x = x_tile_min;
         while (x <= x_tile_max) : (x += 1) {
             const eye_depth = lz_row[@intCast(x)];
-            if (eye_depth >= sky_z) continue;
+            if (eye_depth >= config.LINEAR_Z_SKY) continue;
 
             const cz = -eye_depth;
             const ndc_x = ((@as(f32, @floatFromInt(x)) + 0.5) * inv_screen_width) * 2.0 - 1.0;

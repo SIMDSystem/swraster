@@ -309,8 +309,11 @@ const web = struct {
     fn perfFrequency() Uint64 {
         return 1_000_000;
     }
+    extern fn usleep(usec: c_uint) c_int;
     fn delay(ms: Uint32) void {
-        std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+        // Runs on a renderer pthread (PROXY_TO_PTHREAD), so a blocking libc
+        // usleep is fine and keeps the browser main thread free.
+        _ = usleep(ms * 1000);
     }
 
     // C entry points called directly from JS in the page shell.

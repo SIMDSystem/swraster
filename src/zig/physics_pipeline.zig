@@ -29,7 +29,9 @@ pub const PhysicsPipeline = struct {
 
     pose_snapshots: [2]PoseSnapshot = .{ .{}, .{} },
     published_snapshot: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
-    published_sequence: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    // 32-bit: wasm32 only supports atomics up to 32-bit in this Zig, and this
+    // value is publish-only (no atomic reader), so truncation is harmless.
+    published_sequence: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     mtx: sync.Mutex = .{},
     cv: sync.Condition = .{},
@@ -184,7 +186,7 @@ pub fn physics_worker_thread(pp: *PhysicsPipeline) void {
         }
 
         pp.published_snapshot.store(snapshot_idx, .release);
-        pp.published_sequence.store(sequence, .release);
+        pp.published_sequence.store(@truncate(sequence), .release);
         {
             pp.mtx.lock();
             pp.job_active = false;

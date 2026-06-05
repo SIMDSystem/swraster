@@ -25,6 +25,8 @@ const render_loop = @import("render_loop.zig");
 const cull = @import("cull.zig");
 const jolt = @import("jolt.zig");
 const keysort = @import("keysort.zig");
+const thread = @import("thread.zig");
+const dbg = @import("dbg.zig");
 
 const Surface = platform.Surface;
 const PackedTexture = tex.PackedTexture;
@@ -33,6 +35,39 @@ const FaceList = geom.FaceList;
 const ShadowDepth = config.ShadowDepth;
 
 const is_mac = builtin.target.os.tag == .macos;
+const is_web = builtin.target.os.tag == .emscripten;
+
+// On emscripten the std default panic/log machinery pulls in std.Io.Threaded
+// and std.heap.WasmAllocator (via stack-trace capture), neither of which
+// compiles for multithreaded wasm32-emscripten in Zig 0.16. Override both with
+// console-backed implementations so nothing references those backends.
+extern fn emscripten_console_error(str: [*:0]const u8) void;
+
+fn webPanic(msg: []const u8, _: ?usize) noreturn {
+    var buf: [1024]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf, "PANIC: {s}", .{msg}) catch "PANIC";
+    emscripten_console_error(s.ptr);
+    @trap();
+}
+
+fn webLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    _ = scope;
+    dbg.print("[" ++ comptime level.asText() ++ "] " ++ fmt ++ "\n", args);
+}
+
+pub const panic = if (is_web)
+    std.debug.FullPanic(webPanic)
+else
+    std.debug.FullPanic(std.debug.defaultPanic);
+
+pub const std_options: std.Options = .{
+    .logFn = if (is_web) webLogFn else std.log.defaultLog,
+};
 
 // macOS: resolve the running executable path to find the .app bundle Resources.
 extern fn _NSGetExecutablePath(buf: [*]u8, bufsize: *u32) c_int;
@@ -95,7 +130,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         threading.active_tl_job_thread_count = config.NUM_TL_THREADS;
         threading.active_raster_job_thread_count = config.NUM_RASTER_THREADS;
         thread_perf.log = std.c.fopen("threaadperf.log", "wb") orelse {
-            std.debug.print("Failed to open threaadperf.log for writing\n", .{});
+            dbg.print("Failed to open threaadperf.log for writing\n", .{});
             return;
         };
         const log = thread_perf.log.?;
@@ -109,7 +144,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // ----- 2. Platform / window -----
     if (!platform.Init(1280, 1024, "swraster")) {
-        std.debug.print("Platform::Init failed\n", .{});
+        dbg.print("Platform::Init failed\n", .{});
         return;
     }
     const fb = platform.GetFramebuffer().?;
@@ -173,18 +208,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const physics_system = jolt.jph_physics_system_create(2048, 0, 65536, 16384).?;
     defer jolt.jph_physics_system_destroy(physics_system);
     const body_interface = jolt.jph_physics_system_get_body_interface(physics_system).?;
-    std.debug.print("Jolt: Physics Initialized\n", .{});
+    dbg.print("Jolt: Physics Initialized\n", .{});
 
     var walls = std.array_list.Managed(scene.WallData).init(alloc);
     scene.build_tumbling_walls(body_interface, box_half, wall_thick, 0.9, &walls);
-    std.debug.print("Jolt: Tumbling container box created\n", .{});
+    dbg.print("Jolt: Tumbling container box created\n", .{});
 
     const torus_shape = scene.build_torus_compound_shape(1.0, 0.36, 12, 0.2).?;
     const teapot_shape = scene.build_teapot_compound_shape(0.5, 8).?;
 
     var instances = std.array_list.Managed(scene.CubeInstance).init(alloc);
     scene.populate_scene_instances(body_interface, texture_baboon, texture_lenna, texture_baboon, texture_lenna, texture_tiles, torus_shape, teapot_shape, ground_y, &instances);
-    std.debug.print("Jolt: Created {d} physics bodies\n", .{instances.items.len});
+    dbg.print("Jolt: Created {d} physics bodies\n", .{instances.items.len});
     jolt.jph_physics_system_optimize_broadphase(physics_system);
 
     var lamp_instance_index: i32 = -1;
@@ -408,16 +443,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // ----- 9. Spawn workers -----
     const pool_size: usize = @intCast(launched_raster_threads);
-    var pool_workers = std.array_list.Managed(std.Thread).init(alloc);
+    var pool_workers = std.array_list.Managed(thread.Handle).init(alloc);
     defer pool_workers.deinit();
     {
         var i: i32 = 0;
         while (i < launched_raster_threads) : (i += 1) {
-            const t = try std.Thread.spawn(.{}, pool_worker.pool_worker_main, .{ i, &ctx });
+            const t = try thread.spawn(pool_worker.pool_worker_main, .{ i, &ctx });
             pool_workers.append(t) catch unreachable;
         }
     }
-    const physics_worker = try std.Thread.spawn(.{}, physics_pipeline.physics_worker_thread, .{&physics});
+    const physics_worker = try thread.spawn(physics_pipeline.physics_worker_thread, .{&physics});
 
     // ----- 10. Run -----
     render_loop.run_render_loop(&ctx);

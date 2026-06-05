@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en-us">
+<head>
+  <meta charset="utf-8">
+  <title>swraster — web builds</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0; min-height: 100%;
+      background: #1a1a1a; color: #ccc;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    }
+    main { max-width: 640px; margin: 0 auto; padding: 64px 24px; }
+    h1 { font-weight: 600; letter-spacing: 0.02em; }
+    p { color: #888; line-height: 1.5; }
+    .builds { display: flex; gap: 16px; margin-top: 32px; flex-wrap: wrap; }
+    a.card {
+      flex: 1 1 220px; display: block; text-decoration: none;
+      background: #242424; border: 1px solid #333; border-radius: 10px;
+      padding: 20px 22px; color: #eee; transition: border-color .15s, background .15s;
+    }
+    a.card:hover { background: #2c2c2c; border-color: #4a90d9; }
+    a.card .tag { font-size: 13px; color: #6aa9e0; text-transform: uppercase; letter-spacing: .08em; }
+    a.card h2 { margin: 6px 0 4px; font-size: 20px; }
+    a.card span { color: #888; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>swraster</h1>
+    <p>Multithreaded software rasterizer compiled to WebAssembly. Both builds
+       render the same scene with the same page; pick a backend to compare.</p>
+    <div class="builds">
+      <a class="card" href="zig/raster.html">
+        <div class="tag">Zig</div>
+        <h2>Zig &rarr; WASM</h2>
+        <span>emscripten pthreads + Jolt WASM</span>
+      </a>
+      <a class="card" href="cpp/raster.html">
+        <div class="tag">C++</div>
+        <h2>C++ &rarr; WASM</h2>
+        <span>emscripten pthreads + Jolt WASM</span>
+      </a>
+    </div>
+  </main>
+</body>
+</html>

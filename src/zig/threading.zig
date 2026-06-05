@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const platform = @import("platform.zig");
 const config = @import("render_config.zig");
+const dbg = @import("dbg.zig");
 const sync = @import("sync.zig");
 const Uint64 = platform.Uint64;
 
@@ -67,8 +68,15 @@ pub fn wait_for_main_thread_predicate(context: anytype, comptime predicate: fn (
 
 pub const JOLT_WORKER_THREADS: i32 = 2;
 
+// emscripten exposes navigator.hardwareConcurrency here. std.Thread.getCpuCount
+// takes a BSD sysctl path on this target, pulling in an undefined sysctlbyname.
+extern fn emscripten_num_logical_cores() c_int;
+
 pub fn init_thread_counts() void {
-    var hw: i32 = @intCast(std.Thread.getCpuCount() catch 2);
+    var hw: i32 = if (builtin.target.os.tag == .emscripten)
+        emscripten_num_logical_cores()
+    else
+        @intCast(std.Thread.getCpuCount() catch 2);
     if (hw < 2) hw = 2;
     const POOL_CAPACITY_MAX: i32 = 20;
     var cap = 2 * hw;
@@ -85,7 +93,7 @@ pub fn init_thread_counts() void {
     tile_bin_locks = alloc.alloc(sync.Mutex, @intCast(config.NUM_TILE_BINS)) catch unreachable;
     for (tile_bin_locks) |*m| m.* = .{};
 
-    std.debug.print("Threads: pool capacity {d}, active {d}, T&L-preferred {d} (hw={d}), {d} strips, {d} tiles\n  keys: -/= adjust active workers, [/] adjust T&L-preferred\n", .{ config.NUM_RASTER_THREADS, start_active, cap, hw, config.NUM_STRIPS, config.NUM_TILE_BINS });
+    dbg.print("Threads: pool capacity {d}, active {d}, T&L-preferred {d} (hw={d}), {d} strips, {d} tiles\n  keys: -/= adjust active workers, [/] adjust T&L-preferred\n", .{ config.NUM_RASTER_THREADS, start_active, cap, hw, config.NUM_STRIPS, config.NUM_TILE_BINS });
 }
 
 // ---- Perf timing ----

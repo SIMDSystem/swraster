@@ -37,7 +37,17 @@ ICON_ICNS = $(BUILD_DIR)/icon.icns
 WEB_BUILD_DIR = $(BUILD_DIR)/web
 JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/jolt_release
 JOLT_WEB_LIB = $(JOLT_WEB_BUILD_DIR)/libJolt.a
-WEB_TARGET = $(WEB_BUILD_DIR)/raster.html
+# Each language gets its own subfolder under build/web/ so they serve at
+# distinct URLs (/cpp/, /zig/) and share the same web_shell.html page + the one
+# prebuilt Jolt WASM archive ($(JOLT_WEB_LIB)).
+CPP_WEB_DIR = $(WEB_BUILD_DIR)/cpp
+ZIG_WEB_DIR = $(WEB_BUILD_DIR)/zig
+WEB_TARGET = $(CPP_WEB_DIR)/raster.html
+ZIG_WEB_TARGET = $(ZIG_WEB_DIR)/raster.html
+# Emscripten sysroot include, derived from the active emsdk (em++ on PATH). The
+# Zig wasm compile needs these libc headers (-Demscripten-sysroot).
+EMSCRIPTEN_ROOT := $(shell dirname "$$(command -v $(EMCXX) 2>/dev/null)" 2>/dev/null)
+EM_SYSROOT_INC = $(EMSCRIPTEN_ROOT)/cache/sysroot/include
 # Runtime asset basenames; sources live in $(ASSET_DIR).
 ASSET_NAMES = baboon.bmp lenna.bmp tiles.bmp
 ASSET_FILES = $(addprefix $(ASSET_DIR)/,$(ASSET_NAMES))
@@ -88,6 +98,28 @@ JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
   -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
   -I$(JOLT_DIR) -I$(SRC_DIR)
 
+# --- Zig web (emscripten) build ---------------------------------------------
+# The Zig wasm archive emitted by `zig build web` (installed under build/zig/lib).
+ZIG_WEB_LIB = $(ZIG_BUILD_DIR)/lib/libswraster_web.a
+# joltc C wrapper compiled for wasm. The Zig code calls the jph_* C ABI, so we
+# build joltc.cpp + physics_setup.cpp with em++ using the SAME flags the C++ web
+# build uses for its Jolt consumers ($(WEB_CXXFLAGS)) so they match the prebuilt
+# $(JOLT_WEB_LIB) ABI exactly. We do NOT rebuild Jolt itself.
+ZIG_JOLTC_WEB_DIR = $(ZIG_BUILD_DIR)/joltc_web
+ZIG_JOLTC_WEB_OBJS = $(ZIG_JOLTC_WEB_DIR)/joltc.o $(ZIG_JOLTC_WEB_DIR)/physics_setup.o
+# Same link flags as the C++ web build, but: a slightly larger pthread pool
+# (the Zig worker pool can scale to ~20 raster + physics + Jolt threads), and an
+# explicit export list since Zig's `export fn` symbols need to be kept/exposed
+# as Module._swr_push_* for the page shell (C++ uses EMSCRIPTEN_KEEPALIVE).
+WEB_LDFLAGS_ZIG = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
+  -sPTHREAD_POOL_SIZE=32 \
+  -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
+  -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
+  -sASSERTIONS=1 -sEXIT_RUNTIME=0 \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 \
+  -sEXPORTED_FUNCTIONS=_main,_swr_push_key,_swr_push_mouse_button,_swr_push_mouse_motion,_swr_push_wheel,_swr_push_visibility \
+  -g2
+
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
 
@@ -134,11 +166,56 @@ $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
 
 $(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile
 	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten em++ not found. Activate/install emsdk first."; exit 1; }
-	@mkdir -p $(WEB_BUILD_DIR)
+	@mkdir -p $(CPP_WEB_DIR)
 	$(EMCXX) $(WEB_CXXFLAGS) -o $(WEB_TARGET) $(SOURCES) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file web_shell.html
 
-web: $(WEB_TARGET)
-	@echo "Web build written to $(WEB_BUILD_DIR)/"
+# Zig wasm archive. Reuses the Zig build's own compile/cache; emits a static
+# .a that emcc links below.
+$(ZIG_WEB_LIB): $(ZIG_SOURCES) $(ZIG_SRC_DIR)/build.zig $(ZIG_SRC_DIR)/build.zig.zon
+	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
+	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG)."; exit 1; }
+	@echo "Building Zig rasterizer for WebAssembly ($(ZIG_OPT))..."
+	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build web \
+		--prefix $(abspath $(ZIG_BUILD_DIR)) \
+		--cache-dir $(abspath $(ZIG_CACHE))/local \
+		--global-cache-dir $(abspath $(ZIG_CACHE))/global \
+		-Doptimize=$(ZIG_OPT) \
+		-Demscripten-sysroot=$(abspath $(EM_SYSROOT_INC))
+
+# joltc + physics_setup wrappers compiled to wasm (matching the prebuilt Jolt
+# WASM ABI). These are the only C++ objects the Zig web build needs.
+$(ZIG_JOLTC_WEB_DIR)/joltc.o: $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h Makefile
+	@mkdir -p $(ZIG_JOLTC_WEB_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/joltc.cpp -o $@
+$(ZIG_JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
+	@mkdir -p $(ZIG_JOLTC_WEB_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/physics_setup.cpp -o $@
+
+# Final Zig web link: Zig wasm archive + joltc wasm + the shared Jolt WASM lib,
+# with the JS glue (--js-library) and the same page shell as the C++ build.
+$(ZIG_WEB_TARGET): $(ZIG_WEB_LIB) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
+	@mkdir -p $(ZIG_WEB_DIR)
+	$(EMCXX) -o $(ZIG_WEB_TARGET) \
+		$(ZIG_WEB_LIB) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
+		$(WEB_LDFLAGS_ZIG) --js-library web_zig_lib.js \
+		$(WEB_PRELOADS) --shell-file web_shell.html
+
+# Landing page that links the per-language builds at /cpp/ and /zig/.
+$(WEB_BUILD_DIR)/index.html: web_index.html
+	@mkdir -p $(WEB_BUILD_DIR)
+	@cp web_index.html $@
+
+web-cpp: $(WEB_TARGET) $(WEB_BUILD_DIR)/index.html
+	@echo "C++ web build written to $(CPP_WEB_DIR)/"
+
+web-zig: $(ZIG_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
+	@echo "Zig web build written to $(ZIG_WEB_DIR)/"
+
+# `web` builds the Zig target (the one we run perf comparisons against). Use
+# `web-cpp` for the C++ page or `web-all` for both.
+web: web-zig
+
+web-all: web-cpp web-zig
 
 # Assemble + sign a macOS .app bundle. Used by both the C++ and Zig builds so
 # each toolchain produces a first-class, icon-decorated, console-free app.
@@ -190,12 +267,11 @@ $(ZIG_BIN): $(ZIG_SOURCES) $(ZIG_SRC_DIR)/build.zig $(ZIG_SRC_DIR)/build.zig.zon
 		-Djolt-lib=$(abspath $(JOLT_LIB)) \
 		-Djoltc-lib=$(abspath $(JOLTC_LIB))
 
-$(ZIG_APP): $(ZIG_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
-	$(call make_app_bundle,$(ZIG_BIN),$(ZIG_APP))
-
+# The Zig build now assembles + signs build/zig/Raster.app itself (see
+# build.zig), so the bin rule already produces the bundle. No make_app_bundle.
 zig-bin: $(ZIG_BIN)
 
-zig: $(ZIG_APP)
+zig: $(ZIG_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -209,4 +285,4 @@ clean-zig:
 clean-web:
 	rm -rf $(WEB_BUILD_DIR)
 
-.PHONY: clean clean-cpp clean-zig clean-web app all web zig zig-bin
+.PHONY: clean clean-cpp clean-zig clean-web app all web web-cpp web-zig web-all zig zig-bin

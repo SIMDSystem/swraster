@@ -2,6 +2,7 @@
 // Jolt C++ usage is routed through the joltc wrapper (jolt.zig).
 
 const std = @import("std");
+const dbg = @import("dbg.zig");
 const geom = @import("geometry.zig");
 const tex = @import("texture.zig");
 const jolt = @import("jolt.zig");
@@ -191,7 +192,7 @@ pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
     defer lid_base_pts.deinit();
     if (make_hull(lid_base_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
 
-    std.debug.print("Jolt: Teapot compound collision created (body + handle + spout + lid_top + lid_base)\n", .{});
+    dbg.print("Jolt: Teapot compound collision created (body + handle + spout + lid_top + lid_base)\n", .{});
     return jolt.jph_compound_builder_build(builder);
 }
 
