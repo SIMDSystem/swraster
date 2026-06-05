@@ -23,30 +23,39 @@ pub const Vec3 = struct {
     pub inline fn constant(s: f32) Vec3 {
         return .{ .x = s, .y = s, .z = s };
     }
+    pub inline fn vec(a: Vec3) @Vector(3, f32) {
+        return .{ a.x, a.y, a.z };
+    }
+    pub inline fn fromVec(v: @Vector(3, f32)) Vec3 {
+        return .{ .x = v[0], .y = v[1], .z = v[2] };
+    }
     pub inline fn add(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z };
+        return fromVec(a.vec() + b.vec());
     }
     pub inline fn sub(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z };
+        return fromVec(a.vec() - b.vec());
     }
     pub inline fn scale(a: Vec3, s: f32) Vec3 {
-        return .{ .x = a.x * s, .y = a.y * s, .z = a.z * s };
+        return fromVec(a.vec() * @as(@Vector(3, f32), @splat(s)));
     }
     pub inline fn neg(a: Vec3) Vec3 {
-        return .{ .x = -a.x, .y = -a.y, .z = -a.z };
+        return fromVec(-a.vec());
     }
     pub inline fn dot(a: Vec3, b: Vec3) f32 {
-        return a.x * b.x + a.y * b.y + a.z * b.z;
+        return @reduce(.Add, a.vec() * b.vec());
     }
     pub inline fn cross(a: Vec3, b: Vec3) Vec3 {
-        return .{
-            .x = a.y * b.z - a.z * b.y,
-            .y = a.z * b.x - a.x * b.z,
-            .z = a.x * b.y - a.y * b.x,
-        };
+        const av = a.vec();
+        const bv = b.vec();
+        const a_yzx = @shuffle(f32, av, undefined, [3]i32{ 1, 2, 0 });
+        const a_zxy = @shuffle(f32, av, undefined, [3]i32{ 2, 0, 1 });
+        const b_yzx = @shuffle(f32, bv, undefined, [3]i32{ 1, 2, 0 });
+        const b_zxy = @shuffle(f32, bv, undefined, [3]i32{ 2, 0, 1 });
+        return fromVec(a_yzx * b_zxy - a_zxy * b_yzx);
     }
     pub inline fn squaredNorm(a: Vec3) f32 {
-        return a.x * a.x + a.y * a.y + a.z * a.z;
+        const v = a.vec();
+        return @reduce(.Add, v * v);
     }
     pub inline fn norm(a: Vec3) f32 {
         return @sqrt(a.squaredNorm());
@@ -58,7 +67,7 @@ pub const Vec3 = struct {
         return a.scale(inv);
     }
     pub inline fn cwiseProduct(a: Vec3, b: Vec3) Vec3 {
-        return .{ .x = a.x * b.x, .y = a.y * b.y, .z = a.z * b.z };
+        return fromVec(a.vec() * b.vec());
     }
 };
 
@@ -77,14 +86,20 @@ pub const Vec4 = struct {
     pub inline fn head3(a: Vec4) Vec3 {
         return .{ .x = a.x, .y = a.y, .z = a.z };
     }
+    pub inline fn vec(a: Vec4) @Vector(4, f32) {
+        return .{ a.x, a.y, a.z, a.w };
+    }
+    pub inline fn fromVec(v: @Vector(4, f32)) Vec4 {
+        return .{ .x = v[0], .y = v[1], .z = v[2], .w = v[3] };
+    }
     pub inline fn add(a: Vec4, b: Vec4) Vec4 {
-        return .{ .x = a.x + b.x, .y = a.y + b.y, .z = a.z + b.z, .w = a.w + b.w };
+        return fromVec(a.vec() + b.vec());
     }
     pub inline fn sub(a: Vec4, b: Vec4) Vec4 {
-        return .{ .x = a.x - b.x, .y = a.y - b.y, .z = a.z - b.z, .w = a.w - b.w };
+        return fromVec(a.vec() - b.vec());
     }
     pub inline fn scale(a: Vec4, s: f32) Vec4 {
-        return .{ .x = a.x * s, .y = a.y * s, .z = a.z * s, .w = a.w * s };
+        return fromVec(a.vec() * @as(@Vector(4, f32), @splat(s)));
     }
 };
 
@@ -93,10 +108,14 @@ pub const Mat3 = struct {
     m: [3][3]f32 = .{ .{ 0, 0, 0 }, .{ 0, 0, 0 }, .{ 0, 0, 0 } },
 
     pub inline fn mulVec3(a: Mat3, v: Vec3) Vec3 {
+        const vv: @Vector(3, f32) = .{ v.x, v.y, v.z };
+        const r0: @Vector(3, f32) = a.m[0];
+        const r1: @Vector(3, f32) = a.m[1];
+        const r2: @Vector(3, f32) = a.m[2];
         return .{
-            .x = a.m[0][0] * v.x + a.m[0][1] * v.y + a.m[0][2] * v.z,
-            .y = a.m[1][0] * v.x + a.m[1][1] * v.y + a.m[1][2] * v.z,
-            .z = a.m[2][0] * v.x + a.m[2][1] * v.y + a.m[2][2] * v.z,
+            .x = @reduce(.Add, r0 * vv),
+            .y = @reduce(.Add, r1 * vv),
+            .z = @reduce(.Add, r2 * vv),
         };
     }
 };
@@ -123,25 +142,38 @@ pub const Mat4 = struct {
         a.m[row][col] = v;
     }
     pub fn mul(a: Mat4, b: Mat4) Mat4 {
+        // Each result row is a linear combination of b's rows, weighted by a's
+        // row entries. This keeps every lane busy (no horizontal adds) and uses
+        // fused multiply-add — the SIMD-friendly GEMM form Eigen would emit.
+        const b0: @Vector(4, f32) = b.m[0];
+        const b1: @Vector(4, f32) = b.m[1];
+        const b2: @Vector(4, f32) = b.m[2];
+        const b3: @Vector(4, f32) = b.m[3];
         var r = Mat4{};
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            var j: usize = 0;
-            while (j < 4) : (j += 1) {
-                var sum: f32 = 0;
-                var k: usize = 0;
-                while (k < 4) : (k += 1) sum += a.m[i][k] * b.m[k][j];
-                r.m[i][j] = sum;
-            }
+        inline for (0..4) |i| {
+            const ai0: @Vector(4, f32) = @splat(a.m[i][0]);
+            const ai1: @Vector(4, f32) = @splat(a.m[i][1]);
+            const ai2: @Vector(4, f32) = @splat(a.m[i][2]);
+            const ai3: @Vector(4, f32) = @splat(a.m[i][3]);
+            var acc = ai0 * b0;
+            acc = @mulAdd(@Vector(4, f32), ai1, b1, acc);
+            acc = @mulAdd(@Vector(4, f32), ai2, b2, acc);
+            acc = @mulAdd(@Vector(4, f32), ai3, b3, acc);
+            r.m[i] = acc;
         }
         return r;
     }
     pub inline fn mulVec4(a: Mat4, v: Vec4) Vec4 {
+        const vv: @Vector(4, f32) = .{ v.x, v.y, v.z, v.w };
+        const r0: @Vector(4, f32) = a.m[0];
+        const r1: @Vector(4, f32) = a.m[1];
+        const r2: @Vector(4, f32) = a.m[2];
+        const r3: @Vector(4, f32) = a.m[3];
         return .{
-            .x = a.m[0][0] * v.x + a.m[0][1] * v.y + a.m[0][2] * v.z + a.m[0][3] * v.w,
-            .y = a.m[1][0] * v.x + a.m[1][1] * v.y + a.m[1][2] * v.z + a.m[1][3] * v.w,
-            .z = a.m[2][0] * v.x + a.m[2][1] * v.y + a.m[2][2] * v.z + a.m[2][3] * v.w,
-            .w = a.m[3][0] * v.x + a.m[3][1] * v.y + a.m[3][2] * v.z + a.m[3][3] * v.w,
+            .x = @reduce(.Add, r0 * vv),
+            .y = @reduce(.Add, r1 * vv),
+            .z = @reduce(.Add, r2 * vv),
+            .w = @reduce(.Add, r3 * vv),
         };
     }
     pub inline fn block33(a: *const Mat4) Mat3 {
@@ -200,6 +232,57 @@ pub const Quat = struct {
     z: f32 = 0,
     w: f32 = 1,
 };
+
+test "simd math matches scalar reference" {
+    const expectApproxEqAbs = std.testing.expectApproxEqAbs;
+
+    // cross product right-hand rule
+    const c = Vec3.init(1, 0, 0).cross(Vec3.init(0, 1, 0));
+    try expectApproxEqAbs(@as(f32, 0), c.x, 1e-5);
+    try expectApproxEqAbs(@as(f32, 0), c.y, 1e-5);
+    try expectApproxEqAbs(@as(f32, 1), c.z, 1e-5);
+
+    try expectApproxEqAbs(@as(f32, 20), Vec3.init(1, 2, 3).dot(Vec3.init(2, 3, 4)), 1e-5);
+
+    // mat*vec against hand-rolled scalar dot products
+    var a = Mat4{};
+    var seed: f32 = 1.0;
+    inline for (0..4) |i| inline for (0..4) |j| {
+        a.m[i][j] = seed;
+        seed += 1.3;
+    };
+    const v = Vec4.init(0.5, -1.5, 2.0, 3.0);
+    const r = a.mulVec4(v);
+    inline for (0..4) |i| {
+        const ref = a.m[i][0] * v.x + a.m[i][1] * v.y + a.m[i][2] * v.z + a.m[i][3] * v.w;
+        const got = switch (i) {
+            0 => r.x,
+            1 => r.y,
+            2 => r.z,
+            else => r.w,
+        };
+        try expectApproxEqAbs(ref, got, 1e-3);
+    }
+
+    // identity is a multiplicative identity, and (A*B)*v == A*(B*v)
+    const id = Mat4.identity();
+    const ai = a.mul(id);
+    inline for (0..4) |i| inline for (0..4) |j| {
+        try expectApproxEqAbs(a.m[i][j], ai.m[i][j], 1e-3);
+    };
+    var b = Mat4{};
+    seed = -2.0;
+    inline for (0..4) |i| inline for (0..4) |j| {
+        b.m[i][j] = seed;
+        seed += 0.7;
+    };
+    const lhs = a.mul(b).mulVec4(v);
+    const rhs = a.mulVec4(b.mulVec4(v));
+    try expectApproxEqAbs(lhs.x, rhs.x, 1e-2);
+    try expectApproxEqAbs(lhs.y, rhs.y, 1e-2);
+    try expectApproxEqAbs(lhs.z, rhs.z, 1e-2);
+    try expectApproxEqAbs(lhs.w, rhs.w, 1e-2);
+}
 
 // Eigen's Quaternionf::setFromTwoVectors(a, b): the shortest-arc rotation that
 // maps unit vector a onto unit vector b.

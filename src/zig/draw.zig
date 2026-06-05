@@ -374,7 +374,11 @@ pub fn draw_spotlight_luminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32,
     }
 }
 
-pub fn draw_triangle_barycentric_strip(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, normal_buffer: ?[*]f32, linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
+pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalias depth_buffer: [*]f32, noalias normal_buffer: ?[*]f32, noalias linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, noalias texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, noalias shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
+    // Allow FMA contraction + reassociation across the whole per-pixel loop.
+    // This restores the -ffast-math style codegen Eigen relied on; barycentric
+    // interpolation (a*w0 + b*w1 + c*w2) collapses into mul + fma chains.
+    @setFloatMode(.optimized);
     var fallback_setup: RasterTriangleSetup = undefined;
     var setup: *const RasterTriangleSetup = undefined;
     if (precomputed_setup == null or !precomputed_setup.?.valid) {
@@ -904,7 +908,8 @@ const ssao_kernel: SsaoKernel = blk: {
     break :blk t;
 };
 
-pub fn apply_ssao_strip(pixels: [*]u8, pitch: i32, linear_z: [*]const f32, normal_buffer: [*]const f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, frame_index: u32, proj00: f32, proj11: f32) void {
+pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]const f32, noalias normal_buffer: [*]const f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, frame_index: u32, proj00: f32, proj11: f32) void {
+    @setFloatMode(.optimized);
     const world_radius: f32 = 0.7;
     const depth_bias: f32 = 0.03;
     const ao_intensity: f32 = 1.25;

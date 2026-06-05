@@ -122,8 +122,7 @@ fn append_limited(dst: *RenderTriangleList, dst_count: *usize, src: []const Rend
     const room = if (dst_count.* < dst.items.len) dst.items.len - dst_count.* else 0;
     const write_count = @min(room, src.len);
     const mid = dst_count.*;
-    var k: usize = 0;
-    while (k < write_count) : (k += 1) dst.items[dst_count.* + k] = src[k];
+    @memcpy(dst.items[mid..][0..write_count], src[0..write_count]);
     dst_count.* += write_count;
     if (keep_sorted and write_count > 0 and mid > 0) {
         // C++ std::inplace_merge: both runs are already sorted, so a single

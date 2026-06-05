@@ -91,6 +91,7 @@ pub fn draw_shadow_triangle(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: 
 }
 
 pub fn draw_shadow_triangle_strip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, v2: *const ShadowVertex, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, screendoor_mask: i32) void {
+    @setFloatMode(.optimized);
     var x_min: i32 = @intFromFloat(@floor(@min(v0.x, @min(v1.x, v2.x))));
     var x_max: i32 = @intFromFloat(@ceil(@max(v0.x, @max(v1.x, v2.x))));
     var y_min: i32 = @intFromFloat(@floor(@min(v0.y, @min(v1.y, v2.y))));

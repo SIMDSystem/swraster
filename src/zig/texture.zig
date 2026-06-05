@@ -146,18 +146,31 @@ pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, 
     const c01 = level.rgb[@intCast((y1 & ym) * level.w + (x0 & xm))];
     const c11 = level.rgb[@intCast((y1 & ym) * level.w + (x1 & xm))];
 
-    const w00 = (1.0 - tx) * (1.0 - ty);
-    const w10 = tx * (1.0 - ty);
-    const w01 = (1.0 - tx) * ty;
-    const w11 = tx * ty;
+    // Blend all three channels at once: one (r,g,b) FMA chain over the 4 texels
+    // instead of three independent scalar dot products.
+    const s00: @Vector(3, f32) = @splat((1.0 - tx) * (1.0 - ty));
+    const s10: @Vector(3, f32) = @splat(tx * (1.0 - ty));
+    const s01: @Vector(3, f32) = @splat((1.0 - tx) * ty);
+    const s11: @Vector(3, f32) = @splat(tx * ty);
 
-    const r: u32 = @intFromFloat(@as(f32, @floatFromInt((c00 >> 16) & 0xff)) * w00 + @as(f32, @floatFromInt((c10 >> 16) & 0xff)) * w10 +
-        @as(f32, @floatFromInt((c01 >> 16) & 0xff)) * w01 + @as(f32, @floatFromInt((c11 >> 16) & 0xff)) * w11 + 0.5);
-    const g: u32 = @intFromFloat(@as(f32, @floatFromInt((c00 >> 8) & 0xff)) * w00 + @as(f32, @floatFromInt((c10 >> 8) & 0xff)) * w10 +
-        @as(f32, @floatFromInt((c01 >> 8) & 0xff)) * w01 + @as(f32, @floatFromInt((c11 >> 8) & 0xff)) * w11 + 0.5);
-    const b: u32 = @intFromFloat(@as(f32, @floatFromInt(c00 & 0xff)) * w00 + @as(f32, @floatFromInt(c10 & 0xff)) * w10 +
-        @as(f32, @floatFromInt(c01 & 0xff)) * w01 + @as(f32, @floatFromInt(c11 & 0xff)) * w11 + 0.5);
+    var acc = unpack_rgb_f32(c00) * s00;
+    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c10), s10, acc);
+    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c01), s01, acc);
+    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c11), s11, acc);
+    acc += @as(@Vector(3, f32), @splat(0.5));
+
+    const r: u32 = @intFromFloat(acc[0]);
+    const g: u32 = @intFromFloat(acc[1]);
+    const b: u32 = @intFromFloat(acc[2]);
     return (r << 16) | (g << 8) | b;
+}
+
+inline fn unpack_rgb_f32(c: u32) @Vector(3, f32) {
+    return .{
+        @floatFromInt((c >> 16) & 0xff),
+        @floatFromInt((c >> 8) & 0xff),
+        @floatFromInt(c & 0xff),
+    };
 }
 
 pub inline fn sample_texture_anisotropic(level: *const PackedTextureLevel, u: f32, v: f32, axis_u: f32, axis_v: f32, taps: i32) u32 {

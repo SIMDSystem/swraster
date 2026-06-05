@@ -221,10 +221,10 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     const start_idx = worker_id * instances_per_thread;
     const end_idx = @min(start_idx + instances_per_thread, num_instances);
 
-    var eye_space_vertices = geom.RenderVertexList.init(std.heap.c_allocator);
-    defer eye_space_vertices.deinit();
-    var clip_space_vertices = geom.RenderVertexList.init(std.heap.c_allocator);
-    defer clip_space_vertices.deinit();
+    // Persistent per-worker scratch (capacity retained across frames); both are
+    // fully overwritten by transform_vertices each instance, so no clear needed.
+    const eye_space_vertices = &output.eye_scratch;
+    const clip_space_vertices = &output.clip_scratch;
 
     const pose_snapshot = tl_shared.pose_snapshot.?;
     const NS = config.NUM_STRIPS;
@@ -343,7 +343,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
             }
         }
 
-        clip.transform_vertices(src_vertices, &eye_space_vertices, &mv);
+        clip.transform_vertices(src_vertices, eye_space_vertices, &mv);
 
         if (camera_visible and !needs_near_clip) {
             const nv = eye_space_vertices.items.len;

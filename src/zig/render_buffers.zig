@@ -146,6 +146,11 @@ pub const TLThreadOutput = struct {
     merge_scratch: RenderTriangleList = undefined,
     // (key, index) scratch for the local key-sort; per-worker, reused.
     sort_keys: std.array_list.Managed(keysort.KeyIdx) = undefined,
+    // Persistent per-worker transform scratch, reused across frames (the C++
+    // build constructs these per frame). transform_vertices resizes+overwrites
+    // both fully, so retaining the buffers just avoids re-allocation.
+    eye_scratch: RenderVertexList = undefined,
+    clip_scratch: RenderVertexList = undefined,
 };
 
 pub const RasterSharedData = struct {

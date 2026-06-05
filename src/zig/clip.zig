@@ -190,6 +190,7 @@ pub fn build_spot_shadow_tex_matrix(light_view_eye: *const Mat4, fov_degrees: f3
 }
 
 pub fn transform_vertices(source_vertices: *const RenderVertexList, transformed_vertices: *RenderVertexList, transform: *const Mat4) void {
+    @setFloatMode(.optimized);
     const n = source_vertices.items.len;
     transformed_vertices.resize(n) catch unreachable;
     const normal_matrix: Mat3 = transform.block33();
@@ -209,6 +210,7 @@ pub fn transform_vertices(source_vertices: *const RenderVertexList, transformed_
 }
 
 pub fn project_vertex(v3d: *const Vertex3D, screen_width: i32, screen_height: i32) VertexVaryings {
+    @setFloatMode(.optimized);
     const w = v3d.position.w;
     const inv_w = 1.0 / w;
     const x = v3d.position.x * inv_w;
@@ -303,6 +305,7 @@ pub fn is_back_face_clip_vertices(v0: *const ClipVertex, v1: *const ClipVertex, 
 }
 
 pub fn project_clip_vertex(v: *const ClipVertex, projection: *const Mat4, shadow_matrix: *const Mat4, screen_width: i32, screen_height: i32) VertexVaryings {
+    @setFloatMode(.optimized);
     var projected = Vertex3D{};
     projected.position = projection.mulVec4(v.position);
     projected.r = v.r;

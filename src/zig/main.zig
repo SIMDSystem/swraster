@@ -288,6 +288,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .shadow_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
                 .merge_scratch = buffers.RenderTriangleList.init(alloc),
                 .sort_keys = std.array_list.Managed(keysort.KeyIdx).init(alloc),
+                .eye_scratch = geom.RenderVertexList.init(alloc),
+                .clip_scratch = geom.RenderVertexList.init(alloc),
             };
             out.opaque_list.ensureTotalCapacity(1000) catch unreachable;
             out.trans.ensureTotalCapacity(1000) catch unreachable;
