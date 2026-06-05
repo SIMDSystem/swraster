@@ -468,24 +468,25 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
         profiler_record_tl(*ctx.profiler, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns,
                            (uint8_t)TLJobTag::PerInstance);
 
+        // Sort by a (sort_z, index) key rather than relocating the ~480-byte
+        // RenderTriangle structs through std::sort: sort the 8-byte keys, then
+        // gather each struct exactly once (see keysort.h). Ascending =
+        // front-to-back, descending = back-to-front.
+        auto tri_z = [](const RenderTriangle& t) { return t.sort_z; };
+        auto& sort_keys   = output.sort_keys;
+        auto& sort_gather = output.sort_gather;
         if (ENABLE_RGB_TRIANGLE_SORT) {
-            std::sort(local_opaque.begin(), local_opaque.end(),
-                      [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
-            std::sort(local_trans.begin(), local_trans.end(),
-                      [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; });
+            sort_by_key(local_opaque, true,  sort_keys, sort_gather, tri_z);
+            sort_by_key(local_trans,  false, sort_keys, sort_gather, tri_z);
             for (int s = 0; s < NUM_TILE_BINS; s++) {
-                std::sort(local_opaque_bins[s].begin(), local_opaque_bins[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
-                std::sort(local_trans_bins[s].begin(), local_trans_bins[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; });
+                sort_by_key(local_opaque_bins[s], true,  sort_keys, sort_gather, tri_z);
+                sort_by_key(local_trans_bins[s],  false, sort_keys, sort_gather, tri_z);
             }
         }
         if (ENABLE_SHADOW_TRIANGLE_SORT) {
-            std::sort(local_shadow.begin(), local_shadow.end(),
-                      [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
+            sort_by_key(local_shadow, true, sort_keys, sort_gather, tri_z);
             for (int s = 0; s < NUM_TILE_BINS; s++) {
-                std::sort(local_shadow_bins[s].begin(), local_shadow_bins[s].end(),
-                          [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; });
+                sort_by_key(local_shadow_bins[s], true, sort_keys, sort_gather, tri_z);
             }
         }
 

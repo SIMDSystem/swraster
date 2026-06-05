@@ -20,6 +20,7 @@
 #include "draw.h"     // VertexVaryings, RasterTriangleSetup
 #include "shadow.h"   // ShadowVertex
 #include "texture.h"  // PackedTexture (used as opaque pointer here)
+#include "keysort.h"  // KeyIdx + sort_by_key scratch
 
 struct CubeInstance; // defined in scene.h
 
@@ -155,6 +156,10 @@ struct TLThreadOutput {
     std::vector<std::vector<RenderTriangle>> opaque_bins;
     std::vector<std::vector<RenderTriangle>> trans_bins;
     std::vector<std::vector<RenderTriangle>> shadow_bins;
+    // Reused scratch for the local key-sort (see keysort.h); per-worker so it
+    // never contends and retains capacity across frames.
+    std::vector<KeyIdx>         sort_keys;
+    std::vector<RenderTriangle> sort_gather;
 };
 
 // Inputs every raster worker reads from. Double-buffered so we can publish
