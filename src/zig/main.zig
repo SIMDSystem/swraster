@@ -24,6 +24,7 @@ const pool_worker = @import("pool_worker.zig");
 const render_loop = @import("render_loop.zig");
 const cull = @import("cull.zig");
 const jolt = @import("jolt.zig");
+const keysort = @import("keysort.zig");
 
 const Surface = platform.Surface;
 const PackedTexture = tex.PackedTexture;
@@ -286,11 +287,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .trans_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
                 .shadow_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
                 .merge_scratch = buffers.RenderTriangleList.init(alloc),
+                .sort_keys = std.array_list.Managed(keysort.KeyIdx).init(alloc),
             };
             out.opaque_list.ensureTotalCapacity(1000) catch unreachable;
             out.trans.ensureTotalCapacity(1000) catch unreachable;
             out.shadow.ensureTotalCapacity(1000) catch unreachable;
-            out.merge_scratch.ensureTotalCapacity(1000) catch unreachable;
+            out.merge_scratch.ensureTotalCapacity(2000) catch unreachable;
+            out.sort_keys.ensureTotalCapacity(2000) catch unreachable;
             var s: usize = 0;
             while (s < nb) : (s += 1) {
                 out.opaque_bins[s] = buffers.RenderTriangleList.init(alloc);

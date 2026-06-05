@@ -12,6 +12,7 @@ const draw = @import("draw.zig");
 const shadow = @import("shadow.zig");
 const tex = @import("texture.zig");
 const scene = @import("scene.zig");
+const keysort = @import("keysort.zig");
 
 const Vec3 = la.Vec3;
 const Mat4 = la.Mat4;
@@ -139,10 +140,12 @@ pub const TLThreadOutput = struct {
     opaque_bins: []RenderTriangleList = &.{},
     trans_bins: []RenderTriangleList = &.{},
     shadow_bins: []RenderTriangleList = &.{},
-    // Reusable scratch for the O(n) two-run merge in the scatter-merge phase.
-    // Per-worker so it never contends; only ever holds the smaller of the two
-    // runs being merged.
+    // Reusable scratch for the O(n) two-run merge in the scatter-merge phase
+    // and as the gather buffer for the key-sort. Per-worker so it never
+    // contends.
     merge_scratch: RenderTriangleList = undefined,
+    // (key, index) scratch for the local key-sort; per-worker, reused.
+    sort_keys: std.array_list.Managed(keysort.KeyIdx) = undefined,
 };
 
 pub const RasterSharedData = struct {

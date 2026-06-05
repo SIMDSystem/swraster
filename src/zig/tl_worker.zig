@@ -17,6 +17,7 @@ const profiler = @import("thread_profiler.zig");
 const renderer_context = @import("renderer_context.zig");
 const geom = @import("geometry.zig");
 const merge = @import("merge.zig");
+const keysort = @import("keysort.zig");
 
 const Vec3 = la.Vec3;
 const Vec4 = la.Vec4;
@@ -37,6 +38,9 @@ fn lessZ(_: void, a: RenderTriangle, b: RenderTriangle) bool {
 }
 fn greaterZ(_: void, a: RenderTriangle, b: RenderTriangle) bool {
     return a.sort_z > b.sort_z;
+}
+fn triSortZ(t: *const RenderTriangle) f32 {
+    return t.sort_z;
 }
 
 fn screen_tile_range(x0: f32, x1: f32, x2: f32, y0: f32, y1: f32, y2: f32, width: i32, height: i32, first_col: *i32, last_col: *i32, first_strip: *i32, last_strip: *i32) bool {
@@ -498,25 +502,27 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     profiler.profiler_record_tl(ctx.profiler.?, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns, @intFromEnum(TLJobTag.PerInstance));
 
     // Initial sort of freshly-emitted (unsorted) triangles. This is C++'s
-    // std::sort site; the Zig equivalent is std.sort.pdq (pattern-defeating
-    // quicksort / introsort). Crucially NOT std.mem.sort, which is the stable
-    // block sort: it stack-allocates [512]RenderTriangle (~240 KB) on every
-    // call and is the dominant reason the Zig sorts were pathologically slow.
+    // std::sort site. Rather than sort the ~480-byte RenderTriangle structs in
+    // place (pdq/block both swap whole structs, ~3*n*log2(n) * 480 bytes of
+    // movement -- this was the trailing light-blue "local sort" stage), we sort
+    // (sort_z, index) pairs and gather each struct exactly once. See keysort.zig.
+    const ks = &output.sort_keys;
+    const gb = &output.merge_scratch;
     if (config.ENABLE_RGB_TRIANGLE_SORT) {
-        std.sort.pdq(RenderTriangle, output.opaque_list.items, {}, lessZ);
-        std.sort.pdq(RenderTriangle, output.trans.items, {}, greaterZ);
+        keysort.sortByKey(RenderTriangle, output.opaque_list.items, true, ks, gb, triSortZ);
+        keysort.sortByKey(RenderTriangle, output.trans.items, false, ks, gb, triSortZ);
         var s: usize = 0;
         const nb: usize = @intCast(config.NUM_TILE_BINS);
         while (s < nb) : (s += 1) {
-            std.sort.pdq(RenderTriangle, output.opaque_bins[s].items, {}, lessZ);
-            std.sort.pdq(RenderTriangle, output.trans_bins[s].items, {}, greaterZ);
+            keysort.sortByKey(RenderTriangle, output.opaque_bins[s].items, true, ks, gb, triSortZ);
+            keysort.sortByKey(RenderTriangle, output.trans_bins[s].items, false, ks, gb, triSortZ);
         }
     }
     if (config.ENABLE_SHADOW_TRIANGLE_SORT) {
-        std.sort.pdq(RenderTriangle, output.shadow.items, {}, lessZ);
+        keysort.sortByKey(RenderTriangle, output.shadow.items, true, ks, gb, triSortZ);
         var s: usize = 0;
         const nb: usize = @intCast(config.NUM_TILE_BINS);
-        while (s < nb) : (s += 1) std.sort.pdq(RenderTriangle, output.shadow_bins[s].items, {}, lessZ);
+        while (s < nb) : (s += 1) keysort.sortByKey(RenderTriangle, output.shadow_bins[s].items, true, ks, gb, triSortZ);
     }
 
     const phase1_end_ts = platform.PerfCounter();
