@@ -7,7 +7,20 @@
 // algebra so `projection * v` reproduces Eigen's behaviour 1:1.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const math = std.math;
+
+// Fused multiply-add that stays fast on every target. wasm has no hardware FMA,
+// so @mulAdd there lowers to fmaf libcalls (and a @Vector @mulAdd scalarizes
+// into several) — ruinous in per-pixel/per-vertex hot loops. On wasm we emit a
+// plain mul+add (one v128 mul + one v128 add); natively we keep the real
+// NEON/AVX FMA. The tiny rounding difference is irrelevant for shading/transform.
+pub inline fn mulAdd(comptime T: type, a: T, b: T, c: T) T {
+    // Plain mul+add on wasm (no @mulAdd → no fmaf libcall; wasm has no vector
+    // FMA anyway), real NEON/AVX FMA natively.
+    if (builtin.target.os.tag == .emscripten) return a * b + c;
+    return @mulAdd(T, a, b, c);
+}
 
 pub const Vec3 = struct {
     x: f32 = 0,
@@ -156,9 +169,9 @@ pub const Mat4 = struct {
             const ai2: @Vector(4, f32) = @splat(a.m[i][2]);
             const ai3: @Vector(4, f32) = @splat(a.m[i][3]);
             var acc = ai0 * b0;
-            acc = @mulAdd(@Vector(4, f32), ai1, b1, acc);
-            acc = @mulAdd(@Vector(4, f32), ai2, b2, acc);
-            acc = @mulAdd(@Vector(4, f32), ai3, b3, acc);
+            acc = mulAdd(@Vector(4, f32), ai1, b1, acc);
+            acc = mulAdd(@Vector(4, f32), ai2, b2, acc);
+            acc = mulAdd(@Vector(4, f32), ai3, b3, acc);
             r.m[i] = acc;
         }
         return r;

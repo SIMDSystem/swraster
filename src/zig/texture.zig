@@ -4,6 +4,7 @@
 const std = @import("std");
 const platform = @import("platform.zig");
 const pixel = @import("pixel.zig");
+const la = @import("linalg.zig");
 const Surface = platform.Surface;
 
 pub const PackedTextureLevel = struct {
@@ -130,6 +131,10 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
 }
 
 pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, v: f32) u32 {
+    // Match clang's default -ffp-contract=on (the C++ build contracts mul+add
+    // within expressions); Zig defaults to strict, which left this per-pixel
+    // sampler emitting un-contracted, un-reassociated float ops vs C++.
+    @setFloatMode(.optimized);
     const fx = u * @as(f32, @floatFromInt(level.w)) - 0.5;
     const fy = v * @as(f32, @floatFromInt(level.h)) - 0.5;
     const x0: i32 = @intFromFloat(@floor(fx));
@@ -154,9 +159,9 @@ pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, 
     const s11: @Vector(3, f32) = @splat(tx * ty);
 
     var acc = unpack_rgb_f32(c00) * s00;
-    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c10), s10, acc);
-    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c01), s01, acc);
-    acc = @mulAdd(@Vector(3, f32), unpack_rgb_f32(c11), s11, acc);
+    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c10), s10, acc);
+    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c01), s01, acc);
+    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c11), s11, acc);
     acc += @as(@Vector(3, f32), @splat(0.5));
 
     const r: u32 = @intFromFloat(acc[0]);
@@ -174,6 +179,7 @@ inline fn unpack_rgb_f32(c: u32) @Vector(3, f32) {
 }
 
 pub inline fn sample_texture_anisotropic(level: *const PackedTextureLevel, u: f32, v: f32, axis_u: f32, axis_v: f32, taps: i32) u32 {
+    @setFloatMode(.optimized);
     if (taps <= 1) return sample_texture_bilinear(level, u, v);
     var r: u32 = 0;
     var g: u32 = 0;

@@ -98,7 +98,32 @@ pub fn build(b: *std.Build) void {
     //   * -Demscripten-sysroot: emscripten's libc headers, passed by the Makefile.
     const web_step = b.step("web", "Build the Zig wasm static library for emcc to link");
     var web_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .emscripten };
-    web_query.cpu_features_add = std.Target.wasm.featureSet(&.{ .atomics, .bulk_memory });
+    // simd128 lets LLVM lower our @Vector math to wasm v128 ops (the native
+    // build gets NEON/AVX); without it every @Vector is scalarized, which is
+    // why the wasm build trailed C++ (-msimd128). atomics+bulk_memory back the
+    // shared-memory pthread runtime.
+    //
+    // The rest match the feature set emcc's clang enables by default for the
+    // C++ side — Zig's wasm32 baseline is bare MVP, so without them our body
+    // codegen was strictly worse than C++ on the hot pixel loop:
+    //   * nontrapping_fptoint: lowers every @intFromFloat (pack RGB, texture
+    //     unpack, @floor) to a single trunc_sat instead of a branch-guarded
+    //     trapping conversion — the loop is saturated with float->int casts.
+    //   * sign_ext: native i32.extend8/16_s instead of shift-pair shims for the
+    //     u8 channel truncations.
+    //   * mutable_globals / multivalue / extended_const: modern codegen baseline
+    //     emcc assumes; lets the linker/wasm-opt keep better lowerings.
+    // All are supported by current Chrome (incl. Apple Silicon).
+    web_query.cpu_features_add = std.Target.wasm.featureSet(&.{
+        .atomics,
+        .bulk_memory,
+        .simd128,
+        .nontrapping_fptoint,
+        .sign_ext,
+        .mutable_globals,
+        .multivalue,
+        .extended_const,
+    });
     const web_target = b.resolveTargetQuery(web_query);
     const web_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),

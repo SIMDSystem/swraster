@@ -1,5 +1,6 @@
 CXX = clang++
 EMCXX ?= em++
+EMCC ?= emcc
 EMCMAKE ?= emcmake
 
 # Standard project layout
@@ -99,8 +100,6 @@ JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
   -I$(JOLT_DIR) -I$(SRC_DIR)
 
 # --- Zig web (emscripten) build ---------------------------------------------
-# The Zig wasm archive emitted by `zig build web` (installed under build/zig/lib).
-ZIG_WEB_LIB = $(ZIG_BUILD_DIR)/lib/libswraster_web.a
 # joltc C wrapper compiled for wasm. The Zig code calls the jph_* C ABI, so we
 # build joltc.cpp + physics_setup.cpp with em++ using the SAME flags the C++ web
 # build uses for its Jolt consumers ($(WEB_CXXFLAGS)) so they match the prebuilt
@@ -111,7 +110,12 @@ ZIG_JOLTC_WEB_OBJS = $(ZIG_JOLTC_WEB_DIR)/joltc.o $(ZIG_JOLTC_WEB_DIR)/physics_s
 # (the Zig worker pool can scale to ~20 raster + physics + Jolt threads), and an
 # explicit export list since Zig's `export fn` symbols need to be kept/exposed
 # as Module._swr_push_* for the page shell (C++ uses EMSCRIPTEN_KEEPALIVE).
-WEB_LDFLAGS_ZIG = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
+# -O3 at the LINK matters: the Zig sources are compiled to a .a by Zig's own
+# LLVM, but this separate emcc link is where Binaryen's wasm-opt runs over the
+# whole module (cross-fn inlining, instruction selection, CFG cleanups). Without
+# an -O here emcc links at -O0 and skips that pass entirely — which is why the
+# Zig build trailed the single-shot `em++ -O2` C++ build regardless of SIMD.
+WEB_LDFLAGS_ZIG = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
   -sPTHREAD_POOL_SIZE=32 \
   -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
   -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
@@ -119,6 +123,30 @@ WEB_LDFLAGS_ZIG = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
   -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 \
   -sEXPORTED_FUNCTIONS=_main,_swr_push_key,_swr_push_mouse_button,_swr_push_mouse_motion,_swr_push_wheel,_swr_push_visibility \
   -g2
+
+# --- LLVM 23 codegen backend (from the active emsdk) ------------------------
+# Zig 0.16 bundles LLVM 21; emsdk ships clang/LLVM 23. Zig's wasm/aarch64
+# backends therefore trailed the clang-23 C++ build (notably SIMD/WASM codegen).
+# We keep Zig's frontend + optimizer but re-run *codegen* with LLVM 23: Zig emits
+# its optimized LLVM IR (.bc), then clang-23 (-O3) lowers it to the final object.
+# This closed essentially all of the ~20% web gap and also speeds the native
+# build. The only thing it can't change is the LLVM 21 mid-level passes Zig bakes
+# into the IR before we hand off (closes when Zig itself ships LLVM 23+).
+LLVM23_BIN = $(abspath $(EMSCRIPTEN_ROOT)/../bin)
+LLVM23_CLANG = $(LLVM23_BIN)/clang
+# wasm feature set — mirror src/zig/build.zig web_query.cpu_features_add so the
+# Zig-emitted IR and the LLVM 23 codegen agree on the enabled wasm extensions.
+ZIG_WEB_MCPU = generic+atomics+bulk_memory+simd128+nontrapping_fptoint+sign_ext+mutable_globals+multivalue+extended_const
+ZIG_WEB_LLVM23_FEATURES = -msimd128 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
+ZIG_WEB_BC = $(ZIG_WEB_DIR)/swraster_web.bc
+ZIG_WEB_OBJ = $(ZIG_WEB_DIR)/swraster_web.o
+# Native (arm64 macOS) pipeline.
+MACOS_SDK := $(shell xcrun --show-sdk-path 2>/dev/null)
+ZIG_NATIVE_MCPU = native
+ZIG_NATIVE_LLVM23_MCPU = apple-m3
+ZIG_NATIVE_BC = $(ZIG_BUILD_DIR)/swraster_native.bc
+ZIG_NATIVE_OBJ = $(ZIG_BUILD_DIR)/swraster_native.o
+ZIG_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc
 
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
@@ -169,18 +197,27 @@ $(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile
 	@mkdir -p $(CPP_WEB_DIR)
 	$(EMCXX) $(WEB_CXXFLAGS) -o $(WEB_TARGET) $(SOURCES) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file web_shell.html
 
-# Zig wasm archive. Reuses the Zig build's own compile/cache; emits a static
-# .a that emcc links below.
-$(ZIG_WEB_LIB): $(ZIG_SOURCES) $(ZIG_SRC_DIR)/build.zig $(ZIG_SRC_DIR)/build.zig.zon
-	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
+# Zig wasm via LLVM 23 (two-step). Step 1: Zig emits its optimized LLVM IR for
+# the wasm32-emscripten target (LLVM 21 frontend + mid-level passes). build-obj
+# mirrors src/zig/build.zig's web module: link_libc (-lc) for the
+# __main_argc_argv entry, multithreaded (pthreads), and the wasm feature set.
+$(ZIG_WEB_BC): $(ZIG_SOURCES)
+	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten not found (needed for the LLVM 23 backend + sysroot). Activate/install emsdk first."; exit 1; }
 	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG)."; exit 1; }
-	@echo "Building Zig rasterizer for WebAssembly ($(ZIG_OPT))..."
-	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build web \
-		--prefix $(abspath $(ZIG_BUILD_DIR)) \
+	@mkdir -p $(ZIG_WEB_DIR)
+	@echo "Emitting Zig wasm LLVM IR ($(ZIG_OPT))..."
+	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build-obj main.zig \
+		-target wasm32-emscripten -mcpu=$(ZIG_WEB_MCPU) -O$(ZIG_OPT) \
+		-lc -fno-single-threaded -fno-emit-bin \
+		-femit-llvm-bc=$(abspath $(ZIG_WEB_BC)) \
+		-I$(abspath $(EM_SYSROOT_INC)) \
 		--cache-dir $(abspath $(ZIG_CACHE))/local \
-		--global-cache-dir $(abspath $(ZIG_CACHE))/global \
-		-Doptimize=$(ZIG_OPT) \
-		-Demscripten-sysroot=$(abspath $(EM_SYSROOT_INC))
+		--global-cache-dir $(abspath $(ZIG_CACHE))/global
+
+# Step 2: re-run codegen on that IR with emsdk's clang/LLVM 23 wasm backend.
+$(ZIG_WEB_OBJ): $(ZIG_WEB_BC) Makefile
+	@echo "Lowering Zig wasm IR with LLVM 23 (clang-23 -O3)..."
+	$(EMCC) -c $(ZIG_WEB_BC) -o $(ZIG_WEB_OBJ) -O3 -pthread $(ZIG_WEB_LLVM23_FEATURES)
 
 # joltc + physics_setup wrappers compiled to wasm (matching the prebuilt Jolt
 # WASM ABI). These are the only C++ objects the Zig web build needs.
@@ -193,10 +230,10 @@ $(ZIG_JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/ph
 
 # Final Zig web link: Zig wasm archive + joltc wasm + the shared Jolt WASM lib,
 # with the JS glue (--js-library) and the same page shell as the C++ build.
-$(ZIG_WEB_TARGET): $(ZIG_WEB_LIB) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
+$(ZIG_WEB_TARGET): $(ZIG_WEB_OBJ) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
 	@mkdir -p $(ZIG_WEB_DIR)
 	$(EMCXX) -o $(ZIG_WEB_TARGET) \
-		$(ZIG_WEB_LIB) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
+		$(ZIG_WEB_OBJ) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
 		$(WEB_LDFLAGS_ZIG) --js-library web_zig_lib.js \
 		$(WEB_PRELOADS) --shell-file web_shell.html
 
@@ -254,24 +291,39 @@ $(JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.c
 	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/physics_setup.cpp -o $(JOLTC_DIR)/physics_setup.o
 	ar rcs $@ $(JOLTC_DIR)/joltc.o $(JOLTC_DIR)/physics_setup.o
 
-# Zig drives its own compile/cache; we just point it at absolute paths so the
-# binary lands in build/zig/bin and reuses the prebuilt Jolt + joltc archives.
-$(ZIG_BIN): $(ZIG_SOURCES) $(ZIG_SRC_DIR)/build.zig $(ZIG_SRC_DIR)/build.zig.zon $(JOLT_LIB) $(JOLTC_LIB)
+# Zig native via LLVM 23 (two-step), mirroring the web pipeline. Step 1: Zig
+# emits optimized LLVM IR for arm64 macOS (link_libc + link_libcpp so the libc
+# entry and Jolt's C++ runtime resolve). Step 2: clang-23 lowers the IR. Step 3:
+# link against the prebuilt Jolt + joltc archives and the Cocoa frameworks.
+$(ZIG_NATIVE_BC): $(ZIG_SOURCES)
 	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG). Set ZIG=/path/to/zig."; exit 1; }
-	@echo "Building Zig rasterizer ($(ZIG_OPT))..."
-	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build \
-		--prefix $(abspath $(ZIG_BUILD_DIR)) \
+	@[ -x $(LLVM23_CLANG) ] || { echo "Error: LLVM 23 clang not found at $(LLVM23_CLANG). Activate/install emsdk first."; exit 1; }
+	@mkdir -p $(ZIG_BUILD_DIR)
+	@echo "Emitting Zig native LLVM IR ($(ZIG_OPT))..."
+	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build-obj main.zig \
+		-target aarch64-macos -mcpu=$(ZIG_NATIVE_MCPU) -O$(ZIG_OPT) \
+		-lc -lc++ -fno-emit-bin \
+		-femit-llvm-bc=$(abspath $(ZIG_NATIVE_BC)) \
 		--cache-dir $(abspath $(ZIG_CACHE))/local \
-		--global-cache-dir $(abspath $(ZIG_CACHE))/global \
-		-Doptimize=$(ZIG_OPT) \
-		-Djolt-lib=$(abspath $(JOLT_LIB)) \
-		-Djoltc-lib=$(abspath $(JOLTC_LIB))
+		--global-cache-dir $(abspath $(ZIG_CACHE))/global
 
-# The Zig build now assembles + signs build/zig/Raster.app itself (see
-# build.zig), so the bin rule already produces the bundle. No make_app_bundle.
+$(ZIG_NATIVE_OBJ): $(ZIG_NATIVE_BC) Makefile
+	@echo "Lowering Zig native IR with LLVM 23 (clang-23 -O3)..."
+	$(LLVM23_CLANG) -target arm64-apple-macos -mcpu=$(ZIG_NATIVE_LLVM23_MCPU) -O3 \
+		-isysroot $(MACOS_SDK) -c $(ZIG_NATIVE_BC) -o $(ZIG_NATIVE_OBJ)
+
+$(ZIG_BIN): $(ZIG_NATIVE_OBJ) $(JOLT_LIB) $(JOLTC_LIB)
+	@mkdir -p $(ZIG_BUILD_DIR)/bin
+	@echo "Linking Zig native (LLVM 23)..."
+	$(CXX) -o $(ZIG_BIN) $(ZIG_NATIVE_OBJ) $(JOLTC_LIB) $(JOLT_LIB) $(ZIG_NATIVE_FRAMEWORKS)
+
+# Shared bundler assembles + signs build/zig/Raster.app (icon, assets, no console).
+$(ZIG_APP): $(ZIG_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(ZIG_BIN),$(ZIG_APP))
+
 zig-bin: $(ZIG_BIN)
 
-zig: $(ZIG_BIN)
+zig: $(ZIG_APP)
 
 clean:
 	rm -rf $(BUILD_DIR)

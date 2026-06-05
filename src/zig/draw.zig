@@ -523,7 +523,17 @@ inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_dep
                         const hhx = hx * inv_h_len;
                         const hhy = hy * inv_h_len;
                         const hhz = hz * inv_h_len;
-                        spec = std.math.pow(f32, @max(0.0, nx * hhx + ny * hhy + nz * hhz), 48.0) * 150.0 * light_visibility * light_scale;
+                        // x^48 by squaring (x^48 = x^32 * x^16): 6 muls instead
+                        // of a per-pixel general pow()/powf — same result, and
+                        // far cheaper than the musl pow Zig inlines for a
+                        // constant integer exponent.
+                        const sd = @max(0.0, nx * hhx + ny * hhy + nz * hhz);
+                        const sd2 = sd * sd;
+                        const sd4 = sd2 * sd2;
+                        const sd8 = sd4 * sd4;
+                        const sd16 = sd8 * sd8;
+                        const sd32 = sd16 * sd16;
+                        spec = sd32 * sd16 * 150.0 * light_visibility * light_scale;
                     }
                 }
             }
