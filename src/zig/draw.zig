@@ -27,6 +27,11 @@ const M_PI: f32 = 3.14159265358979323846;
 
 pub const TriangleShader = enum { Lit, DebugUnlitRed, LuminaireCone };
 
+// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
+// comparison against the 4-wide quad path. Both paths still use SIMD linalg,
+// vectorized bilinear sampling, and FMA float-mode; this only gates the quad.
+pub var g_quad_path_enabled = std.atomic.Value(bool).init(true);
+
 pub const RasterTriangleSetup = struct {
     valid: bool = false,
     x_min: i32 = 0,
@@ -374,6 +379,196 @@ pub fn draw_spotlight_luminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32,
     }
 }
 
+// Per-fragment inputs for the Lit shader, already interpolated. The quad path
+// fills these four lanes at a time with SIMD; the scalar path fills one.
+const LitFrag = struct {
+    u: f32,
+    v: f32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+    nx: f32,
+    ny: f32,
+    nz: f32,
+    ex: f32,
+    ey: f32,
+    ez: f32,
+    ss: f32,
+    st: f32,
+    sr: f32,
+    sq: f32,
+};
+
+// Triangle-invariant shading state, hoisted out of the pixel loop.
+const LitCtx = struct {
+    screen_width: i32,
+    format: *const PixelFormat,
+    has_texture: bool,
+    tex_level: ?*const PackedTextureLevel,
+    aniso_axis_u: f32,
+    aniso_axis_v: f32,
+    aniso_taps: i32,
+    light_dir: Vec3,
+    light_pos: Vec3,
+    spot_dir: Vec3,
+    use_spotlight: bool,
+    spot_inner_cos: f32,
+    spot_outer_cos: f32,
+    shadow_depth: ?[*]const ShadowDepth,
+    shadow_size: i32,
+    depth_write: bool,
+    linear_z: ?[*]f32,
+    normal_buffer: ?[*]f32,
+    perspective_correct_normals: bool,
+};
+
+// Shared Lit back-end: texture + Phong + alpha + buffer writes for one pixel.
+// Called per pixel from the scalar path and per lane from the quad path, so
+// both produce identical output. Texture/shadow are gathers, kept scalar.
+inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth: [*]f32, x: i32, y: i32, z: f32, inv_w: f32, f: LitFrag) void {
+    @setFloatMode(.optimized);
+    const u = f.u - @floor(f.u);
+    const v = f.v - @floor(f.v);
+
+    var final_r: f32 = undefined;
+    var final_g: f32 = undefined;
+    var final_b: f32 = undefined;
+    if (ctx.has_texture) {
+        const tc = tex.sample_texture_anisotropic(ctx.tex_level.?, u, v, ctx.aniso_axis_u, ctx.aniso_axis_v, ctx.aniso_taps);
+        const tr: u8 = @truncate(tc >> 16);
+        const tg: u8 = @truncate(tc >> 8);
+        const tb: u8 = @truncate(tc);
+        final_r = @as(f32, @floatFromInt(tr)) * f.r;
+        final_g = @as(f32, @floatFromInt(tg)) * f.g;
+        final_b = @as(f32, @floatFromInt(tb)) * f.b;
+    } else {
+        final_r = 255.0 * f.r;
+        final_g = 255.0 * f.g;
+        final_b = 255.0 * f.b;
+    }
+
+    if (config.ENABLE_PHONG_SHADING) {
+        var diffuse: f32 = 0.35;
+        var spec: f32 = 0.0;
+
+        var nx = f.nx;
+        var ny = f.ny;
+        var nz = f.nz;
+        const n_len2 = nx * nx + ny * ny + nz * nz;
+        if (n_len2 > 0.000001) {
+            const inv_n_len = 1.0 / @sqrt(n_len2);
+            nx *= inv_n_len;
+            ny *= inv_n_len;
+            nz *= inv_n_len;
+        }
+
+        var ex = f.ex;
+        var ey = f.ey;
+        var ez = f.ez;
+
+        // Spotlight cone modulation is computed before the shadow lookup: beyond
+        // the outer soft edge light_scale is zero, so there is nothing to light
+        // and nothing to shadow. We skip the shadow map entirely out there, which
+        // also guarantees that every pixel we *do* sample lands inside the cone's
+        // shadow frustum (no image-edge case to handle in the PCF).
+        var lx = ctx.light_dir.x;
+        var ly = ctx.light_dir.y;
+        var lz = ctx.light_dir.z;
+        var light_scale: f32 = 1.0;
+        if (ctx.use_spotlight) {
+            lx = ctx.light_pos.x - ex;
+            ly = ctx.light_pos.y - ey;
+            lz = ctx.light_pos.z - ez;
+            const l_len2 = lx * lx + ly * ly + lz * lz;
+            if (l_len2 > 0.000001) {
+                const inv_l_len = 1.0 / @sqrt(l_len2);
+                lx *= inv_l_len;
+                ly *= inv_l_len;
+                lz *= inv_l_len;
+                const cone_cos = -(lx * ctx.spot_dir.x + ly * ctx.spot_dir.y + lz * ctx.spot_dir.z);
+                light_scale = @min(1.0, @max(0.0, (cone_cos - ctx.spot_outer_cos) / (ctx.spot_inner_cos - ctx.spot_outer_cos)));
+                light_scale *= 3.5 / (1.0 + 0.004 * l_len2);
+            } else {
+                light_scale = 0.0;
+            }
+        }
+
+        if (light_scale > 0.0) {
+            var light_visibility: f32 = 1.0;
+            if (ctx.shadow_depth != null and ctx.shadow_size > 0) {
+                const inv_sq = 1.0 / f.sq;
+                light_visibility = shadow.sample_shadow_compare_bilinear_2x2(ctx.shadow_depth, ctx.shadow_size, f.ss * inv_sq, f.st * inv_sq, f.sr * inv_sq);
+            }
+
+            if (light_visibility > 0.0) {
+                const ndotl = @max(0.0, nx * lx + ny * ly + nz * lz);
+                diffuse += 0.8 * ndotl * light_visibility * light_scale;
+
+                if (ndotl > 0.0) {
+                    const v_len2 = ex * ex + ey * ey + ez * ez;
+                    if (v_len2 > 0.000001) {
+                        const inv_v_len = -1.0 / @sqrt(v_len2);
+                        ex *= inv_v_len;
+                        ey *= inv_v_len;
+                        ez *= inv_v_len;
+                    }
+
+                    const hx = lx + ex;
+                    const hy = ly + ey;
+                    const hz = lz + ez;
+                    const h_len2 = hx * hx + hy * hy + hz * hz;
+                    if (h_len2 > 0.000001) {
+                        const inv_h_len = 1.0 / @sqrt(h_len2);
+                        const hhx = hx * inv_h_len;
+                        const hhy = hy * inv_h_len;
+                        const hhz = hz * inv_h_len;
+                        spec = std.math.pow(f32, @max(0.0, nx * hhx + ny * hhy + nz * hhz), 48.0) * 150.0 * light_visibility * light_scale;
+                    }
+                }
+            }
+        }
+
+        final_r = final_r * diffuse + spec;
+        final_g = final_g * diffuse + spec;
+        final_b = final_b * diffuse + spec;
+    }
+
+    if (final_r > 255.0) final_r = 255.0;
+    if (final_g > 255.0) final_g = 255.0;
+    if (final_b > 255.0) final_b = 255.0;
+
+    if (f.a < 0.995 and f.a > 0.005) {
+        const dst = pixel.unpack_rgb_fast(row_pixels[@intCast(x)], ctx.format);
+        const inv_alpha = 1.0 - f.a;
+        final_r = final_r * f.a + @as(f32, @floatFromInt(dst.r)) * inv_alpha;
+        final_g = final_g * f.a + @as(f32, @floatFromInt(dst.g)) * inv_alpha;
+        final_b = final_b * f.a + @as(f32, @floatFromInt(dst.b)) * inv_alpha;
+    }
+
+    row_pixels[@intCast(x)] = pixel.pack_rgb_fast(ctx.format, @intFromFloat(final_r), @intFromFloat(final_g), @intFromFloat(final_b));
+    if (ctx.depth_write) {
+        row_depth[@intCast(x)] = z;
+        if (ctx.linear_z) |lz_buf| lz_buf[@intCast(y * ctx.screen_width + x)] = 1.0 / inv_w;
+        if (ctx.normal_buffer) |nb_buf| {
+            var nnx = f.nx;
+            var nny = f.ny;
+            var nnz = f.nz;
+            const nl2 = nnx * nnx + nny * nny + nnz * nnz;
+            if (nl2 > 1e-12) {
+                const invn = 1.0 / @sqrt(nl2);
+                nnx *= invn;
+                nny *= invn;
+                nnz *= invn;
+            }
+            const nb = nb_buf + @as(usize, @intCast(y * ctx.screen_width + x)) * 3;
+            nb[0] = nnx;
+            nb[1] = nny;
+            nb[2] = nnz;
+        }
+    }
+}
+
 pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalias depth_buffer: [*]f32, noalias normal_buffer: ?[*]f32, noalias linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, noalias texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, noalias shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
     // Allow FMA contraction + reassociation across the whole per-pixel loop.
     // This restores the -ffast-math style codegen Eigen relied on; barycentric
@@ -528,6 +723,33 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
         tex_level = &texture.?.levels[@intCast(mip_level)];
     }
 
+    const ctx = LitCtx{
+        .screen_width = screen_width,
+        .format = format,
+        .has_texture = has_texture,
+        .tex_level = tex_level,
+        .aniso_axis_u = aniso_axis_u,
+        .aniso_axis_v = aniso_axis_v,
+        .aniso_taps = aniso_taps,
+        .light_dir = light_dir,
+        .light_pos = light_pos,
+        .spot_dir = spot_dir,
+        .use_spotlight = use_spotlight,
+        .spot_inner_cos = spot_inner_cos,
+        .spot_outer_cos = spot_outer_cos,
+        .shadow_depth = shadow_depth,
+        .shadow_size = shadow_size,
+        .depth_write = depth_write,
+        .linear_z = linear_z,
+        .normal_buffer = normal_buffer,
+        .perspective_correct_normals = perspective_correct_normals,
+    };
+
+    const lane_idx: @Vector(4, f32) = .{ 0, 1, 2, 3 };
+    const vzero: @Vector(4, f32) = @splat(0.0);
+    const vone: @Vector(4, f32) = @splat(1.0);
+    const quad_enabled = g_quad_path_enabled.load(.monotonic);
+
     var y = y_min;
     while (y <= y_max) : (y += 1) {
         var w0 = w0_row;
@@ -537,247 +759,174 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
         const row_depth = depth_buffer + @as(usize, @intCast(y * screen_width));
 
         var x = x_min;
-        while (x <= x_max) : (x += 1) {
-            if ((w0 < 0 or w1 < 0 or w2 < 0) and (w0 > 0 or w1 > 0 or w2 > 0)) {
-                w0 += A0;
-                w1 += A1;
-                w2 += A2;
-                continue;
-            }
+        while (x <= x_max) {
+            // 4-wide maskless quad path: take it only when all four lanes are
+            // covered (consistent edge sign) and all four pass the depth test,
+            // so no write mask is needed. Mixed coverage, any depth reject, or a
+            // non-Lit shader drops through to the scalar path for this pixel.
+            if (quad_enabled and shader == .Lit and x + 3 <= x_max) {
+                const w0v = @as(@Vector(4, f32), @splat(w0)) + @as(@Vector(4, f32), @splat(A0)) * lane_idx;
+                const w1v = @as(@Vector(4, f32), @splat(w1)) + @as(@Vector(4, f32), @splat(A1)) * lane_idx;
+                const w2v = @as(@Vector(4, f32), @splat(w2)) + @as(@Vector(4, f32), @splat(A2)) * lane_idx;
+                const mn = @min(w0v, @min(w1v, w2v));
+                const mx = @max(w0v, @max(w1v, w2v));
+                const mixed = @select(f32, mn < vzero, vone, vzero) * @select(f32, mx > vzero, vone, vzero);
+                if (@reduce(.Add, mixed) == 0.0) {
+                    const qaw0 = @abs(w0v);
+                    const qaw1 = @abs(w1v);
+                    const qaw2 = @abs(w2v);
+                    const qwsum = qaw0 + qaw1 + qaw2;
+                    const zv = (@as(@Vector(4, f32), @splat(v0.z)) * qaw0 + @as(@Vector(4, f32), @splat(v1.z)) * qaw1 + @as(@Vector(4, f32), @splat(v2.z)) * qaw2) / qwsum;
+                    const xu: usize = @intCast(x);
+                    const dbuf: @Vector(4, f32) = .{ row_depth[xu], row_depth[xu + 1], row_depth[xu + 2], row_depth[xu + 3] };
+                    if (@reduce(.Add, @select(f32, zv >= dbuf, vone, vzero)) == 0.0) {
+                        const inv_qwsum = vone / qwsum;
+                        const b0v = qaw0 * inv_qwsum;
+                        const b1v = qaw1 * inv_qwsum;
+                        const b2v = qaw2 * inv_qwsum;
+                        const inv_wv = @as(@Vector(4, f32), @splat(v0.inv_w)) * b0v + @as(@Vector(4, f32), @splat(v1.inv_w)) * b1v + @as(@Vector(4, f32), @splat(v2.inv_w)) * b2v;
+                        const persp = vone / inv_wv;
 
-            const aw0 = @abs(w0);
-            const aw1 = @abs(w1);
-            const aw2 = @abs(w2);
-            const w_sum = aw0 + aw1 + aw2;
-            const z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
+                        const uv = (@as(@Vector(4, f32), @splat(uw0)) * b0v + @as(@Vector(4, f32), @splat(uw1)) * b1v + @as(@Vector(4, f32), @splat(uw2)) * b2v) * persp;
+                        const vv = (@as(@Vector(4, f32), @splat(v0_w)) * b0v + @as(@Vector(4, f32), @splat(v1_w)) * b1v + @as(@Vector(4, f32), @splat(v2_w)) * b2v) * persp;
+                        const rv = @as(@Vector(4, f32), @splat(v0.r)) * b0v + @as(@Vector(4, f32), @splat(v1.r)) * b1v + @as(@Vector(4, f32), @splat(v2.r)) * b2v;
+                        const gv = @as(@Vector(4, f32), @splat(v0.g)) * b0v + @as(@Vector(4, f32), @splat(v1.g)) * b1v + @as(@Vector(4, f32), @splat(v2.g)) * b2v;
+                        const bvv = @as(@Vector(4, f32), @splat(v0.b)) * b0v + @as(@Vector(4, f32), @splat(v1.b)) * b1v + @as(@Vector(4, f32), @splat(v2.b)) * b2v;
+                        const avv = @as(@Vector(4, f32), @splat(v0.a)) * b0v + @as(@Vector(4, f32), @splat(v1.a)) * b1v + @as(@Vector(4, f32), @splat(v2.a)) * b2v;
 
-            if (z >= row_depth[@intCast(x)]) {
-                w0 += A0;
-                w1 += A1;
-                w2 += A2;
-                continue;
-            }
+                        var nxv: @Vector(4, f32) = undefined;
+                        var nyv: @Vector(4, f32) = undefined;
+                        var nzv: @Vector(4, f32) = undefined;
+                        if (perspective_correct_normals) {
+                            nxv = (@as(@Vector(4, f32), @splat(nx0_w)) * b0v + @as(@Vector(4, f32), @splat(nx1_w)) * b1v + @as(@Vector(4, f32), @splat(nx2_w)) * b2v) * persp;
+                            nyv = (@as(@Vector(4, f32), @splat(ny0_w)) * b0v + @as(@Vector(4, f32), @splat(ny1_w)) * b1v + @as(@Vector(4, f32), @splat(ny2_w)) * b2v) * persp;
+                            nzv = (@as(@Vector(4, f32), @splat(nz0_w)) * b0v + @as(@Vector(4, f32), @splat(nz1_w)) * b1v + @as(@Vector(4, f32), @splat(nz2_w)) * b2v) * persp;
+                        } else {
+                            nxv = @as(@Vector(4, f32), @splat(v0.nx)) * b0v + @as(@Vector(4, f32), @splat(v1.nx)) * b1v + @as(@Vector(4, f32), @splat(v2.nx)) * b2v;
+                            nyv = @as(@Vector(4, f32), @splat(v0.ny)) * b0v + @as(@Vector(4, f32), @splat(v1.ny)) * b1v + @as(@Vector(4, f32), @splat(v2.ny)) * b2v;
+                            nzv = @as(@Vector(4, f32), @splat(v0.nz)) * b0v + @as(@Vector(4, f32), @splat(v1.nz)) * b1v + @as(@Vector(4, f32), @splat(v2.nz)) * b2v;
+                        }
+                        const exv = (@as(@Vector(4, f32), @splat(ex0_w)) * b0v + @as(@Vector(4, f32), @splat(ex1_w)) * b1v + @as(@Vector(4, f32), @splat(ex2_w)) * b2v) * persp;
+                        const eyv = (@as(@Vector(4, f32), @splat(ey0_w)) * b0v + @as(@Vector(4, f32), @splat(ey1_w)) * b1v + @as(@Vector(4, f32), @splat(ey2_w)) * b2v) * persp;
+                        const ezv = (@as(@Vector(4, f32), @splat(ez0_w)) * b0v + @as(@Vector(4, f32), @splat(ez1_w)) * b1v + @as(@Vector(4, f32), @splat(ez2_w)) * b2v) * persp;
+                        const ssv = (@as(@Vector(4, f32), @splat(ss0_w)) * b0v + @as(@Vector(4, f32), @splat(ss1_w)) * b1v + @as(@Vector(4, f32), @splat(ss2_w)) * b2v) * persp;
+                        const stv = (@as(@Vector(4, f32), @splat(st0_w)) * b0v + @as(@Vector(4, f32), @splat(st1_w)) * b1v + @as(@Vector(4, f32), @splat(st2_w)) * b2v) * persp;
+                        const srv = (@as(@Vector(4, f32), @splat(sr0_w)) * b0v + @as(@Vector(4, f32), @splat(sr1_w)) * b1v + @as(@Vector(4, f32), @splat(sr2_w)) * b2v) * persp;
+                        const sqv = (@as(@Vector(4, f32), @splat(sq0_w)) * b0v + @as(@Vector(4, f32), @splat(sq1_w)) * b1v + @as(@Vector(4, f32), @splat(sq2_w)) * b2v) * persp;
 
-            const inv_w_sum = 1.0 / w_sum;
-            const b0 = aw0 * inv_w_sum;
-            const b1 = aw1 * inv_w_sum;
-            const b2 = aw2 * inv_w_sum;
+                        inline for (0..4) |k| {
+                            shade_lit_fragment(&ctx, row_pixels, row_depth, x + @as(i32, @intCast(k)), y, zv[k], inv_wv[k], .{
+                                .u = uv[k],
+                                .v = vv[k],
+                                .r = rv[k],
+                                .g = gv[k],
+                                .b = bvv[k],
+                                .a = avv[k],
+                                .nx = nxv[k],
+                                .ny = nyv[k],
+                                .nz = nzv[k],
+                                .ex = exv[k],
+                                .ey = eyv[k],
+                                .ez = ezv[k],
+                                .ss = ssv[k],
+                                .st = stv[k],
+                                .sr = srv[k],
+                                .sq = sqv[k],
+                            });
+                        }
 
-            const inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
-            if (shader == .DebugUnlitRed) {
-                row_pixels[@intCast(x)] = pixel.pack_rgb_fast(format, 255, 0, 0);
-                if (depth_write) row_depth[@intCast(x)] = z;
-                w0 += A0;
-                w1 += A1;
-                w2 += A2;
-                continue;
-            }
-            if (shader == .LuminaireCone) {
-                const ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
-                const ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
-                const ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
-                var nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                var ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                var nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
-
-                const px = ex - light_pos.x;
-                const py = ey - light_pos.y;
-                const pz = ez - light_pos.z;
-                const cone_len: f32 = 4.5;
-                var cone_t = (px * spot_dir.x + py * spot_dir.y + pz * spot_dir.z) / cone_len;
-                cone_t = @min(1.0, @max(0.0, cone_t));
-                const distal_fade = 0.5 + 0.5 * @cos(M_PI * cone_t);
-
-                const n_len2 = nx * nx + ny * ny + nz * nz;
-                const p_len2 = ex * ex + ey * ey + ez * ez;
-                if (n_len2 > 0.000001 and p_len2 > 0.000001) {
-                    const inv_n_len = 1.0 / @sqrt(n_len2);
-                    const inv_p_len = -1.0 / @sqrt(p_len2);
-                    nx *= inv_n_len;
-                    ny *= inv_n_len;
-                    nz *= inv_n_len;
-                    const eex = ex * inv_p_len;
-                    const eey = ey * inv_p_len;
-                    const eez = ez * inv_p_len;
-
-                    const vdotn = @abs(eex * nx + eey * ny + eez * nz);
-                    const silhouette_t = @min(1.0, @max(0.0, vdotn / 0.45));
-                    const silhouette_fade = silhouette_t * silhouette_t * (3.0 - 2.0 * silhouette_t);
-                    const a_add = 0.22 * distal_fade * silhouette_fade;
-                    pixel.add_pixel_rgb(row_pixels, x, format, 255.0 * a_add, 255.0 * a_add, 255.0 * a_add);
-                }
-
-                w0 += A0;
-                w1 += A1;
-                w2 += A2;
-                continue;
-            }
-
-            var u = (uw0 * b0 + uw1 * b1 + uw2 * b2) / inv_w;
-            var v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w;
-
-            const r_attr = v0.r * b0 + v1.r * b1 + v2.r * b2;
-            const g_attr = v0.g * b0 + v1.g * b1 + v2.g * b2;
-            const b_attr = v0.b * b0 + v1.b * b1 + v2.b * b2;
-            const alpha = v0.a * b0 + v1.a * b1 + v2.a * b2;
-
-            u = u - @floor(u);
-            v = v - @floor(v);
-
-            var final_r: f32 = undefined;
-            var final_g: f32 = undefined;
-            var final_b: f32 = undefined;
-            if (has_texture) {
-                const tc = tex.sample_texture_anisotropic(tex_level.?, u, v, aniso_axis_u, aniso_axis_v, aniso_taps);
-                const tr: u8 = @truncate(tc >> 16);
-                const tg: u8 = @truncate(tc >> 8);
-                const tb: u8 = @truncate(tc);
-                final_r = @as(f32, @floatFromInt(tr)) * r_attr;
-                final_g = @as(f32, @floatFromInt(tg)) * g_attr;
-                final_b = @as(f32, @floatFromInt(tb)) * b_attr;
-            } else {
-                final_r = 255.0 * r_attr;
-                final_g = 255.0 * g_attr;
-                final_b = 255.0 * b_attr;
-            }
-
-            if (config.ENABLE_PHONG_SHADING) {
-                var light_visibility: f32 = 1.0;
-                if (shadow_depth != null and shadow_size > 0) {
-                    const ss = (ss0_w * b0 + ss1_w * b1 + ss2_w * b2) / inv_w;
-                    const st = (st0_w * b0 + st1_w * b1 + st2_w * b2) / inv_w;
-                    const sr = (sr0_w * b0 + sr1_w * b1 + sr2_w * b2) / inv_w;
-                    const sq = (sq0_w * b0 + sq1_w * b1 + sq2_w * b2) / inv_w;
-                    const inv_sq = 1.0 / sq;
-                    light_visibility = shadow.sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size, ss * inv_sq, st * inv_sq, sr * inv_sq);
-                }
-
-                var diffuse: f32 = 0.35;
-                var spec: f32 = 0.0;
-                if (light_visibility > 0.0) {
-                    var nx: f32 = undefined;
-                    var ny: f32 = undefined;
-                    var nz: f32 = undefined;
-                    if (perspective_correct_normals) {
-                        nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                        ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                        nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
-                    } else {
-                        nx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
-                        ny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
-                        nz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
+                        x += 4;
+                        w0 += A0 * 4.0;
+                        w1 += A1 * 4.0;
+                        w2 += A2 * 4.0;
+                        continue;
                     }
+                }
+            }
+
+            // Scalar single-pixel path (covers partial quads + non-Lit shaders).
+            scalar: {
+                if ((w0 < 0 or w1 < 0 or w2 < 0) and (w0 > 0 or w1 > 0 or w2 > 0)) break :scalar;
+
+                const aw0 = @abs(w0);
+                const aw1 = @abs(w1);
+                const aw2 = @abs(w2);
+                const w_sum = aw0 + aw1 + aw2;
+                const z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
+                if (z >= row_depth[@intCast(x)]) break :scalar;
+
+                const inv_w_sum = 1.0 / w_sum;
+                const b0 = aw0 * inv_w_sum;
+                const b1 = aw1 * inv_w_sum;
+                const b2 = aw2 * inv_w_sum;
+                const inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
+
+                if (shader == .DebugUnlitRed) {
+                    row_pixels[@intCast(x)] = pixel.pack_rgb_fast(format, 255, 0, 0);
+                    if (depth_write) row_depth[@intCast(x)] = z;
+                    break :scalar;
+                }
+                if (shader == .LuminaireCone) {
+                    const ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
+                    const ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
+                    const ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
+                    var nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
+                    var ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
+                    var nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+
+                    const px = ex - light_pos.x;
+                    const py = ey - light_pos.y;
+                    const pz = ez - light_pos.z;
+                    const cone_len: f32 = 4.5;
+                    var cone_t = (px * spot_dir.x + py * spot_dir.y + pz * spot_dir.z) / cone_len;
+                    cone_t = @min(1.0, @max(0.0, cone_t));
+                    const distal_fade = 0.5 + 0.5 * @cos(M_PI * cone_t);
+
                     const n_len2 = nx * nx + ny * ny + nz * nz;
-                    if (n_len2 > 0.000001) {
+                    const p_len2 = ex * ex + ey * ey + ez * ez;
+                    if (n_len2 > 0.000001 and p_len2 > 0.000001) {
                         const inv_n_len = 1.0 / @sqrt(n_len2);
+                        const inv_p_len = -1.0 / @sqrt(p_len2);
                         nx *= inv_n_len;
                         ny *= inv_n_len;
                         nz *= inv_n_len;
+                        const eex = ex * inv_p_len;
+                        const eey = ey * inv_p_len;
+                        const eez = ez * inv_p_len;
+
+                        const vdotn = @abs(eex * nx + eey * ny + eez * nz);
+                        const silhouette_t = @min(1.0, @max(0.0, vdotn / 0.45));
+                        const silhouette_fade = silhouette_t * silhouette_t * (3.0 - 2.0 * silhouette_t);
+                        const a_add = 0.22 * distal_fade * silhouette_fade;
+                        pixel.add_pixel_rgb(row_pixels, x, format, 255.0 * a_add, 255.0 * a_add, 255.0 * a_add);
                     }
-
-                    var ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
-                    var ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
-                    var ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
-
-                    var lx = light_dir.x;
-                    var ly = light_dir.y;
-                    var lz = light_dir.z;
-                    var light_scale: f32 = 1.0;
-                    if (use_spotlight) {
-                        lx = light_pos.x - ex;
-                        ly = light_pos.y - ey;
-                        lz = light_pos.z - ez;
-                        const l_len2 = lx * lx + ly * ly + lz * lz;
-                        if (l_len2 > 0.000001) {
-                            const inv_l_len = 1.0 / @sqrt(l_len2);
-                            lx *= inv_l_len;
-                            ly *= inv_l_len;
-                            lz *= inv_l_len;
-                            const cone_cos = -(lx * spot_dir.x + ly * spot_dir.y + lz * spot_dir.z);
-                            light_scale = @min(1.0, @max(0.0, (cone_cos - spot_outer_cos) / (spot_inner_cos - spot_outer_cos)));
-                            light_scale *= 3.5 / (1.0 + 0.004 * l_len2);
-                        } else {
-                            light_scale = 0.0;
-                        }
-                    }
-
-                    const ndotl = @max(0.0, nx * lx + ny * ly + nz * lz);
-                    diffuse += 0.8 * ndotl * light_visibility * light_scale;
-
-                    if (ndotl > 0.0 and light_scale > 0.0) {
-                        const v_len2 = ex * ex + ey * ey + ez * ez;
-                        if (v_len2 > 0.000001) {
-                            const inv_v_len = -1.0 / @sqrt(v_len2);
-                            ex *= inv_v_len;
-                            ey *= inv_v_len;
-                            ez *= inv_v_len;
-                        }
-
-                        const hx = lx + ex;
-                        const hy = ly + ey;
-                        const hz = lz + ez;
-                        const h_len2 = hx * hx + hy * hy + hz * hz;
-                        if (h_len2 > 0.000001) {
-                            const inv_h_len = 1.0 / @sqrt(h_len2);
-                            const hhx = hx * inv_h_len;
-                            const hhy = hy * inv_h_len;
-                            const hhz = hz * inv_h_len;
-                            spec = std.math.pow(f32, @max(0.0, nx * hhx + ny * hhy + nz * hhz), 48.0) * 150.0 * light_visibility * light_scale;
-                        }
-                    }
+                    break :scalar;
                 }
 
-                final_r = final_r * diffuse + spec;
-                final_g = final_g * diffuse + spec;
-                final_b = final_b * diffuse + spec;
-            }
-
-            if (final_r > 255.0) final_r = 255.0;
-            if (final_g > 255.0) final_g = 255.0;
-            if (final_b > 255.0) final_b = 255.0;
-
-            if (alpha < 0.995 and alpha > 0.005) {
-                const dst = pixel.unpack_rgb_fast(row_pixels[@intCast(x)], format);
-                const inv_alpha = 1.0 - alpha;
-                final_r = final_r * alpha + @as(f32, @floatFromInt(dst.r)) * inv_alpha;
-                final_g = final_g * alpha + @as(f32, @floatFromInt(dst.g)) * inv_alpha;
-                final_b = final_b * alpha + @as(f32, @floatFromInt(dst.b)) * inv_alpha;
-            }
-
-            row_pixels[@intCast(x)] = pixel.pack_rgb_fast(format, @intFromFloat(final_r), @intFromFloat(final_g), @intFromFloat(final_b));
-            if (depth_write) {
-                row_depth[@intCast(x)] = z;
-                if (linear_z) |lz_buf| lz_buf[@intCast(y * screen_width + x)] = 1.0 / inv_w;
-                if (normal_buffer) |nb_buf| {
-                    var nnx: f32 = undefined;
-                    var nny: f32 = undefined;
-                    var nnz: f32 = undefined;
-                    if (perspective_correct_normals) {
-                        nnx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                        nny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                        nnz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
-                    } else {
-                        nnx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
-                        nny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
-                        nnz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
-                    }
-                    const nl2 = nnx * nnx + nny * nny + nnz * nnz;
-                    if (nl2 > 1e-12) {
-                        const invn = 1.0 / @sqrt(nl2);
-                        nnx *= invn;
-                        nny *= invn;
-                        nnz *= invn;
-                    }
-                    const nb = nb_buf + @as(usize, @intCast(y * screen_width + x)) * 3;
-                    nb[0] = nnx;
-                    nb[1] = nny;
-                    nb[2] = nnz;
-                }
+                shade_lit_fragment(&ctx, row_pixels, row_depth, x, y, z, inv_w, .{
+                    .u = (uw0 * b0 + uw1 * b1 + uw2 * b2) / inv_w,
+                    .v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w,
+                    .r = v0.r * b0 + v1.r * b1 + v2.r * b2,
+                    .g = v0.g * b0 + v1.g * b1 + v2.g * b2,
+                    .b = v0.b * b0 + v1.b * b1 + v2.b * b2,
+                    .a = v0.a * b0 + v1.a * b1 + v2.a * b2,
+                    .nx = if (perspective_correct_normals) (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w else v0.nx * b0 + v1.nx * b1 + v2.nx * b2,
+                    .ny = if (perspective_correct_normals) (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w else v0.ny * b0 + v1.ny * b1 + v2.ny * b2,
+                    .nz = if (perspective_correct_normals) (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w else v0.nz * b0 + v1.nz * b1 + v2.nz * b2,
+                    .ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w,
+                    .ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w,
+                    .ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w,
+                    .ss = (ss0_w * b0 + ss1_w * b1 + ss2_w * b2) / inv_w,
+                    .st = (st0_w * b0 + st1_w * b1 + st2_w * b2) / inv_w,
+                    .sr = (sr0_w * b0 + sr1_w * b1 + sr2_w * b2) / inv_w,
+                    .sq = (sq0_w * b0 + sq1_w * b1 + sq2_w * b2) / inv_w,
+                });
             }
 
             w0 += A0;
             w1 += A1;
             w2 += A2;
+            x += 1;
         }
         w0_row += B0;
         w1_row += B1;

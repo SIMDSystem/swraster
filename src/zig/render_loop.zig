@@ -353,6 +353,11 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                         ctx.profiler.?.enabled.store(!was, .monotonic);
                     }
                     if (event.key == 'f' or event.key == 'F') profiler_unfreeze = !profiler_unfreeze;
+                    if (event.key == 'q' or event.key == 'Q') {
+                        const was = draw.g_quad_path_enabled.load(.monotonic);
+                        draw.g_quad_path_enabled.store(!was, .monotonic);
+                        std.debug.print("Quad raster path: {s}\n", .{if (!was) "ON (4-wide + scalar fallback)" else "OFF (scalar only)"});
+                    }
                     if (event.key == 'b' or event.key == 'B') {
                         const was = threading.raster_hard_barrier.load(.monotonic);
                         threading.raster_hard_barrier.store(!was, .monotonic);

@@ -61,15 +61,67 @@ pub fn sample_shadow_compare_bilinear(shadow_depth: ?[*]const ShadowDepth, shado
 }
 
 pub fn sample_shadow_compare_bilinear_2x2(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, s: f32, t: f32, r: f32) f32 {
+    @setFloatMode(.optimized);
     const depth = shadow_depth orelse return 1.0;
     if (shadow_size <= 0) return 1.0;
-    const texel = 1.0 / @as(f32, @floatFromInt(shadow_size - 1));
+    // r is shared by all four bilinear taps, so an out-of-range r makes every
+    // tap return 1.0 (sum == 4 -> 1.0). Bail before touching the map.
+    if (r < 0.0 or r > 1.0) return 1.0;
+
+    const sizef = @as(f32, @floatFromInt(shadow_size - 1));
+    const r16: u32 = config.shadow_depth_to_u16(r);
+
+    const fx = s * sizef;
+    const fy = t * sizef;
+    const nx: i32 = @intFromFloat(@floor(fx));
+    const ny: i32 = @intFromFloat(@floor(fy));
+    const fxr = fx - @as(f32, @floatFromInt(nx));
+    const fyr = fy - @as(f32, @floatFromInt(ny));
+
+    // The four bilinear taps sit at +/-0.5 texel around (fx,fy); together they
+    // touch one 3x3 texel block. Resolve each of the 9 compares once instead of
+    // refetching the 16 overlapping texels the naive 2x2 did. The two taps along
+    // each axis share the same fractional weight (wx/wy), and select adjacent
+    // 2x2 windows {0,1} and {1,2} of the block.
+    const wx = if (fxr < 0.5) fxr + 0.5 else fxr - 0.5;
+    const wy = if (fyr < 0.5) fyr + 0.5 else fyr - 0.5;
+
+    // Callers gate this sampler on the spotlight cone, so every lit pixel lands
+    // inside the cone's shadow frustum and the 3x3 block is on the map. The
+    // clamp below is a branchless safety backstop (it never bites for lit
+    // pixels); it lets us drop the per-row / per-tap image-edge branches and run
+    // one straight-line vectorized pass.
+    const max_base = shadow_size - 3;
+    const col_base = std.math.clamp(if (fxr < 0.5) nx - 1 else nx, 0, max_base);
+    const row_base = std.math.clamp(if (fyr < 0.5) ny - 1 else ny, 0, max_base);
+
+    var grid: [3][3]f32 = undefined;
+    const bias_v: @Vector(3, u32) = @splat(@as(u32, SHADOW_DEPTH_BIAS_U16));
+    const max_v: @Vector(3, u32) = @splat(0xffff);
+    const r16_v: @Vector(3, u32) = @splat(r16);
+    const ones: @Vector(3, f32) = @splat(1.0);
+    const zeros: @Vector(3, f32) = @splat(0.0);
+
+    inline for (0..3) |gy| {
+        const base: usize = @intCast((row_base + @as(i32, @intCast(gy))) * shadow_size + col_base);
+        const fv: @Vector(3, u32) = .{ depth[base], depth[base + 1], depth[base + 2] };
+        const biased = @min(max_v, fv + bias_v);
+        const cmp = @select(f32, r16_v <= biased, ones, zeros);
+        grid[gy][0] = cmp[0];
+        grid[gy][1] = cmp[1];
+        grid[gy][2] = cmp[2];
+    }
+
     var sum: f32 = 0.0;
-    var oy: i32 = 0;
-    while (oy <= 1) : (oy += 1) {
-        var ox: i32 = 0;
-        while (ox <= 1) : (ox += 1) {
-            sum += sample_shadow_compare_bilinear(depth, shadow_size, s + (@as(f32, @floatFromInt(ox)) - 0.5) * texel, t + (@as(f32, @floatFromInt(oy)) - 0.5) * texel, r);
+    inline for (0..2) |oy| {
+        inline for (0..2) |ox| {
+            const c00 = grid[oy + 0][ox + 0];
+            const c10 = grid[oy + 0][ox + 1];
+            const c01 = grid[oy + 1][ox + 0];
+            const c11 = grid[oy + 1][ox + 1];
+            const cx0 = c00 + (c10 - c00) * wx;
+            const cx1 = c01 + (c11 - c01) * wx;
+            sum += cx0 + (cx1 - cx0) * wy;
         }
     }
     return sum * 0.25;
