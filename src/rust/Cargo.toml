@@ -1,0 +1,25 @@
+[package]
+name = "swraster"
+version = "0.1.0"
+edition = "2021"
+description = "Software rasterizer — Rust port of the C++/Zig swraster"
+build = "build.rs"
+
+[[bin]]
+name = "raster"
+path = "src/main.rs"
+
+[dependencies]
+winit = "0.30"
+softbuffer = "0.4"
+
+[build-dependencies]
+cc = "1"
+
+# ReleaseFast-equivalent: the renderer is a hot-loop CPU program, so optimize
+# aggressively and match the native C++/Zig builds (LTO, single codegen unit).
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

@@ -148,6 +148,23 @@ ZIG_NATIVE_BC = $(ZIG_BUILD_DIR)/swraster_native.bc
 ZIG_NATIVE_OBJ = $(ZIG_BUILD_DIR)/swraster_native.o
 ZIG_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc
 
+# --- Rust native build ------------------------------------------------------
+# The Rust port lives in src/rust and uses cargo (+ build.rs, which compiles the
+# joltc C wrapper and links the prebuilt $(JOLT_LIB)). Cargo's own output dir
+# goes to $(RUST_BUILD_DIR), and we copy the optimized binary into the shared
+# build/<tool>/bin/raster shape used by the C++ and Zig builds.
+#
+# CARGO_TARGET_DIR is set EXPLICITLY on the cargo invocation so the artifacts
+# always land in $(RUST_BUILD_DIR) even when the surrounding shell exports its
+# own CARGO_TARGET_DIR (which would otherwise override .cargo/config.toml).
+CARGO ?= cargo
+RUST_SRC_DIR = src/rust
+RUST_BUILD_DIR = $(BUILD_DIR)/rust
+RUST_CARGO_BIN = $(RUST_BUILD_DIR)/release/raster
+RUST_BIN = $(RUST_BUILD_DIR)/bin/raster
+RUST_APP = $(RUST_BUILD_DIR)/Raster.app
+RUST_SOURCES = $(wildcard $(RUST_SRC_DIR)/src/*.rs) $(RUST_SRC_DIR)/Cargo.toml $(RUST_SRC_DIR)/build.rs
+
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
 
@@ -325,6 +342,35 @@ zig-bin: $(ZIG_BIN)
 
 zig: $(ZIG_APP)
 
+# --- Rust native build ------------------------------------------------------
+$(RUST_CARGO_BIN): $(RUST_SOURCES) $(JOLT_LIB)
+	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
+	@echo "Building Rust (cargo --release) -> $(RUST_BUILD_DIR)..."
+	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_BUILD_DIR)) $(CARGO) build --release
+
+# Mirror the build/<tool>/bin/raster shape of the C++ and Zig builds.
+$(RUST_BIN): $(RUST_CARGO_BIN)
+	@mkdir -p $(RUST_BUILD_DIR)/bin
+	@cp $(RUST_CARGO_BIN) $(RUST_BIN)
+	@echo "  -> $(RUST_BIN)"
+
+rust-bin: $(RUST_BIN)
+
+# Shared bundler assembles + signs build/rust/Raster.app (icon, assets, no console).
+# The Rust renderer presents 1:1 into the surface softbuffer hands it, so we opt
+# the window out of HiDPI backing (NSHighResolutionCapable=false). macOS then
+# gives a logical-resolution (non-Retina) surface that the window server upscales
+# — the same logical-render + compositor-scale path as the C++/Zig IOSurface
+# backend, but with no per-frame CPU upscale. Editing the plist invalidates the
+# bundle signature, so we re-sign afterwards.
+$(RUST_APP): $(RUST_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(RUST_BIN),$(RUST_APP))
+	@plutil -replace NSHighResolutionCapable -bool false $(RUST_APP)/Contents/Info.plist
+	@codesign --force --deep --sign - $(RUST_APP) >/dev/null 2>&1
+	@echo "  -> NSHighResolutionCapable=false (logical-res surface, compositor-scaled)"
+
+rust: $(RUST_APP)
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -337,4 +383,7 @@ clean-zig:
 clean-web:
 	rm -rf $(WEB_BUILD_DIR)
 
-.PHONY: clean clean-cpp clean-zig clean-web app all web web-cpp web-zig web-all zig zig-bin
+clean-rust:
+	rm -rf $(RUST_BUILD_DIR)
+
+.PHONY: clean clean-cpp clean-zig clean-web clean-rust app all web web-cpp web-zig web-all zig zig-bin rust rust-bin
