@@ -43,6 +43,11 @@ fn main() {
     // C++ standard library (libc++ on macOS).
     if cfg!(target_os = "macos") {
         println!("cargo:rustc-link-lib=dylib=c++");
+        println!("cargo:rustc-link-lib=dylib=objc");
+        println!("cargo:rustc-link-lib=framework=AppKit");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+        println!("cargo:rustc-link-lib=framework=IOSurface");
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }

@@ -345,8 +345,9 @@ zig: $(ZIG_APP)
 # --- Rust native build ------------------------------------------------------
 $(RUST_CARGO_BIN): $(RUST_SOURCES) $(JOLT_LIB)
 	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
-	@echo "Building Rust (cargo --release) -> $(RUST_BUILD_DIR)..."
-	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_BUILD_DIR)) $(CARGO) build --release
+	@echo "Building Rust (fresh non-incremental cargo --release) -> $(RUST_BUILD_DIR)..."
+	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_BUILD_DIR)) CARGO_INCREMENTAL=0 $(CARGO) build --release
+	@rm -rf $(RUST_BUILD_DIR)/release/incremental
 
 # Mirror the build/<tool>/bin/raster shape of the C++ and Zig builds.
 $(RUST_BIN): $(RUST_CARGO_BIN)
@@ -384,6 +385,18 @@ clean-web:
 	rm -rf $(WEB_BUILD_DIR)
 
 clean-rust:
-	rm -rf $(RUST_BUILD_DIR)
+	rm -rf $(RUST_BUILD_DIR) $(RUST_SRC_DIR)/target
 
-.PHONY: clean clean-cpp clean-zig clean-web clean-rust app all web web-cpp web-zig web-all zig zig-bin rust rust-bin
+rebuild-cpp:
+	$(MAKE) clean-cpp
+	$(MAKE) app
+
+rebuild-zig:
+	$(MAKE) clean-zig
+	$(MAKE) zig
+
+rebuild-rust:
+	$(MAKE) clean-rust
+	$(MAKE) rust
+
+.PHONY: clean clean-cpp clean-zig clean-web clean-rust rebuild-cpp rebuild-zig rebuild-rust app all web web-cpp web-zig web-all zig zig-bin rust rust-bin

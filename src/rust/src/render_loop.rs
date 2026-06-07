@@ -95,6 +95,8 @@ pub struct RenderState {
 
     instance_depths: Vec<InstanceDepth>,
     occluders: Vec<OccluderEye>,
+    sort_keys: Vec<KeyIdx>,
+    sort_gather: Vec<RenderTriangle>,
 
     // Stable storage for this frame's T&L params so the worker plan can hold a
     // pointer to it across the two-phase kick (raster fired before setup fills
@@ -121,15 +123,7 @@ pub struct RenderState {
 
     last_physics_ms: u64,
     started: bool,
-
-    // Frame N's pool is reaped at frame N+1's top (after Present), so its T&L
-    // bin-merge tail overlaps the Present. These hold frame N's main-thread
-    // profiler intervals until then, when they're recorded alongside the
-    // workers' now-complete intervals. `pool_inflight` guards the very first
-    // frame (no previous pool to reap).
-    pool_inflight: bool,
-    pending_physics_iv: Option<Interval>,
-    pending_overlay_iv: Option<Interval>,
+    profiler_unfreeze: bool,
 
     // Per-thread concurrency profiler overlay (toggled with 's').
     profiler: Profiler,
@@ -193,6 +187,45 @@ const PASS_COLOR: i32 = 1;
 const PASS_SSAO: i32 = 2;
 const PASS_LUM: i32 = 3;
 
+const PUBLISHED_OPAQUE_BIN_RESERVE: usize = 512;
+const PUBLISHED_TRANS_BIN_RESERVE: usize = 128;
+const PUBLISHED_SHADOW_BIN_RESERVE: usize = 512;
+const WORKER_OPAQUE_BIN_RESERVE: usize = 256;
+const WORKER_TRANS_BIN_RESERVE: usize = 96;
+const WORKER_SHADOW_BIN_RESERVE: usize = 256;
+const WORKER_FLAT_RESERVE: usize = 1000;
+const SORT_SCRATCH_RESERVE: usize = 2000;
+
+#[derive(Clone, Copy)]
+struct KeyIdx {
+    key: f32,
+    idx: u32,
+}
+
+#[inline]
+fn sort_triangles_by_key(items: &mut Vec<RenderTriangle>, ascending: bool, keys: &mut Vec<KeyIdx>, gather: &mut Vec<RenderTriangle>) {
+    let n = items.len();
+    if n < 2 {
+        return;
+    }
+    keys.clear();
+    keys.reserve(n.saturating_sub(keys.capacity()));
+    for (idx, item) in items.iter().enumerate() {
+        keys.push(KeyIdx { key: item.sort_z, idx: idx as u32 });
+    }
+    if ascending {
+        keys.sort_by(|a, b| a.key.partial_cmp(&b.key).unwrap_or(std::cmp::Ordering::Equal));
+    } else {
+        keys.sort_by(|a, b| b.key.partial_cmp(&a.key).unwrap_or(std::cmp::Ordering::Equal));
+    }
+    gather.clear();
+    gather.reserve(n.saturating_sub(gather.capacity()));
+    for ki in keys.iter() {
+        gather.push(items[ki.idx as usize]);
+    }
+    items.copy_from_slice(&gather[..n]);
+}
+
 // Per-tile triangle bins (mirror StripTriangleBuffer / TLThreadOutput bins).
 // Small triangles (covering <=4 tiles) are binned per tile so each raster tile
 // only draws its own bin merged with the flat global list; larger triangles
@@ -204,12 +237,21 @@ struct TriBins {
     shadow: Vec<Vec<RenderTriangle>>,
 }
 impl TriBins {
-    fn new() -> TriBins {
+    fn new_with_caps(opaque_cap: usize, trans_cap: usize, shadow_cap: usize) -> TriBins {
+        let make_bins = |cap: usize| -> Vec<Vec<RenderTriangle>> {
+            (0..NTILES).map(|_| Vec::with_capacity(cap)).collect()
+        };
         TriBins {
-            opaque: (0..NTILES).map(|_| Vec::new()).collect(),
-            trans: (0..NTILES).map(|_| Vec::new()).collect(),
-            shadow: (0..NTILES).map(|_| Vec::new()).collect(),
+            opaque: make_bins(opaque_cap),
+            trans: make_bins(trans_cap),
+            shadow: make_bins(shadow_cap),
         }
+    }
+    fn published() -> TriBins {
+        TriBins::new_with_caps(PUBLISHED_OPAQUE_BIN_RESERVE, PUBLISHED_TRANS_BIN_RESERVE, PUBLISHED_SHADOW_BIN_RESERVE)
+    }
+    fn worker() -> TriBins {
+        TriBins::new_with_caps(WORKER_OPAQUE_BIN_RESERVE, WORKER_TRANS_BIN_RESERVE, WORKER_SHADOW_BIN_RESERVE)
     }
     fn clear(&mut self) {
         for b in &mut self.opaque {
@@ -232,12 +274,27 @@ struct WorkerLocal {
     trans: Vec<RenderTriangle>,
     shadow: Vec<RenderTriangle>,
     bins: TriBins,
+    eye_scratch: RenderVertexList,
+    clip_scratch: RenderVertexList,
+    sort_keys: Vec<KeyIdx>,
+    sort_gather: Vec<RenderTriangle>,
     tl_ivs: Vec<Interval>,
     r_ivs: Vec<Interval>,
 }
 impl WorkerLocal {
     fn new() -> WorkerLocal {
-        WorkerLocal { bins: TriBins::new(), ..Default::default() }
+        WorkerLocal {
+            opaque: Vec::with_capacity(WORKER_FLAT_RESERVE),
+            trans: Vec::with_capacity(WORKER_FLAT_RESERVE),
+            shadow: Vec::with_capacity(WORKER_FLAT_RESERVE),
+            bins: TriBins::worker(),
+            eye_scratch: RenderVertexList::new(),
+            clip_scratch: RenderVertexList::new(),
+            sort_keys: Vec::with_capacity(SORT_SCRATCH_RESERVE),
+            sort_gather: Vec::with_capacity(SORT_SCRATCH_RESERVE),
+            tl_ivs: Vec::with_capacity(8),
+            r_ivs: Vec::with_capacity(64),
+        }
     }
 }
 
@@ -414,7 +471,21 @@ impl RenderState {
         let camera_pitch = (8.0f32 / camera_distance).asin();
 
         let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        config::NUM_RASTER_THREADS.store(num_threads as i32, Ordering::Relaxed);
+        config::NUM_TL_THREADS.store(num_threads as i32, Ordering::Relaxed);
+        config::NUM_STRIPS.store(R as i32, Ordering::Relaxed);
+        config::NUM_TILE_BINS.store(NTILES as i32, Ordering::Relaxed);
         let pool = RenderPool::new(num_threads);
+
+        let opaque = [Vec::with_capacity(WORKER_FLAT_RESERVE), Vec::with_capacity(WORKER_FLAT_RESERVE)];
+        let trans = [Vec::with_capacity(WORKER_FLAT_RESERVE), Vec::with_capacity(WORKER_FLAT_RESERVE)];
+        let shadow = [Vec::with_capacity(WORKER_FLAT_RESERVE * 2), Vec::with_capacity(WORKER_FLAT_RESERVE * 2)];
+        let mut cone = [LuminaireConeBuffer::default(), LuminaireConeBuffer::default()];
+        for c in &mut cone {
+            c.tris.reserve(config::LUMINAIRE_CONE_SEGMENTS as usize);
+        }
+        let instance_depths = Vec::with_capacity(instances.len());
+        let occluders = Vec::with_capacity(instances.len());
 
         RenderState {
             cube,
@@ -442,15 +513,17 @@ impl RenderState {
             normal: vec![0.0; npix * 3],
             linear_z: vec![config::LINEAR_Z_SKY; npix],
             shadow_depth: vec![0u16; shadow_px],
-            opaque: [Vec::new(), Vec::new()],
-            trans: [Vec::new(), Vec::new()],
-            shadow: [Vec::new(), Vec::new()],
-            cone: [LuminaireConeBuffer::default(), LuminaireConeBuffer::default()],
+            opaque,
+            trans,
+            shadow,
+            cone,
             shadow_box: [ShadowBoxBuffer::default(), ShadowBoxBuffer::default()],
             frame_params: [FrameParams::default(), FrameParams::default()],
-            bins: [TriBins::new(), TriBins::new()],
-            instance_depths: Vec::new(),
-            occluders: Vec::new(),
+            bins: [TriBins::published(), TriBins::published()],
+            instance_depths,
+            occluders,
+            sort_keys: Vec::with_capacity(SORT_SCRATCH_RESERVE),
+            sort_gather: Vec::with_capacity(SORT_SCRATCH_RESERVE),
             frame_tl_params: TlParams::default(),
             num_threads,
             camera_yaw: 0.0,
@@ -466,9 +539,7 @@ impl RenderState {
             format: FB_FORMAT,
             last_physics_ms: 0,
             started: false,
-            pool_inflight: false,
-            pending_physics_iv: None,
-            pending_overlay_iv: None,
+            profiler_unfreeze: false,
             profiler: Profiler::new(num_threads),
             pool,
         }
@@ -493,45 +564,8 @@ impl RenderState {
             self.last_physics_ms = now_ms;
             self.started = true;
         }
-        let nthreads = self.num_threads.max(1);
-        let tl_idx = (self.frame_num as usize) & 1;
-        let raster_idx = 1 - tl_idx;
-
-        // ----- Reap the PREVIOUS frame's pool. Its raster drained at that
-        // frame's wait_raster (before its Present); only its T&L bin-merge tail
-        // could still be running, and it overlapped the Present that just
-        // completed in main.rs. Now collect its now-complete worker intervals
-        // (plus the main-thread physics/overlay spans stashed last frame) and
-        // fold its flat-global triangles into the buffer this frame rasterizes.
-        // Mirrors C++ main after Present: wait pool_workers_done -> merge_tl_globals.
-        if self.pool_inflight {
-            self.pool.wait_pool();
-        }
+        self.profiler.set_frozen(self.paused && !self.profiler_unfreeze);
         self.profiler.begin_frame();
-        if self.pool_inflight {
-            {
-                let prof = &mut self.profiler;
-                for wid in 0..nthreads {
-                    let lo = self.pool.local(wid);
-                    for iv in &lo.tl_ivs {
-                        prof.record_tl(wid, *iv);
-                    }
-                    for iv in &lo.r_ivs {
-                        prof.record_raster(wid, *iv);
-                    }
-                }
-            }
-            if let Some(iv) = self.pending_physics_iv.take() {
-                self.profiler.record_physics(iv);
-            }
-            if let Some(iv) = self.pending_overlay_iv.take() {
-                self.profiler.record_raster(0, iv);
-            }
-            // Flat-global triangles (the big >4-tile fallbacks) the previous
-            // frame's T&L produced, concatenated + re-sorted into the buffer
-            // this frame rasterizes (raster_idx == previous tl_idx).
-            self.merge_flat_globals(raster_idx);
-        }
 
         // ----- Timing (physics runs concurrently with raster/T&L, below) -----
         let mut delta_time = (now_ms - self.last_physics_ms) as f32 / 1000.0;
@@ -550,6 +584,8 @@ impl RenderState {
         // tl_idx while raster consumes the previous frame's output in raster_idx.
         let read_idx = self.snap_read;
         let write_idx = 1 - read_idx;
+        let tl_idx = (self.frame_num as usize) & 1;
+        let raster_idx = 1 - tl_idx;
 
         let mut snaps = std::mem::take(&mut self.snapshots);
         let target_time = snaps[read_idx].sim_time + delta_time;
@@ -567,12 +603,24 @@ impl RenderState {
 
         let shadow_size = config::SHADOW_MAP_SIZE;
         let clear_color = pixel::pack_rgb_fast(&self.format, 45, 45, 45);
+        let nthreads = self.num_threads.max(1);
+        let tl_workers = config::num_tl_threads().clamp(1, nthreads as i32);
 
         // Raster runs the buffer the previous frame's T&L populated. Its inputs
         // (raster_idx geometry, matrices, cone, shadow box) are all complete from
         // last frame, so it does not depend on anything in this frame's setup.
         let do_raster = self.frame_params[raster_idx].valid;
         let fp_raster = self.frame_params[raster_idx];
+
+        // Finalize the previous frame's flat-global triangles into the buffer
+        // this frame rasterizes. Per-tile bins were scatter-merged by the workers
+        // last frame; only the few big-triangle flat fallbacks are concatenated +
+        // sorted here. Done at frame top (after the previous Present) so it is off
+        // the path between raster completion and Present (mirrors C++
+        // merge_tl_globals running post-Present).
+        if do_raster {
+            self.merge_flat_globals(raster_idx);
+        }
 
         // Clear this frame's scatter-merge target before the pool can touch it.
         self.bins[tl_idx].clear();
@@ -583,6 +631,7 @@ impl RenderState {
         let raster_plan = FramePlan {
             do_raster,
             nthreads: nthreads as i32,
+            tl_workers,
             pix: fb.as_mut_ptr(),
             depth: self.depth.as_mut_ptr(),
             normal: self.normal.as_mut_ptr(),
@@ -598,6 +647,7 @@ impl RenderState {
             proj11: projection.m[1][1],
             format: self.format,
             fp: fp_raster,
+            hard_barrier: self.pool.shared.sched.hard_barrier.load(Ordering::Relaxed),
             r_opaque: self.opaque[raster_idx].as_ptr(),
             r_opaque_len: self.opaque[raster_idx].len(),
             r_trans: self.trans[raster_idx].as_ptr(),
@@ -777,6 +827,7 @@ impl RenderState {
         let plan = FramePlan {
             do_raster,
             nthreads: nthreads as i32,
+            tl_workers,
             pix: fb.as_mut_ptr(),
             depth: self.depth.as_mut_ptr(),
             normal: self.normal.as_mut_ptr(),
@@ -792,6 +843,7 @@ impl RenderState {
             proj11: projection.m[1][1],
             format: self.format,
             fp: fp_raster,
+            hard_barrier: self.pool.shared.sched.hard_barrier.load(Ordering::Relaxed),
             r_opaque: self.opaque[raster_idx].as_ptr(),
             r_opaque_len: self.opaque[raster_idx].len(),
             r_trans: self.trans[raster_idx].as_ptr(),
@@ -833,7 +885,7 @@ impl RenderState {
         // back snapshot (write_idx); the pool reads the disjoint front one.
         self.pool.publish_tl(plan);
 
-        self.pending_physics_iv = if run_physics {
+        let physics_iv = if run_physics {
             let t0 = self.profiler.now();
             self.physics.step(delta_time, target_time, seq, &self.instances, &self.walls, write_snap);
             Some(Interval { start: t0, end: self.profiler.now(), tag: 0 })
@@ -841,12 +893,26 @@ impl RenderState {
             None
         };
 
-        // Wait for RASTER ONLY (all four passes drained). The T&L bin-merge tail
-        // — a slow worker still in Phase B — may keep running; it overlaps the
-        // overlays + Present below and is reaped at the next frame's top. This
-        // is the C++ split: `wait raster_pass >= RASTER_PASS_COUNT` here, then
-        // overlays / Present, then `wait pool_workers_done` after Present.
-        self.pool.wait_raster();
+        self.pool.wait();
+
+        // ----- Record profiler intervals from the worker locals. The flat-global
+        // merge for this frame's T&L output is deferred to the top of the next
+        // frame (merge_flat_globals), keeping it off the path to Present. -----
+        {
+            let prof = &mut self.profiler;
+            for wid in 0..nthreads {
+                let lo = self.pool.local(wid);
+                for iv in &lo.tl_ivs {
+                    prof.record_tl(wid, *iv);
+                }
+                for iv in &lo.r_ivs {
+                    prof.record_raster(wid, *iv);
+                }
+            }
+        }
+        if let Some(iv) = physics_iv {
+            self.profiler.record_physics(iv);
+        }
 
         // ----- Publish physics result + restore snapshots. -----
         self.snapshots = snaps;
@@ -856,14 +922,11 @@ impl RenderState {
         }
 
         // ----- Single-threaded overlays (glare + wireframe) on the now-complete
-        // raster; or clear on the first frame which has no geometry yet. The
-        // overlay's profiler span is stashed and recorded next frame alongside
-        // the worker intervals (they belong to the same frame). -----
+        // raster; or clear on the first frame which has no geometry yet. -----
         if do_raster {
-            self.pending_overlay_iv = self.draw_overlays(fb, w, h, fp_raster);
+            self.draw_overlays(fb, w, h, fp_raster);
         } else {
             fb.fill(clear_color);
-            self.pending_overlay_iv = None;
         }
 
         // ----- Overlays: FPS, then the concurrency profiler (drawn last so it
@@ -874,7 +937,6 @@ impl RenderState {
         let draw_end = self.profiler.now();
         self.profiler.draw(fb, w, w, h, &self.format, draw_end);
 
-        self.pool_inflight = true;
         self.frame_num += 1;
     }
 
@@ -894,19 +956,23 @@ impl RenderState {
             self.trans[idx].extend_from_slice(&lo.trans);
             self.shadow[idx].extend_from_slice(&lo.shadow);
         }
+        let mut keys = std::mem::take(&mut self.sort_keys);
+        let mut gather = std::mem::take(&mut self.sort_gather);
         if config::ENABLE_RGB_TRIANGLE_SORT {
-            self.opaque[idx].sort_by(|a, b| a.sort_z.partial_cmp(&b.sort_z).unwrap_or(std::cmp::Ordering::Equal));
-            self.trans[idx].sort_by(|a, b| b.sort_z.partial_cmp(&a.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+            sort_triangles_by_key(&mut self.opaque[idx], true, &mut keys, &mut gather);
+            sort_triangles_by_key(&mut self.trans[idx], false, &mut keys, &mut gather);
         }
         if config::ENABLE_SHADOW_TRIANGLE_SORT {
-            self.shadow[idx].sort_by(|a, b| a.sort_z.partial_cmp(&b.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+            sort_triangles_by_key(&mut self.shadow[idx], true, &mut keys, &mut gather);
         }
+        self.sort_keys = keys;
+        self.sort_gather = gather;
     }
 
     // Single-threaded overlays drawn after the cooperative raster completes:
     // spotlight glare and the tumbling-box wireframe. Uses the frame params that
     // match the geometry just rasterized (raster_idx).
-    fn draw_overlays(&mut self, fb: &mut [u32], w: i32, h: i32, fp: FrameParams) -> Option<Interval> {
+    fn draw_overlays(&mut self, fb: &mut [u32], w: i32, h: i32, fp: FrameParams) {
         let overlay_t0 = self.profiler.now();
         let format = self.format;
         let shadow_size = config::SHADOW_MAP_SIZE;
@@ -964,7 +1030,7 @@ impl RenderState {
                 }
             }
         }
-        Some(Interval { start: overlay_t0, end: self.profiler.now(), tag: profiler::RASTER_LUMINAIRE })
+        self.profiler.record_raster(0, Interval { start: overlay_t0, end: self.profiler.now(), tag: profiler::RASTER_LUMINAIRE });
     }
 
     /// Profiler epoch timestamp accessor (used by main.rs to bracket present).
@@ -1255,6 +1321,23 @@ impl RenderState {
     pub fn toggle_stats(&mut self) {
         self.profiler.toggle();
     }
+    pub fn toggle_profiler_unfreeze(&mut self) {
+        self.profiler_unfreeze = !self.profiler_unfreeze;
+    }
+    pub fn toggle_raster_hard_barrier(&mut self) -> bool {
+        let was = self.pool.shared.sched.hard_barrier.fetch_xor(true, Ordering::AcqRel);
+        !was
+    }
+    pub fn adjust_tl_workers(&mut self, delta: i32) -> i32 {
+        let max = self.num_threads.max(1) as i32;
+        let mut cur = config::num_tl_threads();
+        if cur < 1 {
+            cur = max;
+        }
+        let next = (cur + delta).clamp(1, max);
+        config::NUM_TL_THREADS.store(next, Ordering::Relaxed);
+        next
+    }
     pub fn orbit(&mut self, xrel: f32, yrel: f32) {
         if self.camera_orbiting {
             self.camera_yaw -= xrel * 0.006;
@@ -1298,18 +1381,92 @@ unsafe fn slice_from<'a, T>(p: *const T, len: usize) -> &'a [T] {
 // run. Rust's adaptive sort detects the two existing runs, so this is the
 // std::inplace_merge equivalent. Mirrors tl_worker.cpp append_bin.
 #[inline]
-fn append_bin(dst: &mut Vec<RenderTriangle>, src: &[RenderTriangle], keep_sorted: bool, ascending: bool) {
+fn merge_sorted_runs(
+    items: &mut [RenderTriangle],
+    mid: usize,
+    ascending: bool,
+    scratch: &mut Vec<RenderTriangle>,
+) {
+    let n = items.len();
+    if mid == 0 || mid >= n {
+        return;
+    }
+    let left_len = mid;
+    let right_len = n - mid;
+    scratch.clear();
+
+    if left_len <= right_len {
+        // Copy only the smaller left run aside, then merge front-to-back. The
+        // write cursor never overtakes the unread right run.
+        scratch.reserve(left_len.saturating_sub(scratch.capacity()));
+        scratch.extend_from_slice(&items[..left_len]);
+        let mut i = 0usize; // scratch / left
+        let mut j = mid; // items / right
+        let mut k = 0usize; // write
+        while i < left_len && j < n {
+            let take_right = if ascending {
+                items[j].sort_z < scratch[i].sort_z
+            } else {
+                items[j].sort_z > scratch[i].sort_z
+            };
+            if take_right {
+                items[k] = items[j];
+                j += 1;
+            } else {
+                items[k] = scratch[i];
+                i += 1;
+            }
+            k += 1;
+        }
+        if i < left_len {
+            items[k..k + (left_len - i)].copy_from_slice(&scratch[i..left_len]);
+        }
+        // Leftover right-run items are already in place.
+    } else {
+        // Copy only the smaller right run aside, then merge back-to-front. The
+        // write cursor never clobbers unread left-run items.
+        scratch.reserve(right_len.saturating_sub(scratch.capacity()));
+        scratch.extend_from_slice(&items[mid..n]);
+        let mut i = mid; // one past current left item
+        let mut j = right_len; // one past current scratch/right item
+        let mut k = n; // one past write
+        while i > 0 && j > 0 {
+            let take_left = if ascending {
+                scratch[j - 1].sort_z < items[i - 1].sort_z
+            } else {
+                scratch[j - 1].sort_z > items[i - 1].sort_z
+            };
+            if take_left {
+                items[k - 1] = items[i - 1];
+                i -= 1;
+            } else {
+                items[k - 1] = scratch[j - 1];
+                j -= 1;
+            }
+            k -= 1;
+        }
+        if j > 0 {
+            items[k - j..k].copy_from_slice(&scratch[..j]);
+        }
+        // Leftover left-run items are already in place.
+    }
+}
+
+#[inline]
+fn append_bin(
+    dst: &mut Vec<RenderTriangle>,
+    src: &[RenderTriangle],
+    keep_sorted: bool,
+    ascending: bool,
+    gather: &mut Vec<RenderTriangle>,
+) {
     if src.is_empty() {
         return;
     }
     let old = dst.len();
     dst.extend_from_slice(src);
     if keep_sorted && old > 0 {
-        if ascending {
-            dst.sort_by(|a, b| a.sort_z.partial_cmp(&b.sort_z).unwrap_or(std::cmp::Ordering::Equal));
-        } else {
-            dst.sort_by(|a, b| b.sort_z.partial_cmp(&a.sort_z).unwrap_or(std::cmp::Ordering::Equal));
-        }
+        merge_sorted_runs(dst.as_mut_slice(), old, ascending, gather);
     }
 }
 
@@ -1319,6 +1476,7 @@ fn append_bin(dst: &mut Vec<RenderTriangle>, src: &[RenderTriangle], keep_sorted
 struct FramePlan {
     do_raster: bool,
     nthreads: i32,
+    tl_workers: i32,
     pix: *mut u32,
     depth: *mut f32,
     normal: *mut f32,
@@ -1334,6 +1492,7 @@ struct FramePlan {
     proj11: f32,
     format: PixelFormat,
     fp: FrameParams,
+    hard_barrier: bool,
     r_opaque: *const RenderTriangle,
     r_opaque_len: usize,
     r_trans: *const RenderTriangle,
@@ -1369,6 +1528,7 @@ impl Default for FramePlan {
         FramePlan {
             do_raster: false,
             nthreads: 1,
+            tl_workers: 1,
             pix: std::ptr::null_mut(),
             depth: std::ptr::null_mut(),
             normal: std::ptr::null_mut(),
@@ -1384,6 +1544,7 @@ impl Default for FramePlan {
             proj11: 0.0,
             format: FB_FORMAT,
             fp: FrameParams::default(),
+            hard_barrier: false,
             r_opaque: std::ptr::null(),
             r_opaque_len: 0,
             r_trans: std::ptr::null(),
@@ -1502,26 +1663,8 @@ impl RenderPool {
         self.shared.cv_pool.notify_all();
     }
 
-    // Block until all four raster passes have drained (raster_pass >= RPC),
-    // exactly like C++ main waiting on `raster_pass >= RASTER_PASS_COUNT` before
-    // it touches the framebuffer for the post passes / overlays / present. The
-    // T&L tail (a slow worker still in Phase B) may still be running afterward;
-    // that overlaps the main thread's overlays + present, then wait_pool reaps it.
-    fn wait_raster(&self) {
-        let k = self.shared.mtx.lock().unwrap();
-        // sched.pass is atomic; the worker that crosses RPC takes mtx (empty
-        // section) then notifies, so checking it under this lock is race-free.
-        let _g = self
-            .shared
-            .cv_main
-            .wait_while(k, |_| self.shared.sched.pass.load(Ordering::Acquire) < RPC)
-            .unwrap();
-    }
-
-    // Block until every worker has finished the whole frame (T&L bin merge +
-    // all raster passes). Mirrors C++ main waiting on pool_workers_done after
-    // Present.
-    fn wait_pool(&self) {
+    // Block until every worker has finished the current frame.
+    fn wait(&self) {
         let mut k = self.shared.mtx.lock().unwrap();
         while k.workers_done < self.shared.nthreads {
             k = self.shared.cv_main.wait(k).unwrap();
@@ -1585,25 +1728,29 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
             ctx_a.raster_shadow_prepass(worker_id, &mut local.r_ivs);
         }
 
-        // T&L gate: wait for publish_tl (setup complete). Re-read the plan under
-        // the lock so the now-filled T&L fields are visible.
-        let plan = {
-            let mut k = shared.mtx.lock().unwrap();
-            while shared.running.load(Ordering::Acquire) && k.tl_target < this_frame {
-                k = shared.cv_pool.wait(k).unwrap();
+        if (worker_id as i32) < plan_a.tl_workers {
+            // T&L-preferred workers wait for publish_tl (setup complete), then
+            // run this frame's T&L before falling through to help raster.
+            let plan = {
+                let mut k = shared.mtx.lock().unwrap();
+                while shared.running.load(Ordering::Acquire) && k.tl_target < this_frame {
+                    k = shared.cv_pool.wait(k).unwrap();
+                }
+                if !shared.running.load(Ordering::Acquire) {
+                    return;
+                }
+                unsafe { *shared.plan.get() }
+            };
+            let ctx = WorkerCtx { plan, shared };
+            ctx.tl_phase(worker_id, local);
+            if plan.do_raster {
+                ctx.raster_rest(worker_id, &mut local.r_ivs);
             }
-            if !shared.running.load(Ordering::Acquire) {
-                return;
-            }
-            unsafe { *shared.plan.get() }
-        };
-        let ctx = WorkerCtx { plan, shared };
-
-        // Phase B: this worker's T&L chunk -> bins + flat + local sort + scatter.
-        ctx.tl_phase(worker_id, local);
-        // Phase C: cooperatively finish the previous frame's raster.
-        if plan.do_raster {
-            ctx.raster_rest(worker_id, &mut local.r_ivs);
+        } else if plan_a.do_raster {
+            // Raster-preferred workers do not wait for this frame's T&L setup.
+            // They immediately continue draining raster(N-1), matching C++/Zig
+            // workers with worker_id >= k_eff.
+            ctx_a.raster_rest(worker_id, &mut local.r_ivs);
         }
 
         let mut k = shared.mtx.lock().unwrap();
@@ -1622,6 +1769,7 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
 // Color(+SSAO overlap) -> Ssao -> Luminaire.
 struct Sched {
     pass: AtomicI32,
+    hard_barrier: std::sync::atomic::AtomicBool,
     tiles_done: [AtomicI32; 4],
     // Per-pass, per-row next-column claim counters (ShadowDepth + Color use them).
     row_next_col: [[AtomicI32; R]; RPC as usize],
@@ -1635,6 +1783,7 @@ impl Sched {
     fn new() -> Sched {
         Sched {
             pass: AtomicI32::new(RPC),
+            hard_barrier: std::sync::atomic::AtomicBool::new(false),
             tiles_done: [AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0), AtomicI32::new(0)],
             row_next_col: std::array::from_fn(|_| std::array::from_fn(|_| AtomicI32::new(0))),
             color_done: std::array::from_fn(|_| AtomicU8::new(0)),
@@ -1935,7 +2084,10 @@ impl<'a> WorkerCtx<'a> {
         r_ivs.push(Interval { start: t0, end: self.ts(), tag: profiler::RASTER_SSAO });
         sched.ssao_done[idx].store(1, Ordering::Release);
         // This tile's SSAO is done -> opportunistically run its own luminaire cone.
-        self.try_run_lum(c, r, r_ivs);
+        // Disabled by the hard barrier so Luminaire waits for its dedicated pass.
+        if !self.plan.hard_barrier {
+            self.try_run_lum(c, r, r_ivs);
+        }
         let done = sched.tiles_done[PASS_SSAO as usize].fetch_add(1, Ordering::AcqRel) + 1;
         if done >= NTILES as i32 {
             sched.pass.fetch_max(PASS_LUM, Ordering::AcqRel);
@@ -1978,15 +2130,7 @@ impl<'a> WorkerCtx<'a> {
         r_ivs.push(Interval { start: t0, end: self.ts(), tag: profiler::RASTER_LUMINAIRE });
         let done = sched.tiles_done[PASS_LUM as usize].fetch_add(1, Ordering::AcqRel) + 1;
         if done >= NTILES as i32 {
-            // Raster (all four passes) just drained. Wake the main thread's
-            // wait_raster so it can run the post passes / overlays / present
-            // while the T&L tail (a slow worker still in Phase B) keeps going.
-            // The empty mtx critical section closes the predicate/wait race,
-            // mirroring raster_worker.cpp's advance_pass_to(RASTER_PASS_COUNT).
-            if sched.pass.fetch_max(RPC, Ordering::AcqRel) < RPC {
-                drop(self.shared.mtx.lock().unwrap());
-                self.shared.cv_main.notify_one();
-            }
+            sched.pass.fetch_max(RPC, Ordering::AcqRel);
         }
         true
     }
@@ -2039,6 +2183,7 @@ impl<'a> WorkerCtx<'a> {
     // ---- Phase C: cooperatively drain the rest of the previous frame's raster.
     fn raster_rest(&self, worker_id: usize, r_ivs: &mut Vec<Interval>) {
         let sched = self.sched();
+        let hard_barrier = self.plan.hard_barrier;
         let pool = self.plan.nthreads.max(1);
         loop {
             let p = sched.pass.load(Ordering::Acquire);
@@ -2086,15 +2231,18 @@ impl<'a> WorkerCtx<'a> {
                         sched.pass.fetch_max(PASS_SSAO, Ordering::AcqRel);
                     }
                     // Opportunistically run any SSAO tile this completion unblocked.
-                    for dr in -1..=1 {
-                        for dc in -1..=1 {
-                            let nc = col + dc;
-                            let nr = row + dr;
-                            if nc < 0 || nc >= X as i32 || nr < 0 || nr >= R as i32 {
-                                continue;
-                            }
-                            if sched.ssao_claimed[nr as usize * X + nc as usize].load(Ordering::Relaxed) == 0 {
-                                self.try_run_ssao(nc, nr, r_ivs);
+                    // Disabled by the hard barrier so passes serialize cleanly.
+                    if !hard_barrier {
+                        for dr in -1..=1 {
+                            for dc in -1..=1 {
+                                let nc = col + dc;
+                                let nr = row + dr;
+                                if nc < 0 || nc >= X as i32 || nr < 0 || nr >= R as i32 {
+                                    continue;
+                                }
+                                if sched.ssao_claimed[nr as usize * X + nc as usize].load(Ordering::Relaxed) == 0 {
+                                    self.try_run_ssao(nc, nr, r_ivs);
+                                }
                             }
                         }
                     }
@@ -2109,12 +2257,14 @@ impl<'a> WorkerCtx<'a> {
                 }
             }
             if p == PASS_COLOR {
-                self.ssao_drain(r_ivs);
+                if !hard_barrier {
+                    self.ssao_drain(r_ivs);
+                }
             }
             // Out of claimable tiles; wait for the pass to advance, helping drain
             // any SSAO that becomes eligible while waiting in the color pass.
             while sched.pass.load(Ordering::Acquire) <= p {
-                if p == PASS_COLOR {
+                if p == PASS_COLOR && !hard_barrier {
                     self.ssao_drain(r_ivs);
                 }
                 std::thread::yield_now();
@@ -2125,15 +2275,15 @@ impl<'a> WorkerCtx<'a> {
     // ---- Phase B: T&L instance chunk -> local bins/flat -> sort -> scatter ----
     fn tl_phase(&self, worker_id: usize, local: &mut WorkerLocal) {
         let n = self.plan.instance_depths_len;
-        let nt = self.plan.nthreads.max(1) as usize;
+        let nt = self.plan.tl_workers.max(1) as usize;
         let per = n.div_ceil(nt).max(1);
         let start = worker_id * per;
         let t0 = self.ts();
         if start < n {
             let end = (start + per).min(n);
             let meshes = self.meshes_array();
-            let mut eye = RenderVertexList::new();
-            let mut clp = RenderVertexList::new();
+            let mut eye = std::mem::take(&mut local.eye_scratch);
+            let mut clp = std::mem::take(&mut local.clip_scratch);
             unsafe {
                 RenderState::tl_chunk(
                     &meshes,
@@ -2151,29 +2301,31 @@ impl<'a> WorkerCtx<'a> {
                     self.plan.h,
                 );
             }
+            local.eye_scratch = eye;
+            local.clip_scratch = clp;
         }
         local.tl_ivs.push(Interval { start: t0, end: self.ts(), tag: profiler::TL_PER_INSTANCE });
 
         // Local sort of this worker's flat lists + each of its bins (parallel).
         if config::ENABLE_RGB_TRIANGLE_SORT {
             let s0 = self.ts();
-            local.opaque.sort_by(|a, b| a.sort_z.partial_cmp(&b.sort_z).unwrap_or(std::cmp::Ordering::Equal));
-            local.trans.sort_by(|a, b| b.sort_z.partial_cmp(&a.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+            sort_triangles_by_key(&mut local.opaque, true, &mut local.sort_keys, &mut local.sort_gather);
+            sort_triangles_by_key(&mut local.trans, false, &mut local.sort_keys, &mut local.sort_gather);
             for b in &mut local.bins.opaque {
                 if b.len() > 1 {
-                    b.sort_by(|x, y| x.sort_z.partial_cmp(&y.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+                    sort_triangles_by_key(b, true, &mut local.sort_keys, &mut local.sort_gather);
                 }
             }
             for b in &mut local.bins.trans {
                 if b.len() > 1 {
-                    b.sort_by(|x, y| y.sort_z.partial_cmp(&x.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+                    sort_triangles_by_key(b, false, &mut local.sort_keys, &mut local.sort_gather);
                 }
             }
             if config::ENABLE_SHADOW_TRIANGLE_SORT {
-                local.shadow.sort_by(|a, b| a.sort_z.partial_cmp(&b.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+                sort_triangles_by_key(&mut local.shadow, true, &mut local.sort_keys, &mut local.sort_gather);
                 for b in &mut local.bins.shadow {
                     if b.len() > 1 {
-                        b.sort_by(|x, y| x.sort_z.partial_cmp(&y.sort_z).unwrap_or(std::cmp::Ordering::Equal));
+                        sort_triangles_by_key(b, true, &mut local.sort_keys, &mut local.sort_gather);
                     }
                 }
             }
@@ -2217,9 +2369,9 @@ impl<'a> WorkerCtx<'a> {
             // reference to the whole bin array is ever formed, so disjoint tiles
             // are mutated concurrently without aliasing.
             unsafe {
-                append_bin(&mut *self.plan.w_opaque.add(s), so, config::ENABLE_RGB_TRIANGLE_SORT, true);
-                append_bin(&mut *self.plan.w_trans.add(s), st, config::ENABLE_RGB_TRIANGLE_SORT, false);
-                append_bin(&mut *self.plan.w_shadow.add(s), ssd, config::ENABLE_SHADOW_TRIANGLE_SORT, true);
+                append_bin(&mut *self.plan.w_opaque.add(s), so, config::ENABLE_RGB_TRIANGLE_SORT, true, &mut local.sort_gather);
+                append_bin(&mut *self.plan.w_trans.add(s), st, config::ENABLE_RGB_TRIANGLE_SORT, false, &mut local.sort_gather);
+                append_bin(&mut *self.plan.w_shadow.add(s), ssd, config::ENABLE_SHADOW_TRIANGLE_SORT, true, &mut local.sort_gather);
             }
         }
         local.tl_ivs.push(Interval { start: s1, end: self.ts(), tag: profiler::TL_BIN_MERGE });

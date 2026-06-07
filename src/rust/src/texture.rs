@@ -3,6 +3,9 @@
 //! Includes a small portable 24/32-bpp BMP loader (the C++/Zig kept this in the
 //! platform layer; here it lives with the texture code it feeds).
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 #[derive(Clone, Debug, Default)]
 pub struct PackedTextureLevel {
     pub w: i32,
@@ -150,12 +153,21 @@ pub fn load_packed_texture(path: &str) -> Option<PackedTexture> {
 }
 
 #[inline]
-fn unpack_rgb_f32(c: u32) -> [f32; 3] {
-    [
-        ((c >> 16) & 0xff) as f32,
-        ((c >> 8) & 0xff) as f32,
-        (c & 0xff) as f32,
-    ]
+fn unpack_rgb_f32(c: u32) -> [f32; 4] {
+    [((c >> 16) & 0xff) as f32, ((c >> 8) & 0xff) as f32, (c & 0xff) as f32, 0.0]
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn blend_rgb_bilinear_neon(c00: u32, c10: u32, c01: u32, c11: u32, s00: f32, s10: f32, s01: f32, s11: f32) -> u32 {
+    let mut acc = vmulq_n_f32(vld1q_f32(unpack_rgb_f32(c00).as_ptr()), s00);
+    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c10).as_ptr()), s10);
+    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c01).as_ptr()), s01);
+    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c11).as_ptr()), s11);
+    acc = vaddq_f32(acc, vdupq_n_f32(0.5));
+    let mut out = [0.0f32; 4];
+    vst1q_f32(out.as_mut_ptr(), acc);
+    ((out[0] as u32) << 16) | ((out[1] as u32) << 8) | (out[2] as u32)
 }
 
 #[inline]
@@ -181,16 +193,26 @@ pub fn sample_texture_bilinear(level: &PackedTextureLevel, u: f32, v: f32) -> u3
     let s01 = (1.0 - tx) * ty;
     let s11 = tx * ty;
 
-    let a = unpack_rgb_f32(c00);
-    let b = unpack_rgb_f32(c10);
-    let c = unpack_rgb_f32(c01);
-    let d = unpack_rgb_f32(c11);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            return blend_rgb_bilinear_neon(c00, c10, c01, c11, s00, s10, s01, s11);
+        }
+    }
 
-    let r = a[0] * s00 + b[0] * s10 + c[0] * s01 + d[0] * s11 + 0.5;
-    let g = a[1] * s00 + b[1] * s10 + c[1] * s01 + d[1] * s11 + 0.5;
-    let bb = a[2] * s00 + b[2] * s10 + c[2] * s01 + d[2] * s11 + 0.5;
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let a = unpack_rgb_f32(c00);
+        let b = unpack_rgb_f32(c10);
+        let c = unpack_rgb_f32(c01);
+        let d = unpack_rgb_f32(c11);
 
-    ((r as u32) << 16) | ((g as u32) << 8) | (bb as u32)
+        let r = a[0] * s00 + b[0] * s10 + c[0] * s01 + d[0] * s11 + 0.5;
+        let g = a[1] * s00 + b[1] * s10 + c[1] * s01 + d[1] * s11 + 0.5;
+        let bb = a[2] * s00 + b[2] * s10 + c[2] * s01 + d[2] * s11 + 0.5;
+
+        ((r as u32) << 16) | ((g as u32) << 8) | (bb as u32)
+    }
 }
 
 #[inline]

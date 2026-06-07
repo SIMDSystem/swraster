@@ -16,9 +16,123 @@ use crate::texture::{self as tex, PackedTexture, PackedTextureLevel};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 const M_PI: f32 = std::f32::consts::PI;
 
 type ShadowDepth = u16;
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct F32x4(float32x4_t);
+
+#[cfg(target_arch = "aarch64")]
+impl F32x4 {
+    #[inline(always)]
+    unsafe fn splat(v: f32) -> Self {
+        Self(vdupq_n_f32(v))
+    }
+    #[inline(always)]
+    unsafe fn lanes() -> Self {
+        const LANES: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
+        Self(vld1q_f32(LANES.as_ptr()))
+    }
+    #[inline(always)]
+    unsafe fn from_array(v: [f32; 4]) -> Self {
+        Self(vld1q_f32(v.as_ptr()))
+    }
+    #[inline(always)]
+    unsafe fn load(p: *const f32) -> Self {
+        Self(vld1q_f32(p))
+    }
+    #[inline(always)]
+    unsafe fn to_array(self) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        vst1q_f32(out.as_mut_ptr(), self.0);
+        out
+    }
+    #[inline(always)]
+    unsafe fn abs(self) -> Self {
+        Self(vabsq_f32(self.0))
+    }
+    #[inline(always)]
+    unsafe fn min(self, rhs: Self) -> Self {
+        Self(vminq_f32(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn max(self, rhs: Self) -> Self {
+        Self(vmaxq_f32(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn any_mixed_sign(w0: Self, w1: Self, w2: Self) -> bool {
+        let zero = vdupq_n_f32(0.0);
+        let mn = w0.min(w1.min(w2)).0;
+        let mx = w0.max(w1.max(w2)).0;
+        let neg = vcltq_f32(mn, zero);
+        let pos = vcgtq_f32(mx, zero);
+        vmaxvq_u32(vandq_u32(neg, pos)) != 0
+    }
+    #[inline(always)]
+    unsafe fn any_depth_reject(z: Self, depth: Self) -> bool {
+        vmaxvq_u32(vcgeq_f32(z.0, depth.0)) != 0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn interp3_attrs4(b0: f32, b1: f32, b2: f32, a0: [f32; 4], a1: [f32; 4], a2: [f32; 4]) -> [f32; 4] {
+    (F32x4::from_array(a0) * F32x4::splat(b0)
+        + F32x4::from_array(a1) * F32x4::splat(b1)
+        + F32x4::from_array(a2) * F32x4::splat(b2))
+    .to_array()
+}
+
+#[inline(always)]
+fn dot3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        let a = F32x4::from_array([ax, ay, az, 0.0]);
+        let b = F32x4::from_array([bx, by, bz, 0.0]);
+        return vaddvq_f32(vmulq_f32(a.0, b.0));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        ax * bx + ay * by + az * bz
+    }
+}
+
+#[inline(always)]
+fn len2_3(x: f32, y: f32, z: f32) -> f32 {
+    dot3(x, y, z, x, y, z)
+}
+
+#[cfg(target_arch = "aarch64")]
+impl std::ops::Add for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        unsafe { Self(vaddq_f32(self.0, rhs.0)) }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl std::ops::Mul for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        unsafe { Self(vmulq_f32(self.0, rhs.0)) }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl std::ops::Div for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn div(self, rhs: Self) -> Self {
+        unsafe { Self(vdivq_f32(self.0, rhs.0)) }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TriangleShader {
@@ -592,7 +706,7 @@ unsafe fn shade_lit_fragment(
         let mut nx = f.nx;
         let mut ny = f.ny;
         let mut nz = f.nz;
-        let n_len2 = nx * nx + ny * ny + nz * nz;
+        let n_len2 = len2_3(nx, ny, nz);
         if n_len2 > 0.000001 {
             let inv_n_len = 1.0 / n_len2.sqrt();
             nx *= inv_n_len;
@@ -612,13 +726,13 @@ unsafe fn shade_lit_fragment(
             lx = ctx.light_pos.x - ex;
             ly = ctx.light_pos.y - ey;
             lz = ctx.light_pos.z - ez;
-            let l_len2 = lx * lx + ly * ly + lz * lz;
+            let l_len2 = len2_3(lx, ly, lz);
             if l_len2 > 0.000001 {
                 let inv_l_len = 1.0 / l_len2.sqrt();
                 lx *= inv_l_len;
                 ly *= inv_l_len;
                 lz *= inv_l_len;
-                let cone_cos = -(lx * ctx.spot_dir.x + ly * ctx.spot_dir.y + lz * ctx.spot_dir.z);
+                let cone_cos = -dot3(lx, ly, lz, ctx.spot_dir.x, ctx.spot_dir.y, ctx.spot_dir.z);
                 light_scale = (((cone_cos - ctx.spot_outer_cos) / (ctx.spot_inner_cos - ctx.spot_outer_cos)).max(0.0)).min(1.0);
                 light_scale *= 3.5 / (1.0 + 0.004 * l_len2);
             } else {
@@ -640,11 +754,11 @@ unsafe fn shade_lit_fragment(
             }
 
             if light_visibility > 0.0 {
-                let ndotl = (nx * lx + ny * ly + nz * lz).max(0.0);
+                let ndotl = dot3(nx, ny, nz, lx, ly, lz).max(0.0);
                 diffuse += 0.8 * ndotl * light_visibility * light_scale;
 
                 if ndotl > 0.0 {
-                    let v_len2 = ex * ex + ey * ey + ez * ez;
+                    let v_len2 = len2_3(ex, ey, ez);
                     if v_len2 > 0.000001 {
                         let inv_v_len = -1.0 / v_len2.sqrt();
                         ex *= inv_v_len;
@@ -654,13 +768,13 @@ unsafe fn shade_lit_fragment(
                     let hx = lx + ex;
                     let hy = ly + ey;
                     let hz = lz + ez;
-                    let h_len2 = hx * hx + hy * hy + hz * hz;
+                    let h_len2 = len2_3(hx, hy, hz);
                     if h_len2 > 0.000001 {
                         let inv_h_len = 1.0 / h_len2.sqrt();
                         let hhx = hx * inv_h_len;
                         let hhy = hy * inv_h_len;
                         let hhz = hz * inv_h_len;
-                        let sd = (nx * hhx + ny * hhy + nz * hhz).max(0.0);
+                        let sd = dot3(nx, ny, nz, hhx, hhy, hhz).max(0.0);
                         let sd2 = sd * sd;
                         let sd4 = sd2 * sd2;
                         let sd8 = sd4 * sd4;
@@ -932,103 +1046,117 @@ pub unsafe fn draw_triangle_barycentric_strip(
 
         let mut x = x_min;
         while x <= x_max {
-            // 4-wide quad fast path: only when all four lanes are covered and all
-            // four pass the depth test (no write mask needed). Uses [f32;4]
-            // arrays the compiler autovectorizes.
+            // 4-wide maskless quad fast path: same policy as Zig's @Vector path.
+            // Take it only when all four lanes are covered and all four pass
+            // depth, so no write mask is needed; otherwise fall through scalar.
             if quad_enabled && shader == TriangleShader::Lit && x + 3 <= x_max {
-                let mut w0v = [0.0f32; 4];
-                let mut w1v = [0.0f32; 4];
-                let mut w2v = [0.0f32; 4];
-                for k in 0..4 {
-                    let kf = k as f32;
-                    w0v[k] = w0 + a0 * kf;
-                    w1v[k] = w1 + a1 * kf;
-                    w2v[k] = w2 + a2 * kf;
-                }
-                let mut mixed = 0.0f32;
-                for k in 0..4 {
-                    let mn = w0v[k].min(w1v[k].min(w2v[k]));
-                    let mx = w0v[k].max(w1v[k].max(w2v[k]));
-                    let a = if mn < 0.0 { 1.0 } else { 0.0 };
-                    let b = if mx > 0.0 { 1.0 } else { 0.0 };
-                    mixed += a * b;
-                }
-                if mixed == 0.0 {
-                    let mut qaw0 = [0.0f32; 4];
-                    let mut qaw1 = [0.0f32; 4];
-                    let mut qaw2 = [0.0f32; 4];
-                    let mut qwsum = [0.0f32; 4];
-                    let mut zv = [0.0f32; 4];
-                    for k in 0..4 {
-                        qaw0[k] = w0v[k].abs();
-                        qaw1[k] = w1v[k].abs();
-                        qaw2[k] = w2v[k].abs();
-                        qwsum[k] = qaw0[k] + qaw1[k] + qaw2[k];
-                        zv[k] = (v0.z * qaw0[k] + v1.z * qaw1[k] + v2.z * qaw2[k]) / qwsum[k];
-                    }
-                    let xu = x as usize;
-                    let mut reject = 0.0f32;
-                    for k in 0..4 {
-                        if zv[k] >= *row_depth.add(xu + k) {
-                            reject += 1.0;
-                        }
-                    }
-                    if reject == 0.0 {
-                        let mut frags = [LitFrag {
-                            u: 0.0, v: 0.0, r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                            nx: 0.0, ny: 0.0, nz: 0.0, ex: 0.0, ey: 0.0, ez: 0.0,
-                            ss: 0.0, st: 0.0, sr: 0.0, sq: 0.0,
-                        }; 4];
-                        let mut inv_wv = [0.0f32; 4];
-                        for k in 0..4 {
-                            let inv_qwsum = 1.0 / qwsum[k];
-                            let b0v = qaw0[k] * inv_qwsum;
-                            let b1v = qaw1[k] * inv_qwsum;
-                            let b2v = qaw2[k] * inv_qwsum;
-                            let inv_w = v0.inv_w * b0v + v1.inv_w * b1v + v2.inv_w * b2v;
-                            let persp = 1.0 / inv_w;
-                            inv_wv[k] = inv_w;
+                #[cfg(target_arch = "aarch64")]
+                {
+                    let lanes = F32x4::lanes();
+                    let w0v = F32x4::splat(w0) + F32x4::splat(a0) * lanes;
+                    let w1v = F32x4::splat(w1) + F32x4::splat(a1) * lanes;
+                    let w2v = F32x4::splat(w2) + F32x4::splat(a2) * lanes;
 
-                            let (nx, ny, nz) = if perspective_correct_normals {
+                    if !F32x4::any_mixed_sign(w0v, w1v, w2v) {
+                        let qaw0 = w0v.abs();
+                        let qaw1 = w1v.abs();
+                        let qaw2 = w2v.abs();
+                        let qwsum = qaw0 + qaw1 + qaw2;
+                        let zv = (F32x4::splat(v0.z) * qaw0 + F32x4::splat(v1.z) * qaw1 + F32x4::splat(v2.z) * qaw2) / qwsum;
+                        let xu = x as usize;
+                        let dbuf = F32x4::load(row_depth.add(xu));
+
+                        if !F32x4::any_depth_reject(zv, dbuf) {
+                            let inv_qwsum = F32x4::splat(1.0) / qwsum;
+                            let b0v = qaw0 * inv_qwsum;
+                            let b1v = qaw1 * inv_qwsum;
+                            let b2v = qaw2 * inv_qwsum;
+                            let inv_w_vec = F32x4::splat(v0.inv_w) * b0v + F32x4::splat(v1.inv_w) * b1v + F32x4::splat(v2.inv_w) * b2v;
+                            let persp = F32x4::splat(1.0) / inv_w_vec;
+
+                            let uv = (F32x4::splat(uw0) * b0v + F32x4::splat(uw1) * b1v + F32x4::splat(uw2) * b2v) * persp;
+                            let vv = (F32x4::splat(v0_w) * b0v + F32x4::splat(v1_w) * b1v + F32x4::splat(v2_w) * b2v) * persp;
+                            let rv = F32x4::splat(v0.r) * b0v + F32x4::splat(v1.r) * b1v + F32x4::splat(v2.r) * b2v;
+                            let gv = F32x4::splat(v0.g) * b0v + F32x4::splat(v1.g) * b1v + F32x4::splat(v2.g) * b2v;
+                            let bv = F32x4::splat(v0.b) * b0v + F32x4::splat(v1.b) * b1v + F32x4::splat(v2.b) * b2v;
+                            let av = F32x4::splat(v0.a) * b0v + F32x4::splat(v1.a) * b1v + F32x4::splat(v2.a) * b2v;
+
+                            let (nxv, nyv, nzv) = if perspective_correct_normals {
                                 (
-                                    (nx0_w * b0v + nx1_w * b1v + nx2_w * b2v) * persp,
-                                    (ny0_w * b0v + ny1_w * b1v + ny2_w * b2v) * persp,
-                                    (nz0_w * b0v + nz1_w * b1v + nz2_w * b2v) * persp,
+                                    (F32x4::splat(nx0_w) * b0v + F32x4::splat(nx1_w) * b1v + F32x4::splat(nx2_w) * b2v) * persp,
+                                    (F32x4::splat(ny0_w) * b0v + F32x4::splat(ny1_w) * b1v + F32x4::splat(ny2_w) * b2v) * persp,
+                                    (F32x4::splat(nz0_w) * b0v + F32x4::splat(nz1_w) * b1v + F32x4::splat(nz2_w) * b2v) * persp,
                                 )
                             } else {
                                 (
-                                    v0.nx * b0v + v1.nx * b1v + v2.nx * b2v,
-                                    v0.ny * b0v + v1.ny * b1v + v2.ny * b2v,
-                                    v0.nz * b0v + v1.nz * b1v + v2.nz * b2v,
+                                    F32x4::splat(v0.nx) * b0v + F32x4::splat(v1.nx) * b1v + F32x4::splat(v2.nx) * b2v,
+                                    F32x4::splat(v0.ny) * b0v + F32x4::splat(v1.ny) * b1v + F32x4::splat(v2.ny) * b2v,
+                                    F32x4::splat(v0.nz) * b0v + F32x4::splat(v1.nz) * b1v + F32x4::splat(v2.nz) * b2v,
                                 )
                             };
-                            frags[k] = LitFrag {
-                                u: (uw0 * b0v + uw1 * b1v + uw2 * b2v) * persp,
-                                v: (v0_w * b0v + v1_w * b1v + v2_w * b2v) * persp,
-                                r: v0.r * b0v + v1.r * b1v + v2.r * b2v,
-                                g: v0.g * b0v + v1.g * b1v + v2.g * b2v,
-                                b: v0.b * b0v + v1.b * b1v + v2.b * b2v,
-                                a: v0.a * b0v + v1.a * b1v + v2.a * b2v,
-                                nx,
-                                ny,
-                                nz,
-                                ex: (ex0_w * b0v + ex1_w * b1v + ex2_w * b2v) * persp,
-                                ey: (ey0_w * b0v + ey1_w * b1v + ey2_w * b2v) * persp,
-                                ez: (ez0_w * b0v + ez1_w * b1v + ez2_w * b2v) * persp,
-                                ss: (ss0_w * b0v + ss1_w * b1v + ss2_w * b2v) * persp,
-                                st: (st0_w * b0v + st1_w * b1v + st2_w * b2v) * persp,
-                                sr: (sr0_w * b0v + sr1_w * b1v + sr2_w * b2v) * persp,
-                                sq: (sq0_w * b0v + sq1_w * b1v + sq2_w * b2v) * persp,
-                            };
+
+                            let exv = (F32x4::splat(ex0_w) * b0v + F32x4::splat(ex1_w) * b1v + F32x4::splat(ex2_w) * b2v) * persp;
+                            let eyv = (F32x4::splat(ey0_w) * b0v + F32x4::splat(ey1_w) * b1v + F32x4::splat(ey2_w) * b2v) * persp;
+                            let ezv = (F32x4::splat(ez0_w) * b0v + F32x4::splat(ez1_w) * b1v + F32x4::splat(ez2_w) * b2v) * persp;
+                            let ssv = (F32x4::splat(ss0_w) * b0v + F32x4::splat(ss1_w) * b1v + F32x4::splat(ss2_w) * b2v) * persp;
+                            let stv = (F32x4::splat(st0_w) * b0v + F32x4::splat(st1_w) * b1v + F32x4::splat(st2_w) * b2v) * persp;
+                            let srv = (F32x4::splat(sr0_w) * b0v + F32x4::splat(sr1_w) * b1v + F32x4::splat(sr2_w) * b2v) * persp;
+                            let sqv = (F32x4::splat(sq0_w) * b0v + F32x4::splat(sq1_w) * b1v + F32x4::splat(sq2_w) * b2v) * persp;
+
+                            let z = zv.to_array();
+                            let inv_w = inv_w_vec.to_array();
+                            let u = uv.to_array();
+                            let v = vv.to_array();
+                            let rr = rv.to_array();
+                            let gg = gv.to_array();
+                            let bb = bv.to_array();
+                            let aa = av.to_array();
+                            let nx = nxv.to_array();
+                            let ny = nyv.to_array();
+                            let nz = nzv.to_array();
+                            let ex = exv.to_array();
+                            let ey = eyv.to_array();
+                            let ez = ezv.to_array();
+                            let ss = ssv.to_array();
+                            let st = stv.to_array();
+                            let sr = srv.to_array();
+                            let sq = sqv.to_array();
+
+                            for k in 0..4 {
+                                shade_lit_fragment(
+                                    &ctx,
+                                    row_pixels,
+                                    row_depth,
+                                    x + k as i32,
+                                    y,
+                                    z[k],
+                                    inv_w[k],
+                                    LitFrag {
+                                        u: u[k],
+                                        v: v[k],
+                                        r: rr[k],
+                                        g: gg[k],
+                                        b: bb[k],
+                                        a: aa[k],
+                                        nx: nx[k],
+                                        ny: ny[k],
+                                        nz: nz[k],
+                                        ex: ex[k],
+                                        ey: ey[k],
+                                        ez: ez[k],
+                                        ss: ss[k],
+                                        st: st[k],
+                                        sr: sr[k],
+                                        sq: sq[k],
+                                    },
+                                );
+                            }
+                            x += 4;
+                            w0 += a0 * 4.0;
+                            w1 += a1 * 4.0;
+                            w2 += a2 * 4.0;
+                            continue;
                         }
-                        for k in 0..4 {
-                            shade_lit_fragment(&ctx, row_pixels, row_depth, x + k as i32, y, zv[k], inv_wv[k], frags[k]);
-                        }
-                        x += 4;
-                        w0 += a0 * 4.0;
-                        w1 += a1 * 4.0;
-                        w2 += a2 * 4.0;
-                        continue;
                     }
                 }
             }
@@ -1095,6 +1223,37 @@ pub unsafe fn draw_triangle_barycentric_strip(
                     break 'scalar;
                 }
 
+                #[cfg(target_arch = "aarch64")]
+                let frag = {
+                    let persp = 1.0 / inv_w;
+                    let uvexey = interp3_attrs4(b0b, b1b, b2b, [uw0, v0_w, ex0_w, ey0_w], [uw1, v1_w, ex1_w, ey1_w], [uw2, v2_w, ex2_w, ey2_w]);
+                    let ezssstsr = interp3_attrs4(b0b, b1b, b2b, [ez0_w, ss0_w, st0_w, sr0_w], [ez1_w, ss1_w, st1_w, sr1_w], [ez2_w, ss2_w, st2_w, sr2_w]);
+                    let rgba = interp3_attrs4(b0b, b1b, b2b, [v0.r, v0.g, v0.b, v0.a], [v1.r, v1.g, v1.b, v1.a], [v2.r, v2.g, v2.b, v2.a]);
+                    let nxsq = if perspective_correct_normals {
+                        interp3_attrs4(b0b, b1b, b2b, [nx0_w, ny0_w, nz0_w, sq0_w], [nx1_w, ny1_w, nz1_w, sq1_w], [nx2_w, ny2_w, nz2_w, sq2_w])
+                    } else {
+                        interp3_attrs4(b0b, b1b, b2b, [v0.nx, v0.ny, v0.nz, sq0_w], [v1.nx, v1.ny, v1.nz, sq1_w], [v2.nx, v2.ny, v2.nz, sq2_w])
+                    };
+                    LitFrag {
+                        u: uvexey[0] * persp,
+                        v: uvexey[1] * persp,
+                        r: rgba[0],
+                        g: rgba[1],
+                        b: rgba[2],
+                        a: rgba[3],
+                        nx: if perspective_correct_normals { nxsq[0] * persp } else { nxsq[0] },
+                        ny: if perspective_correct_normals { nxsq[1] * persp } else { nxsq[1] },
+                        nz: if perspective_correct_normals { nxsq[2] * persp } else { nxsq[2] },
+                        ex: uvexey[2] * persp,
+                        ey: uvexey[3] * persp,
+                        ez: ezssstsr[0] * persp,
+                        ss: ezssstsr[1] * persp,
+                        st: ezssstsr[2] * persp,
+                        sr: ezssstsr[3] * persp,
+                        sq: nxsq[3] * persp,
+                    }
+                };
+                #[cfg(not(target_arch = "aarch64"))]
                 let frag = LitFrag {
                     u: (uw0 * b0b + uw1 * b1b + uw2 * b2b) / inv_w,
                     v: (v0_w * b0b + v1_w * b1b + v2_w * b2b) / inv_w,
@@ -1102,21 +1261,9 @@ pub unsafe fn draw_triangle_barycentric_strip(
                     g: v0.g * b0b + v1.g * b1b + v2.g * b2b,
                     b: v0.b * b0b + v1.b * b1b + v2.b * b2b,
                     a: v0.a * b0b + v1.a * b1b + v2.a * b2b,
-                    nx: if perspective_correct_normals {
-                        (nx0_w * b0b + nx1_w * b1b + nx2_w * b2b) / inv_w
-                    } else {
-                        v0.nx * b0b + v1.nx * b1b + v2.nx * b2b
-                    },
-                    ny: if perspective_correct_normals {
-                        (ny0_w * b0b + ny1_w * b1b + ny2_w * b2b) / inv_w
-                    } else {
-                        v0.ny * b0b + v1.ny * b1b + v2.ny * b2b
-                    },
-                    nz: if perspective_correct_normals {
-                        (nz0_w * b0b + nz1_w * b1b + nz2_w * b2b) / inv_w
-                    } else {
-                        v0.nz * b0b + v1.nz * b1b + v2.nz * b2b
-                    },
+                    nx: if perspective_correct_normals { (nx0_w * b0b + nx1_w * b1b + nx2_w * b2b) / inv_w } else { v0.nx * b0b + v1.nx * b1b + v2.nx * b2b },
+                    ny: if perspective_correct_normals { (ny0_w * b0b + ny1_w * b1b + ny2_w * b2b) / inv_w } else { v0.ny * b0b + v1.ny * b1b + v2.ny * b2b },
+                    nz: if perspective_correct_normals { (nz0_w * b0b + nz1_w * b1b + nz2_w * b2b) / inv_w } else { v0.nz * b0b + v1.nz * b1b + v2.nz * b2b },
                     ex: (ex0_w * b0b + ex1_w * b1b + ex2_w * b2b) / inv_w,
                     ey: (ey0_w * b0b + ey1_w * b1b + ey2_w * b2b) / inv_w,
                     ez: (ez0_w * b0b + ez1_w * b1b + ez2_w * b2b) / inv_w,

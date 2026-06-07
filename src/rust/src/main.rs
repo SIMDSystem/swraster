@@ -13,6 +13,7 @@ mod fps;
 mod geometry;
 mod jolt;
 mod linalg;
+mod mac_blit;
 mod physics;
 mod physics_setup;
 mod pixel;
@@ -25,7 +26,6 @@ mod scene;
 mod shadow;
 mod texture;
 
-use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -37,13 +37,14 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use render_loop::RenderState;
+use mac_blit::CocoaBlitter;
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 1024;
 
 struct App {
     window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    blitter: Option<CocoaBlitter>,
     state: Option<RenderState>,
     start: Instant,
     last_cursor: Option<(f64, f64)>,
@@ -51,11 +52,13 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        Self { window: None, surface: None, state: None, start: Instant::now(), last_cursor: None }
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.start.elapsed().as_millis() as u64
+        Self {
+            window: None,
+            blitter: None,
+            state: None,
+            start: Instant::now(),
+            last_cursor: None,
+        }
     }
 }
 
@@ -66,20 +69,14 @@ impl ApplicationHandler for App {
         }
         let attrs = Window::default_attributes()
             .with_title("swraster")
-            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT));
+            .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
+            .with_resizable(false);
         let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
-        let context = softbuffer::Context::new(window.clone()).expect("failed to create softbuffer context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("failed to create softbuffer surface");
 
-        // Render 1:1 into the surface the window manager gives us. On macOS the
-        // bundled app sets NSHighResolutionCapable=false, so this surface is a
-        // logical-resolution (non-Retina) one that the compositor upscales —
-        // mirroring the C++/Zig IOSurface path without any CPU upscale here.
-        let size = window.inner_size();
-        let w = size.width.max(1) as i32;
-        let h = size.height.max(1) as i32;
-        self.state = Some(RenderState::new(w, h));
-        self.surface = Some(surface);
+        // Match the C++/Zig native backends: render into a fixed logical CPU
+        // framebuffer and let the Cocoa layer nearest-scale it to the window.
+        self.state = Some(RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32));
+        self.blitter = Some(CocoaBlitter::new(&window, INITIAL_WIDTH as usize, INITIAL_HEIGHT as usize));
         self.window = Some(window);
     }
 
@@ -98,6 +95,30 @@ impl ApplicationHandler for App {
                         Key::Character("s") | Key::Character("S") => {
                             if let Some(s) = self.state.as_mut() {
                                 s.toggle_stats();
+                            }
+                        }
+                        Key::Character("f") | Key::Character("F") => {
+                            if let Some(s) = self.state.as_mut() {
+                                s.toggle_profiler_unfreeze();
+                            }
+                        }
+                        Key::Character("b") | Key::Character("B") => {
+                            if let Some(s) = self.state.as_mut() {
+                                let on = s.toggle_raster_hard_barrier();
+                                eprintln!(
+                                    "Raster hard barrier: {}",
+                                    if on { "ON (passes serialized)" } else { "OFF (opportunistic overlap)" }
+                                );
+                            }
+                        }
+                        Key::Character("[") | Key::Character("{") => {
+                            if let Some(s) = self.state.as_mut() {
+                                eprintln!("T&L-preferred workers: {}", s.adjust_tl_workers(-1));
+                            }
+                        }
+                        Key::Character("]") | Key::Character("}") => {
+                            if let Some(s) = self.state.as_mut() {
+                                eprintln!("T&L-preferred workers: {}", s.adjust_tl_workers(1));
                             }
                         }
                         _ => {}
@@ -136,24 +157,20 @@ impl ApplicationHandler for App {
             }
             WindowEvent::RedrawRequested => {
                 let now_ms = self.start.elapsed().as_millis() as u64;
-                let (Some(window), Some(surface), Some(state)) =
-                    (self.window.as_ref(), self.surface.as_mut(), self.state.as_mut())
+                let (Some(_window), Some(blitter), Some(state)) =
+                    (self.window.as_ref(), self.blitter.as_mut(), self.state.as_mut())
                 else {
                     return;
                 };
-                let size = window.inner_size();
-                let (w, h) = (size.width.max(1), size.height.max(1));
-                surface
-                    .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-                    .expect("surface resize failed");
 
-                let mut buffer = surface.buffer_mut().expect("failed to get framebuffer");
-                state.frame(&mut buffer, w as i32, h as i32, now_ms);
+                let mut frame = blitter.framebuffer_mut();
+                state.frame(frame.as_framebuffer_mut(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
 
                 // Bracket the present (compositor blit) so the profiler overlay
                 // can mark it on the next frame's timeline.
                 let blit_start = state.prof_now();
-                buffer.present().expect("failed to present framebuffer");
+                drop(frame);
+                blitter.present();
                 let blit_end = state.prof_now();
                 state.prof_set_present(blit_start, blit_end);
             }

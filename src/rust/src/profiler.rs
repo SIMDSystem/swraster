@@ -124,6 +124,15 @@ impl Profiler {
         self.enabled = !self.enabled;
     }
 
+    pub fn set_frozen(&mut self, frozen: bool) {
+        if frozen && !self.frozen {
+            self.frozen_blit_start = self.present_history[1].start;
+            self.frozen_blit_end = self.present_history[1].end;
+            self.frozen_draw_end = self.present_history[0].start;
+        }
+        self.frozen = frozen;
+    }
+
     /// Begin a new frame: roll current intervals into the previous-frame slot,
     /// snapshot the prior present/draw timing, and clear the current buffers.
     pub fn begin_frame(&mut self) {

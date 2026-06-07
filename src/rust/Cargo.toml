@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 winit = "0.30"
-softbuffer = "0.4"
+raw-window-handle = "0.6"
 
 [build-dependencies]
 cc = "1"

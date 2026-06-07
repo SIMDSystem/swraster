@@ -2,9 +2,8 @@
 //! here (mirrors platform.zig's PixelFormat); the windowing/input/present layer
 //! is built on winit + softbuffer further down (see window module).
 //!
-//! Unlike the C++/Zig builds (which query SDL/Cocoa for the surface format), the
-//! Rust build presents through softbuffer, whose buffer is always canonical
-//! 0x00RRGGBB. So the framebuffer format is fixed and known at compile time.
+//! The Rust macOS backend presents through the same IOSurface BGRA path as the
+//! C++/Zig native backends. In host-order u32 pixels this is 0xAARRGGBB.
 
 #[derive(Clone, Copy, Debug)]
 pub struct PixelFormat {
@@ -40,7 +39,8 @@ impl Default for PixelFormat {
 }
 
 impl PixelFormat {
-    /// softbuffer's canonical 0x00RRGGBB: R at bit 16, G at bit 8, B at bit 0.
+    /// IOSurface 'BGRA' in little-endian memory, represented as host-order
+    /// 0xAARRGGBB: R at bit 16, G at bit 8, B at bit 0, opaque alpha.
     pub const fn rgb888() -> PixelFormat {
         PixelFormat {
             bytes_per_pixel: 4,
@@ -53,7 +53,7 @@ impl PixelFormat {
             r_mask: 0x00ff_0000,
             g_mask: 0x0000_ff00,
             b_mask: 0x0000_00ff,
-            a_mask: 0,
+            a_mask: 0xff00_0000,
         }
     }
 }
