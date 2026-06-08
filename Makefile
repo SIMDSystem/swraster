@@ -17,10 +17,12 @@ JOLT_DIR  = third_party/JoltPhysics
 
 JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
+JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=native"
 # NOTE: keep the JPH_* defines in sync with how $(JOLT_LIB) is built below
 # (plain Release, no USE_ASSERTS). Defining JPH_ENABLE_ASSERTS here without
 # building Jolt with asserts leaves JPH::AssertFailed undefined at link time.
-CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
+CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -Ithird_party/highway -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
 LDFLAGS = -flto=thin
 TARGET = $(CPP_BUILD_DIR)/bin/raster
 APP_NAME = $(CPP_BUILD_DIR)/Raster.app
@@ -53,16 +55,17 @@ EM_SYSROOT_INC = $(EMSCRIPTEN_ROOT)/cache/sysroot/include
 ASSET_NAMES = baboon.bmp lenna.bmp tiles.bmp
 ASSET_FILES = $(addprefix $(ASSET_DIR)/,$(ASSET_NAMES))
 WEB_JOBS ?= 8
-WEB_TL_THREADS ?= 3
-WEB_RASTER_THREADS ?= 14
+WEB_TL_THREADS ?= 16
+WEB_RASTER_THREADS ?= 16
 WEB_JOLT_WORKER_THREADS ?= 1
 WEB_PTHREAD_POOL_SIZE ?= 24
 WEB_MEMORY ?= 268435456
 # The Platform layer talks straight to the <canvas> + emscripten input/timing
 # APIs on the web target.
+WEB_WASM_FEATURES = -msimd128 -msse4.2 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
 WEB_CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O2 -g2 -fno-omit-frame-pointer -fstrict-aliasing \
-  -msimd128 -msse4.2 \
-  -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) \
+  $(WEB_WASM_FEATURES) \
+  -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -Ithird_party/highway \
   -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_CROSS_PLATFORM_DETERMINISTIC -DJPH_ENABLE_ASSERTS \
   -DDEFAULT_TL_THREADS=$(WEB_TL_THREADS) -DDEFAULT_RASTER_THREADS=$(WEB_RASTER_THREADS) -DDEFAULT_JOLT_WORKER_THREADS=$(WEB_JOLT_WORKER_THREADS) \
   -pthread
@@ -77,8 +80,8 @@ WEB_LDFLAGS = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
 # runtime loader (which asks for "baboon.bmp" etc.) finds it in the virtual FS.
 WEB_PRELOADS = $(foreach a,$(ASSET_NAMES),--preload-file $(ASSET_DIR)/$(a)@$(a))
 WEB_JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release -DUSE_ASSERTS=ON \
-  -DINTERPROCEDURAL_OPTIMIZATION=OFF -DCROSS_PLATFORM_DETERMINISTIC=ON \
-  -DENABLE_ALL_WARNINGS=OFF -DCMAKE_CXX_FLAGS="-pthread -g2 -msimd128 -msse4.2"
+  -DINTERPROCEDURAL_OPTIMIZATION=OFF -DCROSS_PLATFORM_DETERMINISTIC=ON -DUSE_WASM_SIMD=ON \
+  -DENABLE_ALL_WARNINGS=OFF -DCMAKE_CXX_FLAGS="-pthread -g2 $(WEB_WASM_FEATURES)"
 
 # --- Zig native build -------------------------------------------------------
 # Toolchain + caches live under tools/ (not build/, which is output only).
@@ -95,7 +98,7 @@ ZIG_SOURCES = $(wildcard $(ZIG_SRC_DIR)/*.zig)
 JOLTC_DIR = $(ZIG_BUILD_DIR)/joltc
 JOLTC_LIB = $(JOLTC_DIR)/libjoltc.a
 JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
-  -faligned-allocation -arch arm64 -DNDEBUG \
+  -faligned-allocation -arch arm64 -mcpu=native -DNDEBUG \
   -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
   -I$(JOLT_DIR) -I$(SRC_DIR)
 
@@ -137,7 +140,7 @@ LLVM23_CLANG = $(LLVM23_BIN)/clang
 # wasm feature set — mirror src/zig/build.zig web_query.cpu_features_add so the
 # Zig-emitted IR and the LLVM 23 codegen agree on the enabled wasm extensions.
 ZIG_WEB_MCPU = generic+atomics+bulk_memory+simd128+nontrapping_fptoint+sign_ext+mutable_globals+multivalue+extended_const
-ZIG_WEB_LLVM23_FEATURES = -msimd128 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
+ZIG_WEB_LLVM23_FEATURES = $(filter-out -msse4.2,$(WEB_WASM_FEATURES))
 ZIG_WEB_BC = $(ZIG_WEB_DIR)/swraster_web.bc
 ZIG_WEB_OBJ = $(ZIG_WEB_DIR)/swraster_web.o
 # Native (arm64 macOS) pipeline.
@@ -164,6 +167,11 @@ RUST_CARGO_BIN = $(RUST_BUILD_DIR)/release/raster
 RUST_BIN = $(RUST_BUILD_DIR)/bin/raster
 RUST_APP = $(RUST_BUILD_DIR)/Raster.app
 RUST_SOURCES = $(wildcard $(RUST_SRC_DIR)/src/*.rs) $(RUST_SRC_DIR)/Cargo.toml $(RUST_SRC_DIR)/build.rs
+RUST_WEB_CARGO_DIR = $(BUILD_DIR)/rust-web
+RUST_WEB_DIR = $(WEB_BUILD_DIR)/rust
+RUST_WEB_DEPS_DIR = $(RUST_WEB_CARGO_DIR)/wasm32-unknown-emscripten/release/deps
+RUST_WEB_TARGET = $(RUST_WEB_DIR)/raster.html
+RUST_WEB_RUSTFLAGS = -C target-cpu=generic -C target-feature=+atomics,+bulk-memory,+bulk-memory-opt,+mutable-globals,+simd128,+relaxed-simd,+sign-ext,+nontrapping-fptoint,+multivalue,+extended-const
 
 # Default target: build both executable and app bundle
 all: $(APP_NAME)
@@ -195,7 +203,7 @@ $(ICON_ICNS): $(ICON_PNG)
 $(JOLT_LIB):
 	@echo "Building Jolt Physics..."
 	@mkdir -p $(JOLT_BUILD_DIR)
-	@cd $(JOLT_BUILD_DIR) && cmake -DCMAKE_BUILD_TYPE=Release .. && cmake --build . --target Jolt
+	@cd $(JOLT_BUILD_DIR) && cmake $(JOLT_CMAKE_FLAGS) .. && cmake --build . --target Jolt
 
 $(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB)
 	@mkdir -p $(CPP_BUILD_DIR)/bin
@@ -265,11 +273,34 @@ web-cpp: $(WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 web-zig: $(ZIG_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 	@echo "Zig web build written to $(ZIG_WEB_DIR)/"
 
+$(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data: $(RUST_SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_zig_lib.js web_shell.html Makefile
+	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
+	@command -v $(EMCC) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
+	@rustup +nightly --version >/dev/null 2>&1 || { echo "Error: nightly Rust toolchain required for -Z build-std (rustup toolchain install nightly)."; exit 1; }
+	@rustup +nightly target list --installed | grep -q wasm32-unknown-emscripten || rustup +nightly target add wasm32-unknown-emscripten
+	@rustup component list --toolchain nightly-aarch64-apple-darwin --installed | grep -q '^rust-src' || rustup component add rust-src --toolchain nightly-aarch64-apple-darwin
+	@rm -rf $(RUST_WEB_CARGO_DIR)
+	@echo "Building Rust web (nightly build-std, wasm32-unknown-emscripten)..."
+	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_WEB_CARGO_DIR)) CARGO_INCREMENTAL=0 \
+		CC_wasm32_unknown_emscripten=$(EMCC) CXX_wasm32_unknown_emscripten=$(EMCXX) \
+		RUSTFLAGS="$(RUST_WEB_RUSTFLAGS)" \
+		$(CARGO) +nightly build -Z build-std=std,panic_abort --release --target wasm32-unknown-emscripten
+
+$(RUST_WEB_TARGET): $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data web_shell.html
+	@mkdir -p $(RUST_WEB_DIR)
+	@cp $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DIR)/raster.js
+	@cp $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DIR)/raster.wasm
+	@cp $(RUST_WEB_DEPS_DIR)/raster.data $(RUST_WEB_DIR)/raster.data
+	@sed 's#{{{ SCRIPT }}}#<script async type="text/javascript" src="raster.js"></script>#' web_shell.html > $(RUST_WEB_TARGET)
+
+web-rust: $(RUST_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
+	@echo "Rust web build written to $(RUST_WEB_DIR)/"
+
 # `web` builds the Zig target (the one we run perf comparisons against). Use
-# `web-cpp` for the C++ page or `web-all` for both.
+# `web-cpp`/`web-rust` for one page or `web-all` for all.
 web: web-zig
 
-web-all: web-cpp web-zig
+web-all: web-cpp web-zig web-rust
 
 # Assemble + sign a macOS .app bundle. Used by both the C++ and Zig builds so
 # each toolchain produces a first-class, icon-decorated, console-free app.
@@ -382,7 +413,7 @@ clean-zig:
 	rm -rf $(ZIG_BUILD_DIR)
 
 clean-web:
-	rm -rf $(WEB_BUILD_DIR)
+	rm -rf $(WEB_BUILD_DIR) $(RUST_WEB_CARGO_DIR)
 
 clean-rust:
 	rm -rf $(RUST_BUILD_DIR) $(RUST_SRC_DIR)/target
@@ -399,4 +430,4 @@ rebuild-rust:
 	$(MAKE) clean-rust
 	$(MAKE) rust
 
-.PHONY: clean clean-cpp clean-zig clean-web clean-rust rebuild-cpp rebuild-zig rebuild-rust app all web web-cpp web-zig web-all zig zig-bin rust rust-bin
+.PHONY: clean clean-cpp clean-zig clean-web clean-rust rebuild-cpp rebuild-zig rebuild-rust app all web web-cpp web-zig web-rust web-all zig zig-bin rust rust-bin

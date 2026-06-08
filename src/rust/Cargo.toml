@@ -9,7 +9,7 @@ build = "build.rs"
 name = "raster"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
 raw-window-handle = "0.6"
 

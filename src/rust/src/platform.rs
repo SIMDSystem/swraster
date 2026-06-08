@@ -41,6 +41,7 @@ impl Default for PixelFormat {
 impl PixelFormat {
     /// IOSurface 'BGRA' in little-endian memory, represented as host-order
     /// 0xAARRGGBB: R at bit 16, G at bit 8, B at bit 0, opaque alpha.
+    #[cfg(not(target_os = "emscripten"))]
     pub const fn rgb888() -> PixelFormat {
         PixelFormat {
             bytes_per_pixel: 4,
@@ -53,6 +54,25 @@ impl PixelFormat {
             r_mask: 0x00ff_0000,
             g_mask: 0x0000_ff00,
             b_mask: 0x0000_00ff,
+            a_mask: 0xff00_0000,
+        }
+    }
+
+    /// Emscripten canvas ImageData expects RGBA byte order. In little-endian
+    /// u32 storage this is host-order 0xAABBGGRR.
+    #[cfg(target_os = "emscripten")]
+    pub const fn rgb888() -> PixelFormat {
+        PixelFormat {
+            bytes_per_pixel: 4,
+            r_shift: 0,
+            g_shift: 8,
+            b_shift: 16,
+            r_loss: 0,
+            g_loss: 0,
+            b_loss: 0,
+            r_mask: 0x0000_00ff,
+            g_mask: 0x0000_ff00,
+            b_mask: 0x00ff_0000,
             a_mask: 0xff00_0000,
         }
     }

@@ -19,9 +19,21 @@
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
 
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+#include <pthread.h>
+#endif
+
 using namespace JPH;
 
 namespace {
+
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+inline void set_physics_qos() {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+}
+#else
+inline void set_physics_qos() {}
+#endif
 
 inline Vec3 toVec3(const JPHVec3 &v) { return Vec3(v.x, v.y, v.z); }
 inline RVec3 toRVec3(const JPHVec3 &v) { return RVec3(v.x, v.y, v.z); }
@@ -82,7 +94,10 @@ void jph_temp_allocator_destroy(void *a) {
 }
 
 void *jph_job_system_create(int max_jobs, int max_barriers, int num_threads) {
-    return new JobSystemThreadPool(max_jobs, max_barriers, num_threads);
+    auto *jobs = new JobSystemThreadPool();
+    jobs->SetThreadInitFunction([](int) { set_physics_qos(); });
+    jobs->Init(max_jobs, max_barriers, num_threads);
+    return jobs;
 }
 
 void jph_job_system_destroy(void *j) {
@@ -115,6 +130,7 @@ void jph_physics_system_optimize_broadphase(void *s) {
 
 void jph_physics_system_update(void *s, float delta, int collision_steps,
                                void *temp, void *jobs) {
+    set_physics_qos();
     static_cast<PhysicsSystemWrapper *>(s)->system.Update(
         delta, collision_steps,
         static_cast<TempAllocator *>(temp),

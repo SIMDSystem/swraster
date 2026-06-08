@@ -11,11 +11,23 @@
 #include <algorithm>
 #include <cmath>
 
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+#include <pthread.h>
+#endif
+
 #include "platform.h"
 #include "threading.h" // perf_ms, process_cpu_ms
 #include "thread_profiler.h"
 
 using namespace JPH;
+
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+static inline void set_physics_qos() {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+}
+#else
+static inline void set_physics_qos() {}
+#endif
 
 void physics_wait_for_idle(PhysicsPipeline& pp) {
     std::unique_lock<std::mutex> lock(pp.mtx);
@@ -71,6 +83,7 @@ void physics_step_to_snapshot(PhysicsPipeline& pp,
     int collision_steps = (int)ceilf(delta_time * 60.0f);
     if (collision_steps < 1) collision_steps = 1;
     if (collision_steps > 4) collision_steps = 4;
+    set_physics_qos();
     update_start = Platform::PerfCounter();
     pp.system->Update(delta_time, collision_steps, pp.temp_allocator, pp.job_system);
     update_end = Platform::PerfCounter();
@@ -129,6 +142,7 @@ void physics_reset_pipeline_state(PhysicsPipeline& pp) {
 }
 
 void physics_worker_thread(PhysicsPipeline& pp) {
+    set_physics_qos();
     while (true) {
         float    delta_time;
         float    target_time;

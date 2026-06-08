@@ -105,6 +105,7 @@ pub struct RenderState {
 
     // Worker count for parallel T&L + raster passes.
     num_threads: usize,
+    active_workers: usize,
 
     // Camera + state.
     pub camera_yaw: f32,
@@ -187,19 +188,50 @@ const PASS_COLOR: i32 = 1;
 const PASS_SSAO: i32 = 2;
 const PASS_LUM: i32 = 3;
 
+#[cfg(not(target_os = "emscripten"))]
 const PUBLISHED_OPAQUE_BIN_RESERVE: usize = 512;
+#[cfg(target_os = "emscripten")]
+const PUBLISHED_OPAQUE_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const PUBLISHED_TRANS_BIN_RESERVE: usize = 128;
+#[cfg(target_os = "emscripten")]
+const PUBLISHED_TRANS_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const PUBLISHED_SHADOW_BIN_RESERVE: usize = 512;
+#[cfg(target_os = "emscripten")]
+const PUBLISHED_SHADOW_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const WORKER_OPAQUE_BIN_RESERVE: usize = 256;
+#[cfg(target_os = "emscripten")]
+const WORKER_OPAQUE_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const WORKER_TRANS_BIN_RESERVE: usize = 96;
+#[cfg(target_os = "emscripten")]
+const WORKER_TRANS_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const WORKER_SHADOW_BIN_RESERVE: usize = 256;
+#[cfg(target_os = "emscripten")]
+const WORKER_SHADOW_BIN_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const WORKER_FLAT_RESERVE: usize = 1000;
+#[cfg(target_os = "emscripten")]
+const WORKER_FLAT_RESERVE: usize = 0;
+#[cfg(not(target_os = "emscripten"))]
 const SORT_SCRATCH_RESERVE: usize = 2000;
+#[cfg(target_os = "emscripten")]
+const SORT_SCRATCH_RESERVE: usize = 0;
 
 #[derive(Clone, Copy)]
 struct KeyIdx {
     key: f32,
     idx: u32,
+}
+
+#[inline]
+fn ensure_vec_capacity<T>(v: &mut Vec<T>, target_capacity: usize) {
+    if v.capacity() < target_capacity {
+        v.reserve(target_capacity.saturating_sub(v.len()));
+    }
 }
 
 #[inline]
@@ -209,7 +241,7 @@ fn sort_triangles_by_key(items: &mut Vec<RenderTriangle>, ascending: bool, keys:
         return;
     }
     keys.clear();
-    keys.reserve(n.saturating_sub(keys.capacity()));
+    ensure_vec_capacity(keys, n);
     for (idx, item) in items.iter().enumerate() {
         keys.push(KeyIdx { key: item.sort_z, idx: idx as u32 });
     }
@@ -219,7 +251,7 @@ fn sort_triangles_by_key(items: &mut Vec<RenderTriangle>, ascending: bool, keys:
         keys.sort_by(|a, b| b.key.partial_cmp(&a.key).unwrap_or(std::cmp::Ordering::Equal));
     }
     gather.clear();
-    gather.reserve(n.saturating_sub(gather.capacity()));
+    ensure_vec_capacity(gather, n);
     for ki in keys.iter() {
         gather.push(items[ki.idx as usize]);
     }
@@ -470,9 +502,15 @@ impl RenderState {
         let camera_distance = (8.0f32 * 8.0 + 21.7 * 21.7).sqrt();
         let camera_pitch = (8.0f32 / camera_distance).asin();
 
-        let num_threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        #[cfg(target_os = "emscripten")]
+        let num_threads = 16usize;
+        #[cfg(not(target_os = "emscripten"))]
+        let num_threads = {
+            let hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2);
+            (2 * hw).clamp(16, 20)
+        };
         config::NUM_RASTER_THREADS.store(num_threads as i32, Ordering::Relaxed);
-        config::NUM_TL_THREADS.store(num_threads as i32, Ordering::Relaxed);
+        config::NUM_TL_THREADS.store(16.min(num_threads) as i32, Ordering::Relaxed);
         config::NUM_STRIPS.store(R as i32, Ordering::Relaxed);
         config::NUM_TILE_BINS.store(NTILES as i32, Ordering::Relaxed);
         let pool = RenderPool::new(num_threads);
@@ -526,6 +564,7 @@ impl RenderState {
             sort_gather: Vec::with_capacity(SORT_SCRATCH_RESERVE),
             frame_tl_params: TlParams::default(),
             num_threads,
+            active_workers: 16.min(num_threads),
             camera_yaw: 0.0,
             camera_pitch,
             camera_distance,
@@ -587,9 +626,15 @@ impl RenderState {
         let tl_idx = (self.frame_num as usize) & 1;
         let raster_idx = 1 - tl_idx;
 
-        let mut snaps = std::mem::take(&mut self.snapshots);
-        let target_time = snaps[read_idx].sim_time + delta_time;
-        let time = snaps[read_idx].sim_time;
+        for snap in &mut self.snapshots {
+            if snap.poses.len() != self.instances.len() {
+                let sim_time = snap.sim_time;
+                let sequence = snap.sequence;
+                scene::write_instance_pose_snapshot(snap, &self.instances, sim_time, sequence);
+            }
+        }
+        let target_time = self.snapshots[read_idx].sim_time + delta_time;
+        let time = self.snapshots[read_idx].sim_time;
 
         // Projection (rebuild only on aspect change). Computed up front so the
         // raster kick below — which is independent of this frame's T&L setup —
@@ -603,7 +648,7 @@ impl RenderState {
 
         let shadow_size = config::SHADOW_MAP_SIZE;
         let clear_color = pixel::pack_rgb_fast(&self.format, 45, 45, 45);
-        let nthreads = self.num_threads.max(1);
+        let nthreads = self.active_workers.clamp(1, self.num_threads.max(1));
         let tl_workers = config::num_tl_threads().clamp(1, nthreads as i32);
 
         // Raster runs the buffer the previous frame's T&L populated. Its inputs
@@ -720,7 +765,7 @@ impl RenderState {
             if self.lamp_instance_index >= 0 {
                 let beam = light_target_world.sub(light_pos_world).normalized();
                 let q = linalg::quat_from_two_vectors(Vec3::new(0.0, 1.0, 0.0), beam);
-                let lp = &mut snaps[read_idx].poses[self.lamp_instance_index as usize];
+                let lp = &mut self.snapshots[read_idx].poses[self.lamp_instance_index as usize];
                 lp.tx = light_pos_world.x;
                 lp.ty = light_pos_world.y;
                 lp.tz = light_pos_world.z;
@@ -746,7 +791,7 @@ impl RenderState {
         let sphere_inner_occluder_radius = self.sphere.bound_radius;
         for i in 0..self.instances.len() {
             let inst = self.instances[i];
-            let pose = snaps[read_idx].poses[i];
+            let pose = self.snapshots[read_idx].poses[i];
             let center_view = view.mul_vec4(Vec4::new(pose.tx, pose.ty, pose.tz, 1.0));
             self.instance_depths.push(InstanceDepth { depth: center_view.z, index: i });
             if inst.kind == 0 {
@@ -813,7 +858,7 @@ impl RenderState {
         // Split the pose snapshots: T&L reads the published front buffer while
         // physics writes the back buffer (concurrently, disjoint).
         let (read_snap, write_snap): (&PoseSnapshot, &mut PoseSnapshot) = {
-            let (a, b) = snaps.split_at_mut(1);
+            let (a, b) = self.snapshots.split_at_mut(1);
             if write_idx == 0 { (&b[0], &mut a[0]) } else { (&a[0], &mut b[0]) }
         };
 
@@ -914,8 +959,7 @@ impl RenderState {
             self.profiler.record_physics(iv);
         }
 
-        // ----- Publish physics result + restore snapshots. -----
-        self.snapshots = snaps;
+        // ----- Publish physics result. -----
         if run_physics {
             self.snap_read = write_idx;
             self.sim_time = self.snapshots[write_idx].sim_time;
@@ -932,6 +976,8 @@ impl RenderState {
         // ----- Overlays: FPS, then the concurrency profiler (drawn last so it
         // sits on top). The profiler uses the previous frame's present timing. -----
         self.fps.draw(fb, w, w, &self.format);
+        let label = format!("RUST {}/{}", nthreads, tl_workers);
+        pixel::draw_text(fb, w, 20, 20, &label, 255, 255, 255, &self.format);
         self.fps.tick(now_ms);
 
         let draw_end = self.profiler.now();
@@ -1328,8 +1374,16 @@ impl RenderState {
         let was = self.pool.shared.sched.hard_barrier.fetch_xor(true, Ordering::AcqRel);
         !was
     }
+    pub fn adjust_active_workers(&mut self, delta: i32) -> usize {
+        let max = self.num_threads.max(1);
+        let cur = self.active_workers.clamp(1, max) as i32;
+        self.active_workers = (cur + delta).clamp(1, max as i32) as usize;
+        let tl = config::num_tl_threads().clamp(1, self.active_workers as i32);
+        config::NUM_TL_THREADS.store(tl, Ordering::Relaxed);
+        self.active_workers
+    }
     pub fn adjust_tl_workers(&mut self, delta: i32) -> i32 {
-        let max = self.num_threads.max(1) as i32;
+        let max = self.active_workers.clamp(1, self.num_threads.max(1)) as i32;
         let mut cur = config::num_tl_threads();
         if cur < 1 {
             cur = max;
@@ -1398,7 +1452,7 @@ fn merge_sorted_runs(
     if left_len <= right_len {
         // Copy only the smaller left run aside, then merge front-to-back. The
         // write cursor never overtakes the unread right run.
-        scratch.reserve(left_len.saturating_sub(scratch.capacity()));
+        ensure_vec_capacity(scratch, left_len);
         scratch.extend_from_slice(&items[..left_len]);
         let mut i = 0usize; // scratch / left
         let mut j = mid; // items / right
@@ -1425,7 +1479,7 @@ fn merge_sorted_runs(
     } else {
         // Copy only the smaller right run aside, then merge back-to-front. The
         // write cursor never clobbers unread left-run items.
-        scratch.reserve(right_len.saturating_sub(scratch.capacity()));
+        ensure_vec_capacity(scratch, right_len);
         scratch.extend_from_slice(&items[mid..n]);
         let mut i = mid; // one past current left item
         let mut j = right_len; // one past current scratch/right item
@@ -1713,6 +1767,14 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
         // Phase A reads only the previous frame's raster inputs (published by
         // kick_raster), so copy the plan now for the shadow pre-pass.
         let plan_a = unsafe { *shared.plan.get() };
+        if worker_id >= plan_a.nthreads.max(1) as usize {
+            let mut k = shared.mtx.lock().unwrap();
+            k.workers_done += 1;
+            if k.workers_done >= shared.nthreads {
+                shared.cv_main.notify_one();
+            }
+            continue;
+        }
         let ctx_a = WorkerCtx { plan: plan_a, shared };
         let local = unsafe { &mut *shared.locals[worker_id].get() };
         local.opaque.clear();

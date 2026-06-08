@@ -92,6 +92,25 @@ const FONT_5X7: [[u8; 7]; 10] = [
     [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x11, 0x0E], // 9
 ];
 
+fn glyph_for(ch: u8) -> [u8; 7] {
+    if ch.is_ascii_digit() {
+        return FONT_5X7[(ch - b'0') as usize];
+    }
+    match ch {
+        b'/' => [0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00],
+        b'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        b'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E],
+        b'I' => [0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        b'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        b'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        b'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        b'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        b'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        b'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        _ => [0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
 /// Draw a single digit into a u32 framebuffer (pixels), `pitch` in u32 units.
 pub fn draw_digit(pixels: &mut [u32], pitch: i32, x: i32, y: i32, digit: i32, color: u32) {
     if digit < 0 || digit > 9 {
@@ -105,6 +124,33 @@ pub fn draw_digit(pixels: &mut [u32], pitch: i32, x: i32, y: i32, digit: i32, co
                 let py = y + row as i32;
                 let off = (py * pitch + px) as usize;
                 pixels[off] = color;
+            }
+        }
+    }
+}
+
+pub fn draw_text(
+    pixels: &mut [u32],
+    pitch: i32,
+    x: i32,
+    y: i32,
+    text: &str,
+    r: u8,
+    g: u8,
+    b: u8,
+    format: &PixelFormat,
+) {
+    let color = pack_rgb_fast(format, r, g, b);
+    for (pos, ch) in text.bytes().enumerate() {
+        let glyph = glyph_for(ch);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..5u8 {
+                if bits & (0x10u8 >> col) != 0 {
+                    let px = x + pos as i32 * 6 + col as i32;
+                    let py = y + row as i32;
+                    let off = (py * pitch + px) as usize;
+                    pixels[off] = color;
+                }
             }
         }
     }

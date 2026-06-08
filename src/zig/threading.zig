@@ -83,9 +83,9 @@ pub fn init_thread_counts() void {
     if (cap > POOL_CAPACITY_MAX) cap = POOL_CAPACITY_MAX;
     config.NUM_RASTER_THREADS = cap;
     config.NUM_TL_THREADS = config.NUM_RASTER_THREADS;
-    const start_active = if (hw < cap) hw else cap;
+    const start_active = if (16 < cap) 16 else cap;
     g_active_workers.store(start_active, .monotonic);
-    g_tl_workers.store(cap, .monotonic);
+    g_tl_workers.store(start_active, .monotonic);
     config.NUM_STRIPS = 16;
     config.NUM_TILE_BINS = config.NUM_STRIPS * config.TILE_X_SPLITS;
 
@@ -93,7 +93,6 @@ pub fn init_thread_counts() void {
     tile_bin_locks = alloc.alloc(sync.Mutex, @intCast(config.NUM_TILE_BINS)) catch unreachable;
     for (tile_bin_locks) |*m| m.* = .{};
 
-    dbg.print("Threads: pool capacity {d}, active {d}, T&L-preferred {d} (hw={d}), {d} strips, {d} tiles\n  keys: -/= adjust active workers, [/] adjust T&L-preferred\n", .{ config.NUM_RASTER_THREADS, start_active, cap, hw, config.NUM_STRIPS, config.NUM_TILE_BINS });
 }
 
 // ---- Perf timing ----

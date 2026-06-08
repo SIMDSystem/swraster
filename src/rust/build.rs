@@ -10,7 +10,13 @@ fn main() {
     let repo_root = manifest.parent().unwrap().parent().unwrap().to_path_buf();
     let cpp_dir = repo_root.join("src/cpp");
     let jolt_dir = repo_root.join("third_party/JoltPhysics");
-    let jolt_lib_dir = jolt_dir.join("Build/build_release");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let is_emscripten = target.contains("emscripten");
+    let jolt_lib_dir = if is_emscripten {
+        repo_root.join("build/web/jolt_release")
+    } else {
+        jolt_dir.join("Build/build_release")
+    };
 
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.cpp").display());
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.h").display());
@@ -34,6 +40,23 @@ fn main() {
         .include(&cpp_dir)
         .file(cpp_dir.join("joltc.cpp"))
         .file(cpp_dir.join("physics_setup.cpp"));
+    if is_emscripten {
+        build
+            .flag("-pthread")
+            .flag("-msimd128")
+            .flag("-msse4.2")
+            .flag("-mnontrapping-fptoint")
+            .flag("-msign-ext")
+            .flag("-mbulk-memory")
+            .flag("-mmutable-globals")
+            .flag("-mmultivalue")
+            .flag("-mextended-const")
+            .flag("-ffp-model=precise")
+            .define("JPH_CROSS_PLATFORM_DETERMINISTIC", None)
+            .define("JPH_ENABLE_ASSERTS", None);
+    } else if target.contains("apple-darwin") {
+        build.flag_if_supported("-mcpu=native");
+    }
     build.compile("joltc");
 
     // Link the prebuilt Jolt static library.
@@ -41,13 +64,35 @@ fn main() {
     println!("cargo:rustc-link-lib=static=Jolt");
 
     // C++ standard library (libc++ on macOS).
-    if cfg!(target_os = "macos") {
+    if target.contains("apple-darwin") {
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=dylib=objc");
         println!("cargo:rustc-link-lib=framework=AppKit");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=IOSurface");
+    } else if is_emscripten {
+        println!("cargo:rustc-link-arg=--js-library");
+        println!("cargo:rustc-link-arg={}", repo_root.join("web_zig_lib.js").display());
+        println!("cargo:rustc-link-arg=--no-entry");
+        println!("cargo:rustc-link-arg=-sUSE_PTHREADS=1");
+        println!("cargo:rustc-link-arg=-sPTHREAD_POOL_SIZE=32");
+        println!("cargo:rustc-link-arg=-sINITIAL_MEMORY=512MB");
+        println!("cargo:rustc-link-arg=-sALLOW_MEMORY_GROWTH=1");
+        println!("cargo:rustc-link-arg=-sMAXIMUM_MEMORY=4294967296");
+        println!("cargo:rustc-link-arg=-sSTACK_SIZE=2097152");
+        println!("cargo:rustc-link-arg=-sDEFAULT_PTHREAD_STACK_SIZE=2097152");
+        println!("cargo:rustc-link-arg=-sASSERTIONS=1");
+        println!("cargo:rustc-link-arg=-sEXIT_RUNTIME=0");
+        println!("cargo:rustc-link-arg=-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32");
+        println!("cargo:rustc-link-arg=-sEXPORTED_FUNCTIONS=_swr_rust_start,_swr_push_key,_swr_push_mouse_button,_swr_push_mouse_motion,_swr_push_wheel,_swr_push_visibility");
+        for asset in ["baboon.bmp", "lenna.bmp", "tiles.bmp"] {
+            println!(
+                "cargo:rustc-link-arg=--preload-file={}@/assets/{}",
+                repo_root.join("assets").join(asset).display(),
+                asset
+            );
+        }
     } else {
         println!("cargo:rustc-link-lib=dylib=stdc++");
     }

@@ -59,6 +59,23 @@ const font_5x7 = [10][7]u8{
     .{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x11, 0x0E }, // 9
 };
 
+fn glyph_for(ch: u8) [7]u8 {
+    if (ch >= '0' and ch <= '9') return font_5x7[@intCast(ch - '0')];
+    return switch (ch) {
+        '/' => .{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 },
+        'C' => .{ 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
+        'G' => .{ 0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0E },
+        'I' => .{ 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        'P' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
+        'R' => .{ 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
+        'S' => .{ 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
+        'T' => .{ 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        'U' => .{ 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        'Z' => .{ 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
+        else => .{ 0, 0, 0, 0, 0, 0, 0 },
+    };
+}
+
 pub fn draw_digit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: u32, format: *const PixelFormat) void {
     if (digit < 0 or digit > 9) return;
     const bpp: i32 = format.BytesPerPixel;
@@ -75,6 +92,30 @@ pub fn draw_digit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: 
                 pixel.* = color;
             }
         }
+    }
+}
+
+pub fn draw_text(pixels: [*]u8, pitch: i32, x: i32, y: i32, text: []const u8, r: u8, g: u8, b: u8, format: *const PixelFormat) void {
+    const color = pack_rgb_fast(format, r, g, b);
+    const bpp: i32 = format.BytesPerPixel;
+    var pos: i32 = 0;
+    for (text) |ch| {
+        const glyph = glyph_for(ch);
+        var row: usize = 0;
+        while (row < 7) : (row += 1) {
+            const bits = glyph[row];
+            var col: u3 = 0;
+            while (col < 5) : (col += 1) {
+                if (bits & (@as(u8, 0x10) >> col) != 0) {
+                    const px = x + pos * 6 + @as(i32, col);
+                    const py = y + @as(i32, @intCast(row));
+                    const off: usize = @intCast(py * pitch + px * bpp);
+                    const pixel: *u32 = @ptrCast(@alignCast(pixels + off));
+                    pixel.* = color;
+                }
+            }
+        }
+        pos += 1;
     }
 }
 

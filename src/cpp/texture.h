@@ -9,7 +9,10 @@
 #include <vector>
 #include <memory>
 #include <algorithm>
+#include "hwy/highway.h"
 #include "platform.h"
+
+namespace hwy_static = hwy::HWY_NAMESPACE;
 
 struct PackedTextureLevel {
     int                   w   = 0;
@@ -50,12 +53,29 @@ static inline uint32_t sample_texture_bilinear(const PackedTextureLevel& level, 
     float w10 = tx * (1.0f - ty);
     float w01 = (1.0f - tx) * ty;
     float w11 = tx * ty;
-    uint32_t r = (uint32_t)(((c00 >> 16) & 0xff) * w00 + ((c10 >> 16) & 0xff) * w10 +
-                            ((c01 >> 16) & 0xff) * w01 + ((c11 >> 16) & 0xff) * w11 + 0.5f);
-    uint32_t g = (uint32_t)(((c00 >> 8) & 0xff) * w00 + ((c10 >> 8) & 0xff) * w10 +
-                            ((c01 >> 8) & 0xff) * w01 + ((c11 >> 8) & 0xff) * w11 + 0.5f);
-    uint32_t b = (uint32_t)((c00 & 0xff) * w00 + (c10 & 0xff) * w10 +
-                            (c01 & 0xff) * w01 + (c11 & 0xff) * w11 + 0.5f);
+    const hwy_static::FixedTag<float, 4> d;
+    alignas(16) const float t00[4] = {
+        (float)((c00 >> 16) & 0xff), (float)((c00 >> 8) & 0xff), (float)(c00 & 0xff), 0.0f
+    };
+    alignas(16) const float t10[4] = {
+        (float)((c10 >> 16) & 0xff), (float)((c10 >> 8) & 0xff), (float)(c10 & 0xff), 0.0f
+    };
+    alignas(16) const float t01[4] = {
+        (float)((c01 >> 16) & 0xff), (float)((c01 >> 8) & 0xff), (float)(c01 & 0xff), 0.0f
+    };
+    alignas(16) const float t11[4] = {
+        (float)((c11 >> 16) & 0xff), (float)((c11 >> 8) & 0xff), (float)(c11 & 0xff), 0.0f
+    };
+    auto acc = hwy_static::Mul(hwy_static::Load(d, t00), hwy_static::Set(d, w00));
+    acc = hwy_static::MulAdd(hwy_static::Load(d, t10), hwy_static::Set(d, w10), acc);
+    acc = hwy_static::MulAdd(hwy_static::Load(d, t01), hwy_static::Set(d, w01), acc);
+    acc = hwy_static::MulAdd(hwy_static::Load(d, t11), hwy_static::Set(d, w11), acc);
+    acc = hwy_static::Add(acc, hwy_static::Set(d, 0.5f));
+    alignas(16) float out[4];
+    hwy_static::Store(acc, d, out);
+    uint32_t r = (uint32_t)out[0];
+    uint32_t g = (uint32_t)out[1];
+    uint32_t b = (uint32_t)out[2];
     return (r << 16) | (g << 8) | b;
 }
 

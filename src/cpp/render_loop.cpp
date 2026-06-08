@@ -432,8 +432,6 @@ void run_render_loop(RendererContext& ctx) {
                         // drains fully before the next for clean profiling.
                         bool was = raster_hard_barrier.load(std::memory_order_relaxed);
                         raster_hard_barrier.store(!was, std::memory_order_relaxed);
-                        printf("Raster hard barrier: %s\n", !was ? "ON (passes serialized)"
-                                                                  : "OFF (opportunistic overlap)");
                     }
                     if (event.key == 't' || event.key == 'T') {
                         // Trace mode only makes sense while the profiler
@@ -460,9 +458,6 @@ void run_render_loop(RendererContext& ctx) {
                         if (next > NUM_RASTER_THREADS) next = NUM_RASTER_THREADS;
                         if (next != cur) {
                             g_active_workers.store(next, std::memory_order_relaxed);
-                            printf("Active workers: %d / %d  (T&L-preferred %d)\n",
-                                   next, NUM_RASTER_THREADS,
-                                   g_tl_workers.load(std::memory_order_relaxed));
                         }
                     }
                     // Live T&L-preferred count. ']' (or '}') raises it, '[' (or
@@ -477,9 +472,6 @@ void run_render_loop(RendererContext& ctx) {
                         if (next > NUM_RASTER_THREADS) next = NUM_RASTER_THREADS;
                         if (next != cur) {
                             g_tl_workers.store(next, std::memory_order_relaxed);
-                            printf("T&L-preferred: %d / %d  (active workers %d)\n",
-                                   next, NUM_RASTER_THREADS,
-                                   g_active_workers.load(std::memory_order_relaxed));
                         }
                     }
                     break;
@@ -968,6 +960,11 @@ void run_render_loop(RendererContext& ctx) {
 
         // FPS counter in the top-right corner (safe now: raster is fully drained).
         ctx.fps_counter->draw(pixels, pitch, fb->w, fb->format);
+        {
+            char label[32];
+            snprintf(label, sizeof(label), "CPP %d/%d", pool_active, k_eff);
+            draw_text(pixels, pitch, 20, 20, label, 255, 255, 255, fb->format);
+        }
 
         // Concurrency timeline overlay (toggle with 'S'). The orange line
         // it paints sits exactly at draw_end_ts (captured here, just
@@ -1030,13 +1027,6 @@ void run_render_loop(RendererContext& ctx) {
                 prof.present_history[0].end_ts   = present_end_ts;
             }
         }
-#ifdef __EMSCRIPTEN__
-        if (frame_num <= 3 || (frame_num % 60) == 0) {
-            printf("frame %d presented (fps=%d, sim_t=%.2f)\n",
-                   frame_num, ctx.fps_counter->fps, sim_time);
-        }
-#endif
-
         // Wait for the whole pool to finish the frame (T&L bin merge + all
         // raster passes) before we touch the shared buffers it wrote and set
         // up the next frame's plan. raster already drained above; this also

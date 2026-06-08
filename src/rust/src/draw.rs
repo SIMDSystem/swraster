@@ -18,6 +18,8 @@ use std::sync::OnceLock;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
+#[cfg(target_arch = "wasm32")]
+use std::arch::wasm32::*;
 
 const M_PI: f32 = std::f32::consts::PI;
 
@@ -26,6 +28,10 @@ type ShadowDepth = u16;
 #[cfg(target_arch = "aarch64")]
 #[derive(Clone, Copy)]
 struct F32x4(float32x4_t);
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct F32x4(v128);
 
 #[cfg(target_arch = "aarch64")]
 impl F32x4 {
@@ -79,7 +85,57 @@ impl F32x4 {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(target_arch = "wasm32")]
+impl F32x4 {
+    #[inline(always)]
+    unsafe fn splat(v: f32) -> Self {
+        Self(f32x4_splat(v))
+    }
+    #[inline(always)]
+    unsafe fn lanes() -> Self {
+        const LANES: [f32; 4] = [0.0, 1.0, 2.0, 3.0];
+        Self(v128_load(LANES.as_ptr().cast::<v128>()))
+    }
+    #[inline(always)]
+    unsafe fn from_array(v: [f32; 4]) -> Self {
+        Self(v128_load(v.as_ptr().cast::<v128>()))
+    }
+    #[inline(always)]
+    unsafe fn load(p: *const f32) -> Self {
+        Self(v128_load(p.cast::<v128>()))
+    }
+    #[inline(always)]
+    unsafe fn to_array(self) -> [f32; 4] {
+        let mut out = [0.0f32; 4];
+        v128_store(out.as_mut_ptr().cast::<v128>(), self.0);
+        out
+    }
+    #[inline(always)]
+    unsafe fn abs(self) -> Self {
+        Self(f32x4_abs(self.0))
+    }
+    #[inline(always)]
+    unsafe fn min(self, rhs: Self) -> Self {
+        Self(f32x4_min(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn max(self, rhs: Self) -> Self {
+        Self(f32x4_max(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn any_mixed_sign(w0: Self, w1: Self, w2: Self) -> bool {
+        let zero = f32x4_splat(0.0);
+        let mn = w0.min(w1.min(w2)).0;
+        let mx = w0.max(w1.max(w2)).0;
+        i32x4_bitmask(v128_and(f32x4_lt(mn, zero), f32x4_gt(mx, zero))) != 0
+    }
+    #[inline(always)]
+    unsafe fn any_depth_reject(z: Self, depth: Self) -> bool {
+        i32x4_bitmask(f32x4_ge(z.0, depth.0)) != 0
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
 #[inline(always)]
 unsafe fn interp3_attrs4(b0: f32, b1: f32, b2: f32, a0: [f32; 4], a1: [f32; 4], a2: [f32; 4]) -> [f32; 4] {
     (F32x4::from_array(a0) * F32x4::splat(b0)
@@ -96,7 +152,15 @@ fn dot3(ax: f32, ay: f32, az: f32, bx: f32, by: f32, bz: f32) -> f32 {
         let b = F32x4::from_array([bx, by, bz, 0.0]);
         return vaddvq_f32(vmulq_f32(a.0, b.0));
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "wasm32")]
+    unsafe {
+        let v = f32x4_mul(
+            F32x4::from_array([ax, ay, az, 0.0]).0,
+            F32x4::from_array([bx, by, bz, 0.0]).0,
+        );
+        return f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v) + f32x4_extract_lane::<2>(v);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
     {
         ax * bx + ay * by + az * bz
     }
@@ -116,6 +180,15 @@ impl std::ops::Add for F32x4 {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Add for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Self(f32x4_add(self.0, rhs.0))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 impl std::ops::Mul for F32x4 {
     type Output = Self;
@@ -125,12 +198,30 @@ impl std::ops::Mul for F32x4 {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Mul for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        Self(f32x4_mul(self.0, rhs.0))
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 impl std::ops::Div for F32x4 {
     type Output = Self;
     #[inline(always)]
     fn div(self, rhs: Self) -> Self {
         unsafe { Self(vdivq_f32(self.0, rhs.0)) }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Div for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn div(self, rhs: Self) -> Self {
+        Self(f32x4_div(self.0, rhs.0))
     }
 }
 
@@ -1050,7 +1141,7 @@ pub unsafe fn draw_triangle_barycentric_strip(
             // Take it only when all four lanes are covered and all four pass
             // depth, so no write mask is needed; otherwise fall through scalar.
             if quad_enabled && shader == TriangleShader::Lit && x + 3 <= x_max {
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
                 {
                     let lanes = F32x4::lanes();
                     let w0v = F32x4::splat(w0) + F32x4::splat(a0) * lanes;
@@ -1223,7 +1314,7 @@ pub unsafe fn draw_triangle_barycentric_strip(
                     break 'scalar;
                 }
 
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
                 let frag = {
                     let persp = 1.0 / inv_w;
                     let uvexey = interp3_attrs4(b0b, b1b, b2b, [uw0, v0_w, ex0_w, ey0_w], [uw1, v1_w, ex1_w, ey1_w], [uw2, v2_w, ex2_w, ey2_w]);
@@ -1253,7 +1344,7 @@ pub unsafe fn draw_triangle_barycentric_strip(
                         sq: nxsq[3] * persp,
                     }
                 };
-                #[cfg(not(target_arch = "aarch64"))]
+                #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
                 let frag = LitFrag {
                     u: (uw0 * b0b + uw1 * b1b + uw2 * b2b) / inv_w,
                     v: (v0_w * b0b + v1_w * b1b + v2_w * b2b) / inv_w,

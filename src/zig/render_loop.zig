@@ -357,12 +357,10 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                     if (event.key == 'q' or event.key == 'Q') {
                         const was = draw.g_quad_path_enabled.load(.monotonic);
                         draw.g_quad_path_enabled.store(!was, .monotonic);
-                        dbg.print("Quad raster path: {s}\n", .{if (!was) "ON (4-wide + scalar fallback)" else "OFF (scalar only)"});
                     }
                     if (event.key == 'b' or event.key == 'B') {
                         const was = threading.raster_hard_barrier.load(.monotonic);
                         threading.raster_hard_barrier.store(!was, .monotonic);
-                        dbg.print("Raster hard barrier: {s}\n", .{if (!was) "ON (passes serialized)" else "OFF (opportunistic overlap)"});
                     }
                     if (event.key == 't' or event.key == 'T') {
                         if (ctx.profiler.?.enabled.load(.monotonic)) {
@@ -381,7 +379,6 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                         if (next > config.NUM_RASTER_THREADS) next = config.NUM_RASTER_THREADS;
                         if (next != cur) {
                             threading.g_active_workers.store(next, .monotonic);
-                            dbg.print("Active workers: {d} / {d}  (T&L-preferred {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_tl_workers.load(.monotonic) });
                         }
                     }
                     if (event.key == '[' or event.key == '{' or event.key == ']' or event.key == '}') {
@@ -392,7 +389,6 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                         if (next > config.NUM_RASTER_THREADS) next = config.NUM_RASTER_THREADS;
                         if (next != cur) {
                             threading.g_tl_workers.store(next, .monotonic);
-                            dbg.print("T&L-preferred: {d} / {d}  (active workers {d})\n", .{ next, config.NUM_RASTER_THREADS, threading.g_active_workers.load(.monotonic) });
                         }
                     }
                 },
@@ -824,6 +820,11 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         }
 
         ctx.fps_counter.?.draw(pixels, pitch, fb_w, fb.format.?);
+        {
+            var label_buf: [32]u8 = undefined;
+            const label = std.fmt.bufPrint(&label_buf, "ZIG {d}/{d}", .{ pool_active, k_eff }) catch "";
+            pixel.draw_text(pixels, pitch, 20, 20, label, 255, 255, 255, fb.format.?);
+        }
 
         const draw_end_ts = platform.PerfCounter();
 

@@ -64,10 +64,19 @@
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 #include <mach-o/dyld.h>
 #include <limits.h>
-    #endif
+#include <pthread.h>
+#endif
 
 using namespace JPH;
 using namespace Eigen;
+
+#if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
+static inline void set_physics_qos() {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+}
+#else
+static inline void set_physics_qos() {}
+#endif
 
 // macOS app-bundle aware texture loader. Tries bundled Resources first,
 // then falls back to ../Resources/ and the CWD for command-line runs.
@@ -187,7 +196,9 @@ int main(int argc, char** argv) {
     // Declared BEFORE JobSystem so destruction order on scope unwind is correct.
     TempAllocatorImplWithMallocFallback temp_allocator(64 * 1024 * 1024);
     PhysicsSystem       physics_system;
-    JobSystemThreadPool job_system(JOLT_MAX_PHYSICS_JOBS, JOLT_MAX_PHYSICS_BARRIERS, JOLT_WORKER_THREADS);
+    JobSystemThreadPool job_system;
+    job_system.SetThreadInitFunction([](int) { set_physics_qos(); });
+    job_system.Init(JOLT_MAX_PHYSICS_JOBS, JOLT_MAX_PHYSICS_BARRIERS, JOLT_WORKER_THREADS);
     physics_system.Init(cMaxBodies, cNumBodyMutexes, cMaxBodyPairs, cMaxContactConstraints,
                         broad_phase_layer_interface, object_vs_broadphase_layer_filter, object_vs_object_layer_filter);
     BodyInterface& body_interface = physics_system.GetBodyInterface();

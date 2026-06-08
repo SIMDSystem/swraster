@@ -1,3 +1,4 @@
+#![cfg_attr(target_os = "emscripten", no_main)]
 //! main.rs — swraster Rust port entry point.
 //!
 //! Brings up a winit window with a softbuffer CPU framebuffer, constructs the
@@ -13,6 +14,7 @@ mod fps;
 mod geometry;
 mod jolt;
 mod linalg;
+#[cfg(target_os = "macos")]
 mod mac_blit;
 mod physics;
 mod physics_setup;
@@ -26,22 +28,31 @@ mod scene;
 mod shadow;
 mod texture;
 
-use std::rc::Rc;
 use std::time::Instant;
 
+#[cfg(target_os = "macos")]
+use std::rc::Rc;
+#[cfg(target_os = "macos")]
 use winit::application::ApplicationHandler;
+#[cfg(target_os = "macos")]
 use winit::dpi::LogicalSize;
+#[cfg(target_os = "macos")]
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+#[cfg(target_os = "macos")]
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+#[cfg(target_os = "macos")]
 use winit::keyboard::{Key, NamedKey};
+#[cfg(target_os = "macos")]
 use winit::window::{Window, WindowId};
 
-use render_loop::RenderState;
+#[cfg(target_os = "macos")]
 use mac_blit::CocoaBlitter;
+use render_loop::RenderState;
 
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 1024;
 
+#[cfg(target_os = "macos")]
 struct App {
     window: Option<Rc<Window>>,
     blitter: Option<CocoaBlitter>,
@@ -50,6 +61,7 @@ struct App {
     last_cursor: Option<(f64, f64)>,
 }
 
+#[cfg(target_os = "macos")]
 impl App {
     fn new() -> Self {
         Self {
@@ -62,6 +74,7 @@ impl App {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
@@ -104,21 +117,27 @@ impl ApplicationHandler for App {
                         }
                         Key::Character("b") | Key::Character("B") => {
                             if let Some(s) = self.state.as_mut() {
-                                let on = s.toggle_raster_hard_barrier();
-                                eprintln!(
-                                    "Raster hard barrier: {}",
-                                    if on { "ON (passes serialized)" } else { "OFF (opportunistic overlap)" }
-                                );
+                                s.toggle_raster_hard_barrier();
+                            }
+                        }
+                        Key::Character("-") | Key::Character("_") => {
+                            if let Some(s) = self.state.as_mut() {
+                                s.adjust_active_workers(-1);
+                            }
+                        }
+                        Key::Character("=") | Key::Character("+") => {
+                            if let Some(s) = self.state.as_mut() {
+                                s.adjust_active_workers(1);
                             }
                         }
                         Key::Character("[") | Key::Character("{") => {
                             if let Some(s) = self.state.as_mut() {
-                                eprintln!("T&L-preferred workers: {}", s.adjust_tl_workers(-1));
+                                s.adjust_tl_workers(-1);
                             }
                         }
                         Key::Character("]") | Key::Character("}") => {
                             if let Some(s) = self.state.as_mut() {
-                                eprintln!("T&L-preferred workers: {}", s.adjust_tl_workers(1));
+                                s.adjust_tl_workers(1);
                             }
                         }
                         _ => {}
@@ -185,9 +204,155 @@ impl ApplicationHandler for App {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(target_os = "emscripten")]
+mod web {
+    use super::*;
+    use std::collections::VecDeque;
+    use std::ffi::c_void;
+    use std::sync::{Mutex, OnceLock};
+
+    enum Event {
+        Key(i32),
+        MouseButton { pressed: bool },
+        MouseMotion { dx: i32, dy: i32 },
+        Wheel(i32),
+        Visible(bool),
+    }
+
+    struct WebApp {
+        state: RenderState,
+        framebuffer: Vec<u32>,
+        start: Instant,
+        last_physics_ms: u64,
+        visible: bool,
+        mouse_down: bool,
+    }
+
+    static EVENTS: OnceLock<Mutex<VecDeque<Event>>> = OnceLock::new();
+
+    extern "C" {
+        fn emscripten_set_main_loop_arg(
+            func: extern "C" fn(*mut c_void),
+            arg: *mut c_void,
+            fps: i32,
+            simulate_infinite_loop: i32,
+        );
+        fn swr_js_setup_canvas(w: i32, h: i32);
+        fn swr_js_present(ptr: *const u32, w: i32, h: i32);
+    }
+
+    fn events() -> &'static Mutex<VecDeque<Event>> {
+        EVENTS.get_or_init(|| Mutex::new(VecDeque::new()))
+    }
+
+    fn push_event(ev: Event) {
+        events().lock().unwrap().push_back(ev);
+    }
+
+    #[no_mangle]
+    pub extern "C" fn swr_push_key(key: i32) {
+        push_event(Event::Key(key));
+    }
+
+    #[no_mangle]
+    pub extern "C" fn swr_push_mouse_button(_button: i32, pressed: i32) {
+        push_event(Event::MouseButton { pressed: pressed != 0 });
+    }
+
+    #[no_mangle]
+    pub extern "C" fn swr_push_mouse_motion(dx: i32, dy: i32) {
+        push_event(Event::MouseMotion { dx, dy });
+    }
+
+    #[no_mangle]
+    pub extern "C" fn swr_push_wheel(wy: i32) {
+        push_event(Event::Wheel(wy));
+    }
+
+    #[no_mangle]
+    pub extern "C" fn swr_push_visibility(visible: i32) {
+        push_event(Event::Visible(visible != 0));
+    }
+
+    extern "C" fn frame(arg: *mut c_void) {
+        let app = unsafe { &mut *(arg as *mut WebApp) };
+        while let Some(ev) = events().lock().unwrap().pop_front() {
+            match ev {
+                Event::Key(32) => app.state.toggle_pause(),
+                Event::Key(k) if k == 's' as i32 || k == 'S' as i32 => app.state.toggle_stats(),
+                Event::Key(k) if k == 'f' as i32 || k == 'F' as i32 => app.state.toggle_profiler_unfreeze(),
+                Event::Key(k) if k == 'b' as i32 || k == 'B' as i32 => {
+                    app.state.toggle_raster_hard_barrier();
+                }
+                Event::Key(k) if k == '-' as i32 || k == '_' as i32 => {
+                    app.state.adjust_active_workers(-1);
+                }
+                Event::Key(k) if k == '=' as i32 || k == '+' as i32 => {
+                    app.state.adjust_active_workers(1);
+                }
+                Event::Key(k) if k == '[' as i32 || k == '{' as i32 => {
+                    app.state.adjust_tl_workers(-1);
+                }
+                Event::Key(k) if k == ']' as i32 || k == '}' as i32 => {
+                    app.state.adjust_tl_workers(1);
+                }
+                Event::MouseButton { pressed } => {
+                    app.mouse_down = pressed;
+                    app.state.camera_orbiting = pressed;
+                }
+                Event::MouseMotion { dx, dy } => {
+                    if app.mouse_down {
+                        app.state.orbit(dx as f32, dy as f32);
+                    }
+                }
+                Event::Wheel(wy) => app.state.zoom(wy as f32),
+                Event::Visible(v) => app.visible = v,
+                _ => {}
+            }
+        }
+        if !app.visible {
+            return;
+        }
+        let now_ms = app.start.elapsed().as_millis() as u64;
+        app.state.frame(&mut app.framebuffer, INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
+        let blit_start = app.state.prof_now();
+        unsafe {
+            swr_js_present(app.framebuffer.as_ptr(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
+        }
+        let blit_end = app.state.prof_now();
+        app.state.prof_set_present(blit_start, blit_end);
+    }
+
+    pub fn main() -> i32 {
+        events();
+        unsafe {
+            swr_js_setup_canvas(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
+        }
+        let app = Box::new(WebApp {
+            state: RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32),
+            framebuffer: vec![0; (INITIAL_WIDTH * INITIAL_HEIGHT) as usize],
+            start: Instant::now(),
+            last_physics_ms: 0,
+            visible: true,
+            mouse_down: false,
+        });
+        unsafe {
+            emscripten_set_main_loop_arg(frame, Box::into_raw(app).cast::<c_void>(), 0, 1);
+        }
+        0
+    }
+}
+
+#[cfg(target_os = "emscripten")]
+#[no_mangle]
+pub extern "C" fn swr_rust_start() -> i32 {
+    web::main()
 }

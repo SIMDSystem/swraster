@@ -107,7 +107,6 @@
           Module._swr_push_visibility(document.hidden ? 0 : 1);
         }
       });
-      console.log('[swraster] input listeners installed');
     }
 
     var Module = {
@@ -127,9 +126,11 @@
           : '');
       },
       onRuntimeInitialized: function() {
-        console.log('[swraster] runtime initialised, wiring input');
         pushEvents();
         focusCanvas();
+        if (Module._swr_rust_start) {
+          Module._swr_rust_start();
+        }
       }
     };
 

@@ -27,7 +27,7 @@
 <body>
   <main>
     <h1>swraster</h1>
-    <p>Multithreaded software rasterizer compiled to WebAssembly. Both builds
+    <p>Multithreaded software rasterizer compiled to WebAssembly. The builds
        render the same scene with the same page; pick a backend to compare.</p>
     <div class="builds">
       <a class="card" href="zig/raster.html">
@@ -38,6 +38,11 @@
       <a class="card" href="cpp/raster.html">
         <div class="tag">C++</div>
         <h2>C++ &rarr; WASM</h2>
+        <span>emscripten pthreads + Jolt WASM</span>
+      </a>
+      <a class="card" href="rust/raster.html">
+        <div class="tag">Rust</div>
+        <h2>Rust &rarr; WASM</h2>
         <span>emscripten pthreads + Jolt WASM</span>
       </a>
     </div>

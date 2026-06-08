@@ -46,3 +46,5 @@ void draw_digit(uint8_t* pixels, int pitch, int x, int y, int digit,
                 uint32_t color, PixelFormat* format);
 void draw_number(uint8_t* pixels, int pitch, int x, int y, int number,
                  uint8_t r, uint8_t g, uint8_t b, PixelFormat* format);
+void draw_text(uint8_t* pixels, int pitch, int x, int y, const char* text,
+               uint8_t r, uint8_t g, uint8_t b, PixelFormat* format);

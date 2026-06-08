@@ -63,17 +63,14 @@ void init_thread_counts() {
     if (cap > POOL_CAPACITY_MAX) cap = POOL_CAPACITY_MAX;
     NUM_RASTER_THREADS = cap;                              // launched capacity ceiling
     NUM_TL_THREADS     = NUM_RASTER_THREADS;              // sizing: capacity covers all
-    int start_active = hw < cap ? hw : cap;
-    g_active_workers.store(start_active, std::memory_order_relaxed); // start at core count
-    g_tl_workers.store(cap, std::memory_order_relaxed);   // all active prefer T&L initially
+    int start_active = 16 < cap ? 16 : cap;
+    g_active_workers.store(start_active, std::memory_order_relaxed); // start at 16/16
+    g_tl_workers.store(start_active, std::memory_order_relaxed);     // all active prefer T&L initially
     NUM_STRIPS         = 16;
     NUM_TILE_BINS      = NUM_STRIPS * TILE_X_SPLITS;
     // One lock per tile bin for the scatter-merge (vector move-assign works
     // even though std::mutex isn't movable — it only transfers the buffer).
     tile_bin_locks = std::vector<std::mutex>(NUM_TILE_BINS);
-    printf("Threads: pool capacity %d, active %d, T&L-preferred %d (hw=%d), %d strips, %d tiles\n"
-           "  keys: -/= adjust active workers, [/] adjust T&L-preferred\n",
-           NUM_RASTER_THREADS, start_active, cap, hw, NUM_STRIPS, NUM_TILE_BINS);
 }
 
 // ---- Perf timing ----
