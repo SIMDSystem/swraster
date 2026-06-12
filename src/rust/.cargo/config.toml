@@ -1,9 +1,9 @@
 # Keep Rust build output under the shared build/ tree, mirroring build/cpp and
 # build/zig. A plain `cargo build` from src/rust lands artifacts in
-# <repo>/build/rust. (The Makefile's `rust` target sets CARGO_TARGET_DIR
+# <repo>/build/rust/cargo. (The Makefile's `rust` target sets CARGO_TARGET_DIR
 # explicitly so the location is stable even if the environment overrides it.)
 [build]
-target-dir = "../../build/rust"
+target-dir = "../../build/rust/cargo"
 # Match the C++/Zig native builds (-march=native / -mcpu=native): let LLVM use
 # the host CPU's full instruction set (NEON/AVX etc.) so the hot rasterizer
 # loops autovectorize instead of falling back to baseline scalar codegen.

@@ -6,7 +6,6 @@ import "core:c"
 import "core:fmt"
 import "core:math"
 import "core:mem"
-import "core:os"
 import "core:strings"
 import "core:sync"
 
@@ -365,12 +364,7 @@ main :: proc() {
 	thread_handle_join(physics_worker)
 	platform_shutdown()
 
-	when !IS_WEB_TARGET {
-		// Exit without running Odin's @(fini) cleanup. core:os registers a
-		// fini that free()s the args array as the process dies — pointless
-		// (the OS reclaims everything), and under the clang-23 build that
-		// free aborts ("pointer being freed was not allocated"). os.exit is
-		// documented to skip @(fini) blocks.
-		os.exit(0)
-	}
+	// Native: exits via os.exit(0), skipping Odin's @(fini) cleanup (see
+	// os_args_native.odin). Wasm: no-op, main returns normally.
+	program_exit()
 }

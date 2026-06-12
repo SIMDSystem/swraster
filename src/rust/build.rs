@@ -13,9 +13,9 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_emscripten = target.contains("emscripten");
     let jolt_lib_dir = if is_emscripten {
-        repo_root.join("build/web/jolt_release")
+        repo_root.join("build/deps/jolt/web")
     } else {
-        jolt_dir.join("Build/build_release")
+        repo_root.join("build/deps/jolt/native")
     };
 
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.cpp").display());
@@ -76,7 +76,7 @@ fn main() {
         // emcc links at -O0 and skips that pass entirely.
         println!("cargo:rustc-link-arg=-O3");
         println!("cargo:rustc-link-arg=--js-library");
-        println!("cargo:rustc-link-arg={}", repo_root.join("web_zig_lib.js").display());
+        println!("cargo:rustc-link-arg={}", repo_root.join("src/web/web_zig_lib.js").display());
         println!("cargo:rustc-link-arg=--no-entry");
         println!("cargo:rustc-link-arg=-sUSE_PTHREADS=1");
         println!("cargo:rustc-link-arg=-sPTHREAD_POOL_SIZE=32");

@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
     if (os == .macos) {
         const build_root_path = b.build_root.path orelse ".";
         const repo_root = std.fs.path.resolve(b.allocator, &.{ build_root_path, "..", ".." }) catch @panic("build: cannot resolve repo root");
-        const plist_path = b.pathJoin(&.{ repo_root, "Info.plist" });
+        const plist_path = b.pathJoin(&.{ repo_root, "assets", "Info.plist" });
         const assets_dir = b.pathJoin(&.{ repo_root, "assets" });
         const app_path = b.getInstallPath(.prefix, "Raster.app");
         const icon_cache = b.getInstallPath(.prefix, "icon.icns");

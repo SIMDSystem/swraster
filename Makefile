@@ -3,24 +3,40 @@ EMCXX ?= em++
 EMCC ?= emcc
 EMCMAKE ?= emcmake
 
-# Standard project layout
+# Standard project layout — symmetric across the four language ports:
+#   src/<lang>/            code only (cpp, zig, odin, rust)
+#   src/web/               shared web page sources (shell, index, JS glue)
+#   assets/                runtime assets + Info.plist
+#   scripts/               dev tools (serve_web.py, icon generators)
+#   third_party/           git submodules, kept PRISTINE (no in-tree builds)
+#   build/deps/            shared dependency artifacts (Jolt, joltc wrapper)
+#   build/<lang>/          obj/ obj-web/ [obj-llvm23/] bin/raster Raster.app
+#                          (rust uses cargo/ + cargo-web/ for cargo's trees)
+#   build/web/<lang>/      pure docroot — only raster.{html,js,wasm,data}
 SRC_DIR   = src/cpp
+WEB_SRC_DIR = src/web
+SCRIPT_DIR = scripts
 ASSET_DIR = assets
 BUILD_DIR = build
-# Per-toolchain output folders so the C++, Zig, Odin, and web builds never clobber
-# each other inside build/. Each native toolchain mirrors the same shape:
-#   build/<tool>/bin/raster   — raw executable
-#   build/<tool>/Raster.app   — signed app bundle (icon, no console)
+DEPS_DIR  = $(BUILD_DIR)/deps
 CPP_BUILD_DIR = $(BUILD_DIR)/cpp
 ZIG_BUILD_DIR = $(BUILD_DIR)/zig
 ODIN_BUILD_DIR = $(BUILD_DIR)/odin
+RUST_BUILD_DIR = $(BUILD_DIR)/rust
 JOLT_DIR  = third_party/JoltPhysics
 # Header-only SIMD (google/highway). No build step — just -I$(HIGHWAY_DIR).
 # Native: -march=native picks NEON / SSE / AVX. Web: -msimd128 picks wasm SIMD.
 HIGHWAY_DIR = third_party/highway
 HIGHWAY_HEADER = $(HIGHWAY_DIR)/hwy/highway.h
 
-JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
+# Shared web page sources.
+WEB_SHELL = $(WEB_SRC_DIR)/web_shell.html
+WEB_INDEX = $(WEB_SRC_DIR)/web_index.html
+WEB_JSLIB = $(WEB_SRC_DIR)/web_zig_lib.js
+INFO_PLIST = $(ASSET_DIR)/Info.plist
+
+# Jolt builds out-of-tree under build/deps so the submodule stays pristine.
+JOLT_BUILD_DIR = $(DEPS_DIR)/jolt/native
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
 JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=native"
@@ -28,7 +44,9 @@ JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release \
 # (plain Release, no USE_ASSERTS). Defining JPH_ENABLE_ASSERTS here without
 # building Jolt with asserts leaves JPH::AssertFailed undefined at link time.
 CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -I$(HIGHWAY_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
-LDFLAGS = -flto=thin
+# Codegen-relevant flags repeated at the ThinLTO link (that's where the
+# cross-TU optimization actually runs over the bitcode objects).
+LDFLAGS = -flto=thin -O3 -march=native -fomit-frame-pointer
 TARGET = $(CPP_BUILD_DIR)/bin/raster
 APP_NAME = $(CPP_BUILD_DIR)/Raster.app
 # Backend-independent + web sources (filenames relative to $(SRC_DIR)).
@@ -39,19 +57,24 @@ SOURCES = $(addprefix $(SRC_DIR)/,$(SRC_NAMES))
 NATIVE_SOURCES = $(SOURCES) $(SRC_DIR)/platform_mac.mm
 NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework CoreGraphics -framework IOSurface
 ICON_PNG  = $(ASSET_DIR)/icon.png
-# Shared icon intermediate: both the C++ and Zig app bundles copy this in, so it
-# lives at the build root rather than inside one toolchain's folder.
+# Shared icon intermediate: every app bundle copies this in, so it lives at the
+# build root rather than inside one toolchain's folder.
 ICON_ICNS = $(BUILD_DIR)/icon.icns
 WEB_BUILD_DIR = $(BUILD_DIR)/web
-JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/jolt_release
+JOLT_WEB_BUILD_DIR = $(DEPS_DIR)/jolt/web
 JOLT_WEB_LIB = $(JOLT_WEB_BUILD_DIR)/libJolt.a
 # Each language gets its own subfolder under build/web/ so they serve at
-# distinct URLs (/cpp/, /zig/) and share the same web_shell.html page + the one
-# prebuilt Jolt WASM archive ($(JOLT_WEB_LIB)).
+# distinct URLs (/cpp/, /zig/, ...) and share the same web_shell.html page +
+# the one prebuilt Jolt WASM archive ($(JOLT_WEB_LIB)). These folders are pure
+# docroot: intermediates (.bc/.ll/.o) live under build/<lang>/obj-web instead.
 CPP_WEB_DIR = $(WEB_BUILD_DIR)/cpp
 ZIG_WEB_DIR = $(WEB_BUILD_DIR)/zig
+ODIN_WEB_DIR = $(WEB_BUILD_DIR)/odin
+RUST_WEB_DIR = $(WEB_BUILD_DIR)/rust
 WEB_TARGET = $(CPP_WEB_DIR)/raster.html
 ZIG_WEB_TARGET = $(ZIG_WEB_DIR)/raster.html
+ODIN_WEB_TARGET = $(ODIN_WEB_DIR)/raster.html
+RUST_WEB_TARGET = $(RUST_WEB_DIR)/raster.html
 # Emscripten sysroot include, derived from the active emsdk (em++ on PATH). The
 # Zig wasm compile needs these libc headers (-Demscripten-sysroot).
 EMSCRIPTEN_ROOT := $(shell dirname "$$(command -v $(EMCXX) 2>/dev/null)" 2>/dev/null)
@@ -91,6 +114,22 @@ WEB_JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release -DUSE_ASSERTS=ON \
   -DINTERPROCEDURAL_OPTIMIZATION=OFF -DCROSS_PLATFORM_DETERMINISTIC=ON -DUSE_WASM_SIMD=ON \
   -DENABLE_ALL_WARNINGS=OFF -DCMAKE_CXX_FLAGS="-pthread -g2 $(WEB_WASM_FEATURES)"
 
+# --- joltc wrapper (shared dependency) ---------------------------------------
+# C wrapper that bridges Jolt's C++ API to the jph_* C ABI the Zig, Odin, and
+# (via build.rs) Rust ports call. Built ONCE under build/deps and shared.
+# Flags must match the libJolt.a it links against (same defines / no rtti / no
+# exceptions) or the BroadPhaseLayerInterface vtables won't line up.
+JOLTC_DIR = $(DEPS_DIR)/joltc/native
+JOLTC_LIB = $(JOLTC_DIR)/libjoltc.a
+JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
+  -faligned-allocation -arch arm64 -mcpu=native -DNDEBUG \
+  -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
+  -I$(JOLT_DIR) -I$(SRC_DIR)
+# joltc + physics_setup compiled to wasm (matching the prebuilt Jolt WASM ABI),
+# shared by the Zig and Odin web links.
+JOLTC_WEB_DIR = $(DEPS_DIR)/joltc/web
+JOLTC_WEB_OBJS = $(JOLTC_WEB_DIR)/joltc.o $(JOLTC_WEB_DIR)/physics_setup.o
+
 # --- Zig native build -------------------------------------------------------
 # Toolchain + caches live under tools/ (not build/, which is output only).
 ZIG ?= tools/zig-toolchain/zig-aarch64-macos-0.16.0/zig
@@ -100,32 +139,20 @@ ZIG_OPT ?= ReleaseFast
 ZIG_BIN = $(ZIG_BUILD_DIR)/bin/raster
 ZIG_APP = $(ZIG_BUILD_DIR)/Raster.app
 ZIG_SOURCES = $(wildcard $(ZIG_SRC_DIR)/*.zig)
-# C wrapper that bridges Jolt's C++ API to the jph_* C ABI the Zig port calls.
-# Flags must match the libJolt.a it links against (same defines / no rtti / no
-# exceptions) or the BroadPhaseLayerInterface vtables won't line up.
-JOLTC_DIR = $(ZIG_BUILD_DIR)/joltc
-JOLTC_LIB = $(JOLTC_DIR)/libjoltc.a
-JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
-  -faligned-allocation -arch arm64 -mcpu=native -DNDEBUG \
-  -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
-  -I$(JOLT_DIR) -I$(SRC_DIR)
+ZIG_OBJ_DIR = $(ZIG_BUILD_DIR)/obj
+ZIG_OBJ_WEB_DIR = $(ZIG_BUILD_DIR)/obj-web
 
 # --- Zig web (emscripten) build ---------------------------------------------
-# joltc C wrapper compiled for wasm. The Zig code calls the jph_* C ABI, so we
-# build joltc.cpp + physics_setup.cpp with em++ using the SAME flags the C++ web
-# build uses for its Jolt consumers ($(WEB_CXXFLAGS)) so they match the prebuilt
-# $(JOLT_WEB_LIB) ABI exactly. We do NOT rebuild Jolt itself.
-ZIG_JOLTC_WEB_DIR = $(ZIG_BUILD_DIR)/joltc_web
-ZIG_JOLTC_WEB_OBJS = $(ZIG_JOLTC_WEB_DIR)/joltc.o $(ZIG_JOLTC_WEB_DIR)/physics_setup.o
 # Same link flags as the C++ web build, but: a slightly larger pthread pool
 # (the Zig worker pool can scale to ~20 raster + physics + Jolt threads), and an
 # explicit export list since Zig's `export fn` symbols need to be kept/exposed
 # as Module._swr_push_* for the page shell (C++ uses EMSCRIPTEN_KEEPALIVE).
-# -O3 at the LINK matters: the Zig sources are compiled to a .a by Zig's own
-# LLVM, but this separate emcc link is where Binaryen's wasm-opt runs over the
-# whole module (cross-fn inlining, instruction selection, CFG cleanups). Without
-# an -O here emcc links at -O0 and skips that pass entirely — which is why the
-# Zig build trailed the single-shot `em++ -O2` C++ build regardless of SIMD.
+# -O3 at the LINK matters: the Zig sources are compiled to an object by Zig's
+# own LLVM, but this separate emcc link is where Binaryen's wasm-opt runs over
+# the whole module (cross-fn inlining, instruction selection, CFG cleanups).
+# Without an -O here emcc links at -O0 and skips that pass entirely — which is
+# why the Zig build trailed the single-shot `em++ -O2` C++ build regardless of
+# SIMD.
 WEB_LDFLAGS_ZIG = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
   -sPTHREAD_POOL_SIZE=32 \
   -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
@@ -149,14 +176,14 @@ LLVM23_CLANG = $(LLVM23_BIN)/clang
 # Zig-emitted IR and the LLVM 23 codegen agree on the enabled wasm extensions.
 ZIG_WEB_MCPU = generic+atomics+bulk_memory+simd128+nontrapping_fptoint+sign_ext+mutable_globals+multivalue+extended_const
 ZIG_WEB_LLVM23_FEATURES = $(filter-out -msse4.2,$(WEB_WASM_FEATURES))
-ZIG_WEB_BC = $(ZIG_WEB_DIR)/swraster_web.bc
-ZIG_WEB_OBJ = $(ZIG_WEB_DIR)/swraster_web.o
+ZIG_WEB_BC = $(ZIG_OBJ_WEB_DIR)/swraster_web.bc
+ZIG_WEB_OBJ = $(ZIG_OBJ_WEB_DIR)/swraster_web.o
 # Native (arm64 macOS) pipeline.
 MACOS_SDK := $(shell xcrun --show-sdk-path 2>/dev/null)
 ZIG_NATIVE_MCPU = native
 ZIG_NATIVE_LLVM23_MCPU = apple-m3
-ZIG_NATIVE_BC = $(ZIG_BUILD_DIR)/swraster_native.bc
-ZIG_NATIVE_OBJ = $(ZIG_BUILD_DIR)/swraster_native.o
+ZIG_NATIVE_BC = $(ZIG_OBJ_DIR)/swraster_native.bc
+ZIG_NATIVE_OBJ = $(ZIG_OBJ_DIR)/swraster_native.o
 ZIG_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc
 
 # --- Odin native build ------------------------------------------------------
@@ -171,21 +198,17 @@ ODIN_MICROARCH ?= -microarch:native
 ODIN_BIN = $(ODIN_BUILD_DIR)/bin/raster
 ODIN_APP = $(ODIN_BUILD_DIR)/Raster.app
 ODIN_SOURCES = $(wildcard $(ODIN_SRC_DIR)/*.odin)
-ODIN_JOLTC_DIR = $(ODIN_BUILD_DIR)/joltc
-ODIN_JOLTC_LIB = $(ODIN_JOLTC_DIR)/libjoltc.a
-ODIN_NATIVE_OBJ = $(ODIN_BUILD_DIR)/swraster_native.o
+ODIN_OBJ_DIR = $(ODIN_BUILD_DIR)/obj
+ODIN_OBJ_WEB_DIR = $(ODIN_BUILD_DIR)/obj-web
+ODIN_NATIVE_OBJ = $(ODIN_OBJ_DIR)/swraster_native.o
 ODIN_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc -lc++ -pthread
 # Web: freestanding_wasm32 LLVM IR -> emcc codegen -> link with shared Jolt WASM.
-ODIN_WEB_DIR = $(WEB_BUILD_DIR)/odin
 # NOTE: -build-mode:llvm-ir always writes <out basename>.ll into the CWD (the
 # -out directory part is ignored for this build mode), so the IR rule moves the
 # file into place after the compile.
-ODIN_WEB_BC = $(ODIN_WEB_DIR)/swraster_web.ll
+ODIN_WEB_BC = $(ODIN_OBJ_WEB_DIR)/swraster_web.ll
 ODIN_WEB_OPT ?= -o:speed -no-bounds-check
-ODIN_WEB_OBJ = $(ODIN_WEB_DIR)/swraster_web.o
-ODIN_JOLTC_WEB_DIR = $(ODIN_BUILD_DIR)/joltc_web
-ODIN_JOLTC_WEB_OBJS = $(ODIN_JOLTC_WEB_DIR)/joltc.o $(ODIN_JOLTC_WEB_DIR)/physics_setup.o
-ODIN_WEB_TARGET = $(ODIN_WEB_DIR)/raster.html
+ODIN_WEB_OBJ = $(ODIN_OBJ_WEB_DIR)/swraster_web.o
 ODIN_WEB_FEATURES = -msimd128 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
 ODIN_WEB_LLVM_FEATURES = $(WEB_WASM_FEATURES)
 WEB_LDFLAGS_ODIN = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
@@ -197,17 +220,16 @@ WEB_LDFLAGS_ODIN = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
   -sEXPORTED_FUNCTIONS=_main,_swr_push_key,_swr_push_mouse_button,_swr_push_mouse_motion,_swr_push_wheel,_swr_push_visibility \
   -g2
 
-# --- C++ native via LLVM 23 (experiment) -------------------------------------
+# --- C++ native via LLVM 23 -------------------------------------------------
 # Same sources compiled with emsdk's clang-23 instead of Apple clang 17, to
 # isolate compiler-backend vintage in the native ladder. Entirely parallel to
-# the default build: separate objects + bin/raster-llvm23; `make all`/`app`
-# still use Apple clang with the original CXXFLAGS. Full LLVM 23 pipeline:
-# clang-23 frontend, ThinLTO, and ld64.lld (Apple's ld64 cannot ingest
-# LLVM 23 LTO bitcode, so lld does the Mach-O link). -fno-stack-check: clang's
-# Darwin stack-probe attribute (emitted for dynamic allocas, e.g. Eigen
-# temporaries) is rejected by lld 23's Mach-O LTO backend ("Unsupported stack
-# probing method"); the probe is a hardening feature, safe to drop for this
-# experimental binary.
+# the default build: separate objects + bin/raster-llvm23. Deliberately a
+# single-shot unity TU (whole-program view in one compile) rather than the
+# incremental obj/ pipeline: ld64.lld's Mach-O LTO backend rejects clang-23
+# ThinLTO bitcode on arm64 darwin ("Unsupported stack probing method"), and
+# emsdk ships no llvm-link, so unity is how this lane gets cross-TU inlining.
+# One collision: physics_pipeline.cpp's set_physics_qos clashes inside the
+# unity TU, so it compiles as its own TU.
 CPP_LLVM23_OBJ_DIR = $(CPP_BUILD_DIR)/obj-llvm23
 CPP_LLVM23_BIN = $(CPP_BUILD_DIR)/bin/raster-llvm23
 CPP_LLVM23_FLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -mcpu=apple-m4 \
@@ -234,24 +256,22 @@ cpp-apple: $(TARGET)
 
 # --- Rust native build ------------------------------------------------------
 # The Rust port lives in src/rust and uses cargo (+ build.rs, which compiles the
-# joltc C wrapper and links the prebuilt $(JOLT_LIB)). Cargo's own output dir
-# goes to $(RUST_BUILD_DIR), and we copy the optimized binary into the shared
-# build/<tool>/bin/raster shape used by the C++ and Zig builds.
+# joltc C wrapper and links the prebuilt $(JOLT_LIB)). Cargo's own target trees
+# go to build/rust/cargo (native) and build/rust/cargo-web (wasm); the optimized
+# binary is copied into the shared build/<tool>/bin/raster shape.
 #
 # CARGO_TARGET_DIR is set EXPLICITLY on the cargo invocation so the artifacts
-# always land in $(RUST_BUILD_DIR) even when the surrounding shell exports its
+# always land in the right place even when the surrounding shell exports its
 # own CARGO_TARGET_DIR (which would otherwise override .cargo/config.toml).
 CARGO ?= cargo
 RUST_SRC_DIR = src/rust
-RUST_BUILD_DIR = $(BUILD_DIR)/rust
-RUST_CARGO_BIN = $(RUST_BUILD_DIR)/release/raster
+RUST_CARGO_DIR = $(RUST_BUILD_DIR)/cargo
+RUST_CARGO_BIN = $(RUST_CARGO_DIR)/release/raster
 RUST_BIN = $(RUST_BUILD_DIR)/bin/raster
 RUST_APP = $(RUST_BUILD_DIR)/Raster.app
 RUST_SOURCES = $(wildcard $(RUST_SRC_DIR)/src/*.rs) $(RUST_SRC_DIR)/Cargo.toml $(RUST_SRC_DIR)/build.rs
-RUST_WEB_CARGO_DIR = $(BUILD_DIR)/rust-web
-RUST_WEB_DIR = $(WEB_BUILD_DIR)/rust
+RUST_WEB_CARGO_DIR = $(RUST_BUILD_DIR)/cargo-web
 RUST_WEB_DEPS_DIR = $(RUST_WEB_CARGO_DIR)/wasm32-unknown-emscripten/release/deps
-RUST_WEB_TARGET = $(RUST_WEB_DIR)/raster.html
 RUST_WEB_RUSTFLAGS = -C target-cpu=generic -C target-feature=+atomics,+bulk-memory,+bulk-memory-opt,+mutable-globals,+simd128,+relaxed-simd,+sign-ext,+nontrapping-fptoint,+multivalue,+extended-const
 
 # Default target: build both executable and app bundle
@@ -291,15 +311,33 @@ $(ICON_ICNS): $(ICON_PNG)
 		rm -rf $$ICONSET; \
 	fi
 
-# Build Jolt library if needed
-$(JOLT_LIB):
-	@echo "Building Jolt Physics..."
-	@mkdir -p $(JOLT_BUILD_DIR)
-	@cd $(JOLT_BUILD_DIR) && cmake $(JOLT_CMAKE_FLAGS) .. && cmake --build . --target Jolt
+# Build Jolt library if needed (out-of-tree: the source CMakeLists stays in the
+# submodule, the build tree lands under build/deps).
+$(JOLT_LIB): $(JOLT_DIR)/Build/CMakeLists.txt
+	@echo "Building Jolt Physics (native)..."
+	cmake -S $(JOLT_DIR)/Build -B $(JOLT_BUILD_DIR) $(JOLT_CMAKE_FLAGS)
+	cmake --build $(JOLT_BUILD_DIR) --target Jolt --parallel $(WEB_JOBS)
 
-$(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB) $(HIGHWAY_HEADER)
+# --- C++ native build (two-step: per-TU ThinLTO bitcode objects in obj/, then
+# a ThinLTO link). Incremental — only changed TUs recompile; -MMD/-MP emits
+# header dependency files next to each object so header edits are tracked too.
+CPP_OBJ_DIR = $(CPP_BUILD_DIR)/obj
+CPP_OBJS = $(addprefix $(CPP_OBJ_DIR)/,$(SRC_NAMES:.cpp=.o)) $(CPP_OBJ_DIR)/platform_mac.o
+
+$(CPP_OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HIGHWAY_HEADER)
+	@mkdir -p $(CPP_OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(CPP_OBJ_DIR)/platform_mac.o: $(SRC_DIR)/platform_mac.mm $(HIGHWAY_HEADER)
+	@mkdir -p $(CPP_OBJ_DIR)
+	$(CXX) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(TARGET): $(CPP_OBJS) $(JOLT_LIB)
 	@mkdir -p $(CPP_BUILD_DIR)/bin
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(NATIVE_SOURCES) $(JOLT_LIB) $(LDFLAGS) -pthread $(NATIVE_FRAMEWORKS)
+	@echo "Linking C++ native (ThinLTO)..."
+	$(CXX) $(LDFLAGS) -o $(TARGET) $(CPP_OBJS) $(JOLT_LIB) -pthread $(NATIVE_FRAMEWORKS)
+
+-include $(CPP_OBJS:.o=.d)
 
 # Separate Emscripten/WebAssembly build. Native `all` and `app` targets are unchanged.
 $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
@@ -309,10 +347,21 @@ $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
 	$(EMCMAKE) cmake -S $(JOLT_DIR)/Build -B $(JOLT_WEB_BUILD_DIR) $(WEB_JOLT_CMAKE_FLAGS)
 	cmake --build $(JOLT_WEB_BUILD_DIR) --target Jolt --parallel $(WEB_JOBS)
 
-$(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile $(HIGHWAY_HEADER)
+# C++ web (two-step, mirrors the native obj/ pipeline): per-TU wasm objects in
+# obj-web/, then the emcc -O3 link where Binaryen's wasm-opt runs.
+CPP_WEB_OBJ_DIR = $(CPP_BUILD_DIR)/obj-web
+CPP_WEB_OBJS = $(addprefix $(CPP_WEB_OBJ_DIR)/,$(SRC_NAMES:.cpp=.o))
+
+$(CPP_WEB_OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HIGHWAY_HEADER)
 	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten em++ not found. Activate/install emsdk first."; exit 1; }
+	@mkdir -p $(CPP_WEB_OBJ_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -MMD -MP -c $< -o $@
+
+$(WEB_TARGET): $(CPP_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) $(WEB_SHELL) Makefile
 	@mkdir -p $(CPP_WEB_DIR)
-	$(EMCXX) $(WEB_CXXFLAGS) -o $(WEB_TARGET) $(SOURCES) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file web_shell.html
+	$(EMCXX) -o $(WEB_TARGET) $(CPP_WEB_OBJS) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file $(WEB_SHELL)
+
+-include $(CPP_WEB_OBJS:.o=.d)
 
 # Zig wasm via LLVM 23 (two-step). Step 1: Zig emits its optimized LLVM IR for
 # the wasm32-emscripten target (LLVM 21 frontend + mid-level passes). build-obj
@@ -321,7 +370,7 @@ $(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile
 $(ZIG_WEB_BC): $(ZIG_SOURCES)
 	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten not found (needed for the LLVM 23 backend + sysroot). Activate/install emsdk first."; exit 1; }
 	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG)."; exit 1; }
-	@mkdir -p $(ZIG_WEB_DIR)
+	@mkdir -p $(ZIG_OBJ_WEB_DIR)
 	@echo "Emitting Zig wasm LLVM IR ($(ZIG_OPT))..."
 	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build-obj main.zig \
 		-target wasm32-emscripten -mcpu=$(ZIG_WEB_MCPU) -O$(ZIG_OPT) \
@@ -336,28 +385,27 @@ $(ZIG_WEB_OBJ): $(ZIG_WEB_BC) Makefile
 	@echo "Lowering Zig wasm IR with LLVM 23 (clang-23 -O3)..."
 	$(EMCC) -c $(ZIG_WEB_BC) -o $(ZIG_WEB_OBJ) -O3 -pthread $(ZIG_WEB_LLVM23_FEATURES)
 
-# joltc + physics_setup wrappers compiled to wasm (matching the prebuilt Jolt
-# WASM ABI). These are the only C++ objects the Zig web build needs.
-$(ZIG_JOLTC_WEB_DIR)/joltc.o: $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h Makefile
-	@mkdir -p $(ZIG_JOLTC_WEB_DIR)
+# Shared joltc wasm objects (used by the Zig and Odin web links).
+$(JOLTC_WEB_DIR)/joltc.o: $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h Makefile
+	@mkdir -p $(JOLTC_WEB_DIR)
 	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/joltc.cpp -o $@
-$(ZIG_JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
-	@mkdir -p $(ZIG_JOLTC_WEB_DIR)
+$(JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
+	@mkdir -p $(JOLTC_WEB_DIR)
 	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/physics_setup.cpp -o $@
 
-# Final Zig web link: Zig wasm archive + joltc wasm + the shared Jolt WASM lib,
+# Final Zig web link: Zig wasm object + joltc wasm + the shared Jolt WASM lib,
 # with the JS glue (--js-library) and the same page shell as the C++ build.
-$(ZIG_WEB_TARGET): $(ZIG_WEB_OBJ) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
+$(ZIG_WEB_TARGET): $(ZIG_WEB_OBJ) $(JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) $(WEB_SHELL) $(WEB_JSLIB) Makefile
 	@mkdir -p $(ZIG_WEB_DIR)
 	$(EMCXX) -o $(ZIG_WEB_TARGET) \
-		$(ZIG_WEB_OBJ) $(ZIG_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
-		$(WEB_LDFLAGS_ZIG) --js-library web_zig_lib.js \
-		$(WEB_PRELOADS) --shell-file web_shell.html
+		$(ZIG_WEB_OBJ) $(JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
+		$(WEB_LDFLAGS_ZIG) --js-library $(WEB_JSLIB) \
+		$(WEB_PRELOADS) --shell-file $(WEB_SHELL)
 
-# Landing page that links the per-language builds at /cpp/ and /zig/.
-$(WEB_BUILD_DIR)/index.html: web_index.html
+# Landing page that links the per-language builds at /cpp/, /zig/, /odin/, /rust/.
+$(WEB_BUILD_DIR)/index.html: $(WEB_INDEX)
 	@mkdir -p $(WEB_BUILD_DIR)
-	@cp web_index.html $@
+	@cp $(WEB_INDEX) $@
 
 web-cpp: $(WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 	@echo "C++ web build written to $(CPP_WEB_DIR)/"
@@ -370,8 +418,8 @@ web-zig: $(ZIG_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 $(ODIN_WEB_BC): $(ODIN_SOURCES)
 	@command -v $(EMCC) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
 	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
-	@mkdir -p $(ODIN_WEB_DIR)
-	@echo "Emitting Odin wasm LLVM IR ($(ODIN_OPT))..."
+	@mkdir -p $(ODIN_OBJ_WEB_DIR)
+	@echo "Emitting Odin wasm LLVM IR ($(ODIN_WEB_OPT))..."
 	$(ODIN) build $(ODIN_SRC_DIR) -target:freestanding_wasm32 -build-mode:llvm-ir \
 		-out:$(ODIN_WEB_BC) $(ODIN_WEB_OPT) -strict-target-features \
 		-target-features:+atomics,+bulk-memory,+simd128,+nontrapping-fptoint,+sign-ext,+mutable-globals,+multivalue,+extended-const
@@ -381,24 +429,17 @@ $(ODIN_WEB_OBJ): $(ODIN_WEB_BC) Makefile
 	@echo "Lowering Odin wasm IR with emcc -O3..."
 	$(EMCC) -c $(ODIN_WEB_BC) -o $(ODIN_WEB_OBJ) -O3 -pthread $(ODIN_WEB_LLVM_FEATURES)
 
-$(ODIN_JOLTC_WEB_DIR)/joltc.o: $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h Makefile
-	@mkdir -p $(ODIN_JOLTC_WEB_DIR)
-	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/joltc.cpp -o $@
-$(ODIN_JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
-	@mkdir -p $(ODIN_JOLTC_WEB_DIR)
-	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/physics_setup.cpp -o $@
-
-$(ODIN_WEB_TARGET): $(ODIN_WEB_OBJ) $(ODIN_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
+$(ODIN_WEB_TARGET): $(ODIN_WEB_OBJ) $(JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) $(WEB_SHELL) $(WEB_JSLIB) Makefile
 	@mkdir -p $(ODIN_WEB_DIR)
 	$(EMCXX) -o $(ODIN_WEB_TARGET) \
-		$(ODIN_WEB_OBJ) $(ODIN_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
-		$(WEB_LDFLAGS_ODIN) --js-library web_zig_lib.js \
-		$(WEB_PRELOADS) --shell-file web_shell.html
+		$(ODIN_WEB_OBJ) $(JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
+		$(WEB_LDFLAGS_ODIN) --js-library $(WEB_JSLIB) \
+		$(WEB_PRELOADS) --shell-file $(WEB_SHELL)
 
 web-odin: $(ODIN_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 	@echo "Odin web build written to $(ODIN_WEB_DIR)/"
 
-$(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data: $(RUST_SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_zig_lib.js web_shell.html Makefile
+$(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data: $(RUST_SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) $(WEB_JSLIB) $(WEB_SHELL) Makefile
 	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
 	@command -v $(EMCC) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
 	@rustup +nightly --version >/dev/null 2>&1 || { echo "Error: nightly Rust toolchain required for -Z build-std (rustup toolchain install nightly)."; exit 1; }
@@ -411,12 +452,12 @@ $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_
 		RUSTFLAGS="$(RUST_WEB_RUSTFLAGS)" \
 		$(CARGO) +nightly build -Z build-std=std,panic_abort --release --target wasm32-unknown-emscripten
 
-$(RUST_WEB_TARGET): $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data web_shell.html
+$(RUST_WEB_TARGET): $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data $(WEB_SHELL)
 	@mkdir -p $(RUST_WEB_DIR)
 	@cp $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DIR)/raster.js
 	@cp $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DIR)/raster.wasm
 	@cp $(RUST_WEB_DEPS_DIR)/raster.data $(RUST_WEB_DIR)/raster.data
-	@sed 's#{{{ SCRIPT }}}#<script async type="text/javascript" src="raster.js"></script>#' web_shell.html > $(RUST_WEB_TARGET)
+	@sed 's#{{{ SCRIPT }}}#<script async type="text/javascript" src="raster.js"></script>#' $(WEB_SHELL) > $(RUST_WEB_TARGET)
 
 web-rust: $(RUST_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 	@echo "Rust web build written to $(RUST_WEB_DIR)/"
@@ -427,8 +468,8 @@ web: web-zig
 
 web-all: web-cpp web-zig web-odin web-rust
 
-# Assemble + sign a macOS .app bundle. Used by both the C++ and Zig builds so
-# each toolchain produces a first-class, icon-decorated, console-free app.
+# Assemble + sign a macOS .app bundle. Used by all four builds so each
+# toolchain produces a first-class, icon-decorated, console-free app.
 #   $(call make_app_bundle,<exe-path>,<app-path>)
 # NOTE: the leading '+' is not needed; the strip-quarantine step matters because
 # asset BMPs downloaded via a browser carry com.apple.quarantine, which makes
@@ -438,7 +479,7 @@ define make_app_bundle
 	@echo "Bundling $(2)..."
 	@mkdir -p $(2)/Contents/MacOS $(2)/Contents/Resources
 	@cp $(1) $(2)/Contents/MacOS/raster
-	@cp Info.plist $(2)/Contents/Info.plist
+	@cp $(INFO_PLIST) $(2)/Contents/Info.plist
 	@if [ -f $(ICON_ICNS) ] && [ -s $(ICON_ICNS) ]; then cp $(ICON_ICNS) $(2)/Contents/Resources/icon.icns; fi
 	@for a in $(ASSET_NAMES); do \
 		if [ -f $(ASSET_DIR)/$$a ]; then cp $(ASSET_DIR)/$$a $(2)/Contents/Resources/$$a; \
@@ -456,13 +497,14 @@ endef
 # Apple-clang build stays available: `make cpp-apple` (bin/raster), or bundle
 # it with `make app CPP_APP_BIN=$(TARGET)`.
 CPP_APP_BIN ?= $(CPP_LLVM23_BIN)
-$(APP_NAME): $(CPP_APP_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+$(APP_NAME): $(CPP_APP_BIN) $(INFO_PLIST) $(ICON_ICNS) $(ASSET_FILES)
 	$(call make_app_bundle,$(CPP_APP_BIN),$(APP_NAME))
 
 app: $(APP_NAME)
 
 # --- Zig native build -------------------------------------------------------
-# joltc C wrapper -> static archive the Zig binary links against.
+# joltc C wrapper -> static archive the Zig and Odin binaries link against
+# (built once under build/deps/joltc/native, shared by both ports).
 $(JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h
 	@echo "Building joltc wrapper..."
 	@mkdir -p $(JOLTC_DIR)
@@ -477,7 +519,7 @@ $(JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.c
 $(ZIG_NATIVE_BC): $(ZIG_SOURCES)
 	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG). Set ZIG=/path/to/zig."; exit 1; }
 	@[ -x $(LLVM23_CLANG) ] || { echo "Error: LLVM 23 clang not found at $(LLVM23_CLANG). Activate/install emsdk first."; exit 1; }
-	@mkdir -p $(ZIG_BUILD_DIR)
+	@mkdir -p $(ZIG_OBJ_DIR)
 	@echo "Emitting Zig native LLVM IR ($(ZIG_OPT))..."
 	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build-obj main.zig \
 		-target aarch64-macos -mcpu=$(ZIG_NATIVE_MCPU) -O$(ZIG_OPT) \
@@ -497,7 +539,7 @@ $(ZIG_BIN): $(ZIG_NATIVE_OBJ) $(JOLT_LIB) $(JOLTC_LIB)
 	$(CXX) -o $(ZIG_BIN) $(ZIG_NATIVE_OBJ) $(JOLTC_LIB) $(JOLT_LIB) $(ZIG_NATIVE_FRAMEWORKS)
 
 # Shared bundler assembles + signs build/zig/Raster.app (icon, assets, no console).
-$(ZIG_APP): $(ZIG_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+$(ZIG_APP): $(ZIG_BIN) $(INFO_PLIST) $(ICON_ICNS) $(ASSET_FILES)
 	$(call make_app_bundle,$(ZIG_BIN),$(ZIG_APP))
 
 zig-bin: $(ZIG_BIN)
@@ -505,24 +547,17 @@ zig-bin: $(ZIG_BIN)
 zig: $(ZIG_APP)
 
 # --- Odin native build ------------------------------------------------------
-$(ODIN_JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h
-	@echo "Building joltc wrapper for Odin..."
-	@mkdir -p $(ODIN_JOLTC_DIR)
-	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/joltc.cpp -o $(ODIN_JOLTC_DIR)/joltc.o
-	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/physics_setup.cpp -o $(ODIN_JOLTC_DIR)/physics_setup.o
-	ar rcs $@ $(ODIN_JOLTC_DIR)/joltc.o $(ODIN_JOLTC_DIR)/physics_setup.o
-
 $(ODIN_NATIVE_OBJ): $(ODIN_SOURCES)
 	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
-	@mkdir -p $(ODIN_BUILD_DIR)
+	@mkdir -p $(ODIN_OBJ_DIR)
 	@echo "Emitting Odin native object ($(ODIN_OPT) $(ODIN_MICROARCH))..."
 	$(ODIN) build $(ODIN_SRC_DIR) -build-mode:obj -out:$(ODIN_NATIVE_OBJ) $(ODIN_OPT) $(ODIN_MICROARCH)
 
-$(ODIN_BIN): $(ODIN_NATIVE_OBJ) $(JOLT_LIB) $(ODIN_JOLTC_LIB)
+$(ODIN_BIN): $(ODIN_NATIVE_OBJ) $(JOLT_LIB) $(JOLTC_LIB)
 	@mkdir -p $(ODIN_BUILD_DIR)/bin
 	@echo "Linking Odin native..."
 	$(CXX) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 -mcpu=native \
-		-o $(ODIN_BIN) $(ODIN_NATIVE_OBJ) $(ODIN_JOLTC_LIB) $(JOLT_LIB) \
+		-o $(ODIN_BIN) $(ODIN_NATIVE_OBJ) $(JOLTC_LIB) $(JOLT_LIB) \
 		$(ODIN_NATIVE_FRAMEWORKS)
 
 # --- Odin native via LLVM 23 (split IR interchange, mirrors the Zig and C++
@@ -549,11 +584,11 @@ $(ODIN_LLVM23_DIR)/swraster_native.o: $(ODIN_NATIVE_LL)
 	$(LLVM23_CLANG) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 -mcpu=apple-m4 \
 		-Wno-override-module -c $(ODIN_NATIVE_LL) -o $@
 
-$(ODIN_LLVM23_BIN): $(ODIN_LLVM23_DIR)/swraster_native.o $(JOLT_LIB) $(ODIN_JOLTC_LIB)
+$(ODIN_LLVM23_BIN): $(ODIN_LLVM23_DIR)/swraster_native.o $(JOLT_LIB) $(JOLTC_LIB)
 	@mkdir -p $(ODIN_BUILD_DIR)/bin
 	@echo "Linking Odin native (LLVM 23)..."
 	$(CXX) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 \
-		-o $(ODIN_LLVM23_BIN) $(ODIN_LLVM23_DIR)/swraster_native.o $(ODIN_JOLTC_LIB) $(JOLT_LIB) \
+		-o $(ODIN_LLVM23_BIN) $(ODIN_LLVM23_DIR)/swraster_native.o $(JOLTC_LIB) $(JOLT_LIB) \
 		$(ODIN_NATIVE_FRAMEWORKS)
 
 odin-llvm23: $(ODIN_LLVM23_BIN)
@@ -565,7 +600,7 @@ odin-llvm23: $(ODIN_LLVM23_BIN)
 # environments; the backend was never at fault. Stock Odin backend:
 # `make odin-bin`, or `make odin ODIN_APP_BIN=$(ODIN_BIN)`.
 ODIN_APP_BIN ?= $(ODIN_LLVM23_BIN)
-$(ODIN_APP): $(ODIN_APP_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+$(ODIN_APP): $(ODIN_APP_BIN) $(INFO_PLIST) $(ICON_ICNS) $(ASSET_FILES)
 	$(call make_app_bundle,$(ODIN_APP_BIN),$(ODIN_APP))
 
 odin-bin: $(ODIN_BIN)
@@ -579,9 +614,9 @@ apps: app zig odin rust
 # --- Rust native build ------------------------------------------------------
 $(RUST_CARGO_BIN): $(RUST_SOURCES) $(JOLT_LIB)
 	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
-	@echo "Building Rust (fresh non-incremental cargo --release) -> $(RUST_BUILD_DIR)..."
-	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_BUILD_DIR)) CARGO_INCREMENTAL=0 $(CARGO) build --release
-	@rm -rf $(RUST_BUILD_DIR)/release/incremental
+	@echo "Building Rust (fresh non-incremental cargo --release) -> $(RUST_CARGO_DIR)..."
+	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(RUST_CARGO_DIR)) CARGO_INCREMENTAL=0 $(CARGO) build --release
+	@rm -rf $(RUST_CARGO_DIR)/release/incremental
 
 # Mirror the build/<tool>/bin/raster shape of the C++ and Zig builds.
 $(RUST_BIN): $(RUST_CARGO_BIN)
@@ -598,7 +633,7 @@ rust-bin: $(RUST_BIN)
 # — the same logical-render + compositor-scale path as the C++/Zig IOSurface
 # backend, but with no per-frame CPU upscale. Editing the plist invalidates the
 # bundle signature, so we re-sign afterwards.
-$(RUST_APP): $(RUST_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+$(RUST_APP): $(RUST_BIN) $(INFO_PLIST) $(ICON_ICNS) $(ASSET_FILES)
 	$(call make_app_bundle,$(RUST_BIN),$(RUST_APP))
 	@plutil -replace NSHighResolutionCapable -bool false $(RUST_APP)/Contents/Info.plist
 	@codesign --force --deep --sign - $(RUST_APP) >/dev/null 2>&1
@@ -608,6 +643,9 @@ rust: $(RUST_APP)
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+clean-deps:
+	rm -rf $(DEPS_DIR)
 
 clean-cpp:
 	rm -rf $(CPP_BUILD_DIR)
@@ -619,10 +657,10 @@ clean-odin:
 	rm -rf $(ODIN_BUILD_DIR)
 
 clean-web:
-	rm -rf $(WEB_BUILD_DIR) $(RUST_WEB_CARGO_DIR)
+	rm -rf $(WEB_BUILD_DIR) $(CPP_WEB_OBJ_DIR) $(ZIG_OBJ_WEB_DIR) $(ODIN_OBJ_WEB_DIR) $(RUST_WEB_CARGO_DIR)
 
 clean-rust:
-	rm -rf $(RUST_BUILD_DIR) $(RUST_SRC_DIR)/target
+	rm -rf $(RUST_BUILD_DIR)
 
 rebuild-cpp:
 	$(MAKE) clean-cpp
@@ -640,4 +678,4 @@ rebuild-rust:
 	$(MAKE) clean-rust
 	$(MAKE) rust
 
-.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin
+.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-deps clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin
