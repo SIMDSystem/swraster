@@ -20,8 +20,8 @@ pub fn pool_worker_main(worker_id: i32, ctx: *RendererContext) void {
         var pool_active: i32 = undefined;
         {
             threading.mtx_pool.lock();
-            while (!(!threading.pool_threads_running.load(.monotonic) or
-                threading.frame_pool_target.load(.acquire) > last_frame_processed))
+            while (threading.pool_threads_running.load(.monotonic) and
+                threading.frame_pool_target.load(.acquire) <= last_frame_processed)
             {
                 threading.cv_pool.wait(&threading.mtx_pool);
             }

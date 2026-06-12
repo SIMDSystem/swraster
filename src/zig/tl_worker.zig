@@ -15,6 +15,7 @@ const draw = @import("draw.zig");
 const threading = @import("threading.zig");
 const profiler = @import("thread_profiler.zig");
 const renderer_context = @import("renderer_context.zig");
+const scene = @import("scene.zig");
 const geom = @import("geometry.zig");
 const merge = @import("merge.zig");
 const keysort = @import("keysort.zig");
@@ -43,37 +44,52 @@ fn triSortZ(t: *const RenderTriangle) f32 {
     return t.sort_z;
 }
 
-fn screen_tile_range(x0: f32, x1: f32, x2: f32, y0: f32, y1: f32, y2: f32, width: i32, height: i32, first_col: *i32, last_col: *i32, first_strip: *i32, last_strip: *i32) bool {
+// Inclusive tile-bin footprint of a triangle, or null when fully off screen.
+const TileRange = struct {
+    first_col: i32,
+    last_col: i32,
+    first_strip: i32,
+    last_strip: i32,
+
+    fn bin_count(self: TileRange) i32 {
+        return (self.last_col - self.first_col + 1) * (self.last_strip - self.first_strip + 1);
+    }
+};
+
+fn screen_tile_range(x0: f32, x1: f32, x2: f32, y0: f32, y1: f32, y2: f32, width: i32, height: i32) ?TileRange {
     var x_min: i32 = @intFromFloat(@floor(@min(x0, @min(x1, x2))));
     var x_max: i32 = @intFromFloat(@ceil(@max(x0, @max(x1, x2))));
     var y_min: i32 = @intFromFloat(@floor(@min(y0, @min(y1, y2))));
     var y_max: i32 = @intFromFloat(@ceil(@max(y0, @max(y1, y2))));
-    if (x_max < 0 or x_min >= width or y_max < 0 or y_min >= height) return false;
+    if (x_max < 0 or x_min >= width or y_max < 0 or y_min >= height) return null;
     if (x_min < 0) x_min = 0;
     if (x_max >= width) x_max = width - 1;
     if (y_min < 0) y_min = 0;
     if (y_max >= height) y_max = height - 1;
-    first_col.* = config.tile_column_for_x(width, x_min);
-    last_col.* = config.tile_column_for_x(width, x_max);
-    first_strip.* = @divTrunc(y_min * config.NUM_STRIPS, height);
-    last_strip.* = @divTrunc(y_max * config.NUM_STRIPS, height);
-    if (first_strip.* < 0) first_strip.* = 0;
-    if (last_strip.* >= config.NUM_STRIPS) last_strip.* = config.NUM_STRIPS - 1;
-    return first_col.* <= last_col.* and first_strip.* <= last_strip.*;
+    var range = TileRange{
+        .first_col = config.tile_column_for_x(width, x_min),
+        .last_col = config.tile_column_for_x(width, x_max),
+        .first_strip = @divTrunc(y_min * config.NUM_STRIPS, height),
+        .last_strip = @divTrunc(y_max * config.NUM_STRIPS, height),
+    };
+    if (range.first_strip < 0) range.first_strip = 0;
+    if (range.last_strip >= config.NUM_STRIPS) range.last_strip = config.NUM_STRIPS - 1;
+    if (range.first_col > range.last_col or range.first_strip > range.last_strip) return null;
+    return range;
 }
 
-fn rgb_tile_range(tl_shared: *const TLSharedData, tri: *const RenderTriangle, fc: *i32, lc: *i32, fs: *i32, ls: *i32) bool {
-    return screen_tile_range(tri.v0.x, tri.v1.x, tri.v2.x, tri.v0.y, tri.v1.y, tri.v2.y, tl_shared.screen_width, tl_shared.screen_height, fc, lc, fs, ls);
+fn rgb_tile_range(tl_shared: *const TLSharedData, tri: *const RenderTriangle) ?TileRange {
+    return screen_tile_range(tri.v0.x, tri.v1.x, tri.v2.x, tri.v0.y, tri.v1.y, tri.v2.y, tl_shared.screen_width, tl_shared.screen_height);
 }
 
-fn shadow_tile_range(tri: *const RenderTriangle, fc: *i32, lc: *i32, fs: *i32, ls: *i32) bool {
+fn shadow_tile_range(tri: *const RenderTriangle) ?TileRange {
     var sv0: ShadowVertex = undefined;
     var sv1: ShadowVertex = undefined;
     var sv2: ShadowVertex = undefined;
     if (!shadow.shadow_vertex_from_varying(&tri.v0, &sv0) or
         !shadow.shadow_vertex_from_varying(&tri.v1, &sv1) or
-        !shadow.shadow_vertex_from_varying(&tri.v2, &sv2)) return false;
-    return screen_tile_range(sv0.x, sv1.x, sv2.x, sv0.y, sv1.y, sv2.y, config.SHADOW_MAP_SIZE, config.SHADOW_MAP_SIZE, fc, lc, fs, ls);
+        !shadow.shadow_vertex_from_varying(&tri.v2, &sv2)) return null;
+    return screen_tile_range(sv0.x, sv1.x, sv2.x, sv0.y, sv1.y, sv2.y, config.SHADOW_MAP_SIZE, config.SHADOW_MAP_SIZE);
 }
 
 fn compute_vertex_color(v: *const Vertex3D, tl_shared: *const TLSharedData, base_color: Vec3) Vec3 {
@@ -103,7 +119,7 @@ fn compute_vertex_color(v: *const Vertex3D, tl_shared: *const TLSharedData, base
     return illumination.cwiseProduct(base_color);
 }
 
-fn add_triangle(tl_shared: *const TLSharedData, output: *buffers.TLThreadOutput, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, inst_texture: anytype, inst_type: i32, ground_sort_bias: f32, debug_unlit_red: bool, shadow_backface: bool) void {
+fn add_triangle(tl_shared: *const TLSharedData, output: *buffers.TLThreadOutput, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, inst_texture: anytype, inst_type: scene.InstanceType, ground_sort_bias: f32, debug_unlit_red: bool, shadow_backface: bool) void {
     var tri = RenderTriangle{};
     tri.v0 = v0;
     tri.v1 = v1;
@@ -116,34 +132,23 @@ fn add_triangle(tl_shared: *const TLSharedData, output: *buffers.TLThreadOutput,
     tri.rgb_setup = draw.build_raster_triangle_setup(&v0, &v1, &v2, tl_shared.screen_width, tl_shared.screen_height);
     if (!tri.rgb_setup.valid) return;
 
-    var first_col: i32 = 0;
-    var last_col: i32 = -1;
-    var first_strip: i32 = 0;
-    var last_strip: i32 = -1;
-    const use_strip_bins = rgb_tile_range(tl_shared, &tri, &first_col, &last_col, &first_strip, &last_strip) and
-        ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4;
-
+    const transparent = inst_type == .torus;
+    const bins = if (transparent) output.trans_bins else output.opaque_bins;
     const NS = config.NUM_STRIPS;
-    if (inst_type == 2) {
-        if (use_strip_bins) {
-            var cc = first_col;
-            while (cc <= last_col) : (cc += 1) {
-                var s = first_strip;
-                while (s <= last_strip) : (s += 1) output.trans_bins[@intCast(cc * NS + s)].append(tri) catch unreachable;
+    if (rgb_tile_range(tl_shared, &tri)) |rg| {
+        if (rg.bin_count() <= 4) {
+            var cc = rg.first_col;
+            while (cc <= rg.last_col) : (cc += 1) {
+                var s = rg.first_strip;
+                while (s <= rg.last_strip) : (s += 1) bins[@intCast(cc * NS + s)].append(tri) catch unreachable;
             }
-        } else {
-            output.trans.append(tri) catch unreachable;
+            return;
         }
+    }
+    if (transparent) {
+        output.trans.append(tri) catch unreachable;
     } else {
-        if (use_strip_bins) {
-            var cc = first_col;
-            while (cc <= last_col) : (cc += 1) {
-                var s = first_strip;
-                while (s <= last_strip) : (s += 1) output.opaque_bins[@intCast(cc * NS + s)].append(tri) catch unreachable;
-            }
-        } else {
-            output.opaque_list.append(tri) catch unreachable;
-        }
+        output.opaque_list.append(tri) catch unreachable;
     }
 }
 
@@ -178,27 +183,23 @@ fn emit_shadow_triangle(tl_shared: *const TLSharedData, output: *buffers.TLThrea
     } else {
         shadow_tri.sort_z = 1.0;
     }
-    var first_col: i32 = 0;
-    var last_col: i32 = -1;
-    var first_strip: i32 = 0;
-    var last_strip: i32 = -1;
     const NS = config.NUM_STRIPS;
-    if (shadow_tile_range(&shadow_tri, &first_col, &last_col, &first_strip, &last_strip) and
-        ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4)
-    {
-        var cc = first_col;
-        while (cc <= last_col) : (cc += 1) {
-            var s = first_strip;
-            while (s <= last_strip) : (s += 1) output.shadow_bins[@intCast(cc * NS + s)].append(shadow_tri) catch unreachable;
+    if (shadow_tile_range(&shadow_tri)) |rg| {
+        if (rg.bin_count() <= 4) {
+            var cc = rg.first_col;
+            while (cc <= rg.last_col) : (cc += 1) {
+                var s = rg.first_strip;
+                while (s <= rg.last_strip) : (s += 1) output.shadow_bins[@intCast(cc * NS + s)].append(shadow_tri) catch unreachable;
+            }
+            return;
         }
-    } else {
-        output.shadow.append(shadow_tri) catch unreachable;
     }
+    output.shadow.append(shadow_tri) catch unreachable;
 }
 
 pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererContext, current_frame: i32) void {
-    const output = &ctx.tl_thread_outputs.?.items[@intCast(worker_id)];
-    const tl_shared = ctx.tl_shared.?;
+    const output = &ctx.tl_thread_outputs.items[@intCast(worker_id)];
+    const tl_shared = ctx.tl_shared;
 
     const work_start_ts = platform.PerfCounter();
     const work_start_cpu_ns = platform.ThreadCpuNs();
@@ -206,14 +207,10 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     output.opaque_list.clearRetainingCapacity();
     output.trans.clearRetainingCapacity();
     output.shadow.clearRetainingCapacity();
-    {
-        var s: usize = 0;
-        const nb: usize = @intCast(config.NUM_TILE_BINS);
-        while (s < nb) : (s += 1) {
-            output.opaque_bins[s].clearRetainingCapacity();
-            output.trans_bins[s].clearRetainingCapacity();
-            output.shadow_bins[s].clearRetainingCapacity();
-        }
+    for (output.opaque_bins, output.trans_bins, output.shadow_bins) |*ob, *tb, *sb| {
+        ob.clearRetainingCapacity();
+        tb.clearRetainingCapacity();
+        sb.clearRetainingCapacity();
     }
 
     const num_instances: i32 = @intCast(tl_shared.sorted_instances.?.items.len);
@@ -227,7 +224,6 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     const clip_space_vertices = &output.clip_scratch;
 
     const pose_snapshot = tl_shared.pose_snapshot.?;
-    const NS = config.NUM_STRIPS;
 
     var i = start_idx;
     while (i < end_idx) : (i += 1) {
@@ -239,37 +235,37 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
         var src_faces: *const std.array_list.Managed(geom.Face) = undefined;
         var src_bound_radius: f32 = undefined;
         switch (inst.type) {
-            0 => {
+            .cube => {
                 src_vertices = tl_shared.cube_vertices.?;
                 src_faces = tl_shared.cube_faces.?;
                 src_bound_radius = ctx.cube_bound_radius;
             },
-            1 => {
+            .sphere => {
                 src_vertices = tl_shared.sphere_vertices.?;
                 src_faces = tl_shared.sphere_faces.?;
                 src_bound_radius = ctx.sphere_bound_radius;
             },
-            2 => {
+            .torus => {
                 src_vertices = tl_shared.torus_vertices.?;
                 src_faces = tl_shared.torus_faces.?;
                 src_bound_radius = ctx.torus_bound_radius;
             },
-            3 => {
+            .teapot => {
                 src_vertices = tl_shared.teapot_vertices.?;
                 src_faces = tl_shared.teapot_faces.?;
                 src_bound_radius = ctx.teapot_bound_radius;
             },
-            4 => {
+            .smallball => {
                 src_vertices = tl_shared.smallball_vertices.?;
                 src_faces = tl_shared.smallball_faces.?;
                 src_bound_radius = ctx.smallball_bound_radius;
             },
-            6 => {
+            .lamp => {
                 src_vertices = tl_shared.lamp_vertices.?;
                 src_faces = tl_shared.lamp_faces.?;
                 src_bound_radius = ctx.lamp_bound_radius;
             },
-            else => {
+            .ground => {
                 src_vertices = tl_shared.ground_vertices.?;
                 src_faces = tl_shared.ground_faces.?;
                 src_bound_radius = ctx.ground_bound_radius;
@@ -308,7 +304,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
             cull.sphere_intersects_spotlight_frustum_eye(center_eye3, src_bound_radius, tl_shared.light_pos, tl_shared.spot_dir, tl_shared.spot_outer_cos, tl_shared.shadow_near, tl_shared.shadow_far);
 
         var small_ball_camera_occluded = false;
-        if (inst.type == 4 and tl_shared.occluders_eye != null and (camera_visible or shadow_visible)) {
+        if (inst.type == .smallball and tl_shared.occluders_eye != null and (camera_visible or shadow_visible)) {
             const occluders = tl_shared.occluders_eye.?;
             var cam_occ = !camera_visible;
             var shd_occ = !shadow_visible;
@@ -346,12 +342,10 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
         clip.transform_vertices(src_vertices, eye_space_vertices, &mv);
 
         if (camera_visible and !needs_near_clip) {
-            const nv = eye_space_vertices.items.len;
-            clip_space_vertices.resize(nv) catch unreachable;
-            var vi: usize = 0;
-            while (vi < nv) : (vi += 1) {
-                clip_space_vertices.items[vi] = eye_space_vertices.items[vi];
-                clip_space_vertices.items[vi].position = tl_shared.projection.mulVec4(eye_space_vertices.items[vi].position);
+            clip_space_vertices.resize(eye_space_vertices.items.len) catch unreachable;
+            for (clip_space_vertices.items, eye_space_vertices.items) |*cv, ev| {
+                cv.* = ev;
+                cv.position = tl_shared.projection.mulVec4(ev.position);
             }
         }
 
@@ -359,7 +353,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
             const v0_eye = &eye_space_vertices.items[@intCast(face.v0)];
             const v1_eye = &eye_space_vertices.items[@intCast(face.v1)];
             const v2_eye = &eye_space_vertices.items[@intCast(face.v2)];
-            const base_color = if (inst.texture == null and inst.type != 6)
+            const base_color = if (inst.texture == null and inst.type != .lamp)
                 Vec3.init(inst.color_r, inst.color_g, inst.color_b)
             else
                 Vec3.init(face.r, face.g, face.b);
@@ -378,7 +372,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
             const shadow_backface = face_normal.dot(shadow_light_vec) < 0.0;
 
             var cone_culled = false;
-            if (tl_shared.use_spotlight and shadow_visible and shadow_backface and inst.type != 5) {
+            if (tl_shared.use_spotlight and shadow_visible and shadow_backface and inst.type != .ground) {
                 const Lp = tl_shared.light_pos;
                 const D = tl_shared.spot_dir;
                 const co = tl_shared.spot_outer_cos;
@@ -414,8 +408,8 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
             }
 
             if (!camera_visible) continue;
-            const debug_unlit_red = config.DEBUG_DRAW_CAMERA_OCCLUDED_RED and inst.type == 4 and small_ball_camera_occluded;
-            const ground_sort_bias: f32 = if (inst.type == 5) 1.0e6 else 0.0;
+            const debug_unlit_red = config.DEBUG_DRAW_CAMERA_OCCLUDED_RED and inst.type == .smallball and small_ball_camera_occluded;
+            const ground_sort_bias: f32 = if (inst.type == .ground) 1.0e6 else 0.0;
 
             if (!needs_near_clip) {
                 if (clip.is_back_face(v0_eye, v1_eye, v2_eye)) continue;
@@ -482,7 +476,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
                 if (clipped_count < 3) continue;
 
                 const emit = struct {
-                    fn f(tls: *const TLSharedData, out: *buffers.TLThreadOutput, a: ClipVertex, b: ClipVertex, c: ClipVertex, tex2: anytype, itype: i32, gbias: f32, dred: bool, sbf: bool) void {
+                    fn f(tls: *const TLSharedData, out: *buffers.TLThreadOutput, a: ClipVertex, b: ClipVertex, c: ClipVertex, tex2: anytype, itype: scene.InstanceType, gbias: f32, dred: bool, sbf: bool) void {
                         if (clip.is_back_face_clip_vertices(&a, &b, &c)) return;
                         const p0 = clip.project_clip_vertex(&a, &tls.projection, &tls.shadow_matrix, tls.screen_width, tls.screen_height);
                         const p1 = clip.project_clip_vertex(&b, &tls.projection, &tls.shadow_matrix, tls.screen_width, tls.screen_height);
@@ -499,7 +493,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     const sort_start_ts = platform.PerfCounter();
     const sort_start_cpu_ns = platform.ThreadCpuNs();
     const per_instance_cpu_ns = if (sort_start_cpu_ns > work_start_cpu_ns) sort_start_cpu_ns - work_start_cpu_ns else 0;
-    profiler.profiler_record_tl(ctx.profiler.?, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns, @intFromEnum(TLJobTag.PerInstance));
+    profiler.profiler_record_tl(ctx.profiler, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns, @intFromEnum(TLJobTag.PerInstance));
 
     // Initial sort of freshly-emitted (unsorted) triangles. This is C++'s
     // std::sort site. Rather than sort the ~480-byte RenderTriangle structs in
@@ -511,24 +505,20 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     if (config.ENABLE_RGB_TRIANGLE_SORT) {
         keysort.sortByKey(RenderTriangle, output.opaque_list.items, true, ks, gb, triSortZ);
         keysort.sortByKey(RenderTriangle, output.trans.items, false, ks, gb, triSortZ);
-        var s: usize = 0;
-        const nb: usize = @intCast(config.NUM_TILE_BINS);
-        while (s < nb) : (s += 1) {
-            keysort.sortByKey(RenderTriangle, output.opaque_bins[s].items, true, ks, gb, triSortZ);
-            keysort.sortByKey(RenderTriangle, output.trans_bins[s].items, false, ks, gb, triSortZ);
+        for (output.opaque_bins, output.trans_bins) |ob, tb| {
+            keysort.sortByKey(RenderTriangle, ob.items, true, ks, gb, triSortZ);
+            keysort.sortByKey(RenderTriangle, tb.items, false, ks, gb, triSortZ);
         }
     }
     if (config.ENABLE_SHADOW_TRIANGLE_SORT) {
         keysort.sortByKey(RenderTriangle, output.shadow.items, true, ks, gb, triSortZ);
-        var s: usize = 0;
-        const nb: usize = @intCast(config.NUM_TILE_BINS);
-        while (s < nb) : (s += 1) keysort.sortByKey(RenderTriangle, output.shadow_bins[s].items, true, ks, gb, triSortZ);
+        for (output.shadow_bins) |sb| keysort.sortByKey(RenderTriangle, sb.items, true, ks, gb, triSortZ);
     }
 
     const phase1_end_ts = platform.PerfCounter();
     const phase1_end_cpu_ns = platform.ThreadCpuNs();
     const local_sort_cpu_ns = if (phase1_end_cpu_ns > sort_start_cpu_ns) phase1_end_cpu_ns - sort_start_cpu_ns else 0;
-    profiler.profiler_record_tl(ctx.profiler.?, worker_id, sort_start_ts, phase1_end_ts, local_sort_cpu_ns, @intFromEnum(TLJobTag.LocalSort));
+    profiler.profiler_record_tl(ctx.profiler, worker_id, sort_start_ts, phase1_end_ts, local_sort_cpu_ns, @intFromEnum(TLJobTag.LocalSort));
 
     if (worker_id == 0) {
         if (tl_shared.cone_buf_write) |cone_buf| {
@@ -539,7 +529,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
                 const cone_end_ts = platform.PerfCounter();
                 const cone_end_cpu_ns = platform.ThreadCpuNs();
                 const cone_cpu_ns = if (cone_end_cpu_ns > cone_start_cpu_ns) cone_end_cpu_ns - cone_start_cpu_ns else 0;
-                profiler.profiler_record_tl(ctx.profiler.?, worker_id, cone_start_ts, cone_end_ts, cone_cpu_ns, @intFromEnum(TLJobTag.Spotlight));
+                profiler.profiler_record_tl(ctx.profiler, worker_id, cone_start_ts, cone_end_ts, cone_cpu_ns, @intFromEnum(TLJobTag.Spotlight));
             } else {
                 cone_buf.valid = false;
             }
@@ -551,9 +541,9 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
     const phase2_start_cpu_ns = platform.ThreadCpuNs();
 
     const tl_buf_idx: usize = @intCast(@mod(current_frame, 2));
-    const opaque_strip = &ctx.opaque_strip_buffers.?[tl_buf_idx];
-    const trans_strip = &ctx.trans_strip_buffers.?[tl_buf_idx];
-    const shadow_strip = &ctx.shadow_strip_buffers.?[tl_buf_idx];
+    const opaque_strip = &ctx.opaque_strip_buffers[tl_buf_idx];
+    const trans_strip = &ctx.trans_strip_buffers[tl_buf_idx];
+    const shadow_strip = &ctx.shadow_strip_buffers[tl_buf_idx];
 
     const append_bin = struct {
         fn f(dst: *RenderTriangleList, src: []const RenderTriangle, keep_sorted: bool, scratch: *RenderTriangleList, comptime less: fn (void, RenderTriangle, RenderTriangle) bool) void {
@@ -583,7 +573,6 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
         if (src_opaque.items.len == 0 and src_trans.items.len == 0 and src_shadow.items.len == 0) continue;
         threading.tile_bin_locks[su].lock();
         defer threading.tile_bin_locks[su].unlock();
-        _ = NS;
         append_bin(&opaque_strip.bins[su], src_opaque.items, config.ENABLE_RGB_TRIANGLE_SORT, &output.merge_scratch, lessZ);
         append_bin(&trans_strip.bins[su], src_trans.items, config.ENABLE_RGB_TRIANGLE_SORT, &output.merge_scratch, greaterZ);
         append_bin(&shadow_strip.bins[su], src_shadow.items, config.ENABLE_SHADOW_TRIANGLE_SORT, &output.merge_scratch, lessZ);
@@ -591,7 +580,7 @@ pub fn tl_worker_frame(worker_id: i32, active_tl_threads: i32, ctx: *RendererCon
 
     const phase2_end_cpu_ns = platform.ThreadCpuNs();
     const phase2_cpu_ns = if (phase2_end_cpu_ns > phase2_start_cpu_ns) phase2_end_cpu_ns - phase2_start_cpu_ns else 0;
-    profiler.profiler_record_tl(ctx.profiler.?, worker_id, phase2_start_ts, platform.PerfCounter(), phase2_cpu_ns, @intFromEnum(TLJobTag.BinMerge));
+    profiler.profiler_record_tl(ctx.profiler, worker_id, phase2_start_ts, platform.PerfCounter(), phase2_cpu_ns, @intFromEnum(TLJobTag.BinMerge));
 
     if (threading.tl_done_counter.fetchAdd(1, .release) + 1 >= active_tl_threads) {
         threading.mtx_main.lock();

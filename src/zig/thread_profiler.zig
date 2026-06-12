@@ -8,7 +8,6 @@ const threading = @import("threading.zig");
 const config = @import("render_config.zig");
 const sync = @import("sync.zig");
 
-const Uint64 = platform.Uint64;
 const PixelFormat = platform.PixelFormat;
 const Pixel32 = config.Pixel32;
 const RasterJobMode = threading.RasterJobMode;
@@ -16,15 +15,15 @@ const RasterJobMode = threading.RasterJobMode;
 pub const TLJobTag = enum(u8) { PerInstance = 0, Spotlight = 1, BinMerge = 2, LocalSort = 3 };
 
 pub const ProfilerInterval = struct {
-    start_ts: Uint64,
-    end_ts: Uint64,
-    cpu_ns: Uint64 = 0,
+    start_ts: u64,
+    end_ts: u64,
+    cpu_ns: u64 = 0,
     tag: u8 = 0,
 };
 
 pub const PresentBlit = struct {
-    start_ts: Uint64 = 0,
-    end_ts: Uint64 = 0,
+    start_ts: u64 = 0,
+    end_ts: u64 = 0,
 };
 
 const IntervalList = std.array_list.Managed(ProfilerInterval);
@@ -32,9 +31,9 @@ const IntervalList = std.array_list.Managed(ProfilerInterval);
 pub const ThreadProfiler = struct {
     enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     frozen: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    frozen_blit_start_ts: Uint64 = 0,
-    frozen_blit_end_ts: Uint64 = 0,
-    frozen_draw_end_ts: Uint64 = 0,
+    frozen_blit_start_ts: u64 = 0,
+    frozen_blit_end_ts: u64 = 0,
+    frozen_draw_end_ts: u64 = 0,
 
     present_history: [2]PresentBlit = [_]PresentBlit{.{}} ** 2,
 
@@ -47,11 +46,11 @@ pub const ThreadProfiler = struct {
     tl_intervals_prev: []IntervalList = &.{},
     raster_intervals_prev: []IntervalList = &.{},
     physics_intervals_prev: IntervalList = undefined,
-    prev_blit_start_ts: Uint64 = 0,
-    prev_blit_end_ts: Uint64 = 0,
-    prev_draw_end_ts: Uint64 = 0,
+    prev_blit_start_ts: u64 = 0,
+    prev_blit_end_ts: u64 = 0,
+    prev_draw_end_ts: u64 = 0,
 
-    last_draw_end_ts: Uint64 = 0,
+    last_draw_end_ts: u64 = 0,
 
     right_margin_px: i32 = 40,
     left_margin_px: i32 = 40,
@@ -62,7 +61,7 @@ pub const ThreadProfiler = struct {
 };
 
 fn allocIntervalLists(alloc: std.mem.Allocator, n: usize) []IntervalList {
-    const lists = alloc.alloc(IntervalList, n) catch unreachable;
+    const lists = alloc.alloc(IntervalList, n) catch @panic("profiler: out of memory");
     for (lists) |*l| l.* = IntervalList.init(alloc);
     return lists;
 }
@@ -96,23 +95,23 @@ pub fn thread_profiler_begin_frame(p: *ThreadProfiler) void {
     for (p.raster_intervals) |*v| v.clearRetainingCapacity();
 }
 
-pub fn profiler_record_tl(p: *ThreadProfiler, thread_id: i32, start: Uint64, end: Uint64, cpu_ns: Uint64, tag: u8) void {
+pub fn profiler_record_tl(p: *ThreadProfiler, thread_id: i32, start: u64, end: u64, cpu_ns: u64, tag: u8) void {
     if (!p.enabled.load(.monotonic)) return;
     if (p.frozen.load(.monotonic)) return;
     if (@as(usize, @intCast(thread_id)) < p.tl_intervals.len) {
-        p.tl_intervals[@intCast(thread_id)].append(.{ .start_ts = start, .end_ts = end, .cpu_ns = cpu_ns, .tag = tag }) catch {};
+        p.tl_intervals[@intCast(thread_id)].append(.{ .start_ts = start, .end_ts = end, .cpu_ns = cpu_ns, .tag = tag }) catch return;
     }
 }
 
-pub fn profiler_record_raster(p: *ThreadProfiler, thread_id: i32, start: Uint64, end: Uint64, cpu_ns: Uint64, tag: u8) void {
+pub fn profiler_record_raster(p: *ThreadProfiler, thread_id: i32, start: u64, end: u64, cpu_ns: u64, tag: u8) void {
     if (!p.enabled.load(.monotonic)) return;
     if (p.frozen.load(.monotonic)) return;
     if (@as(usize, @intCast(thread_id)) < p.raster_intervals.len) {
-        p.raster_intervals[@intCast(thread_id)].append(.{ .start_ts = start, .end_ts = end, .cpu_ns = cpu_ns, .tag = tag }) catch {};
+        p.raster_intervals[@intCast(thread_id)].append(.{ .start_ts = start, .end_ts = end, .cpu_ns = cpu_ns, .tag = tag }) catch return;
     }
 }
 
-pub fn profiler_record_physics(p: *ThreadProfiler, start: Uint64, end: Uint64, cpu_ns: Uint64) void {
+pub fn profiler_record_physics(p: *ThreadProfiler, start: u64, end: u64, cpu_ns: u64) void {
     if (!p.enabled.load(.monotonic)) return;
     if (p.frozen.load(.monotonic)) return;
     p.physics_mtx.lock();
@@ -159,13 +158,13 @@ fn tl_color_for(format: *const PixelFormat, tag: u8) u32 {
     };
 }
 
-pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surface_w: i32, surface_h: i32, format: ?*PixelFormat, draw_end_ts: Uint64) void {
+pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surface_w: i32, surface_h: i32, format: ?*PixelFormat, draw_end_ts: u64) void {
     if (!p.enabled.load(.monotonic)) return;
     const fmt = format orelse return;
 
-    var blit_start_ts: Uint64 = undefined;
-    var blit_end_ts: Uint64 = undefined;
-    var orange_ts: Uint64 = undefined;
+    var blit_start_ts: u64 = undefined;
+    var blit_end_ts: u64 = undefined;
+    var orange_ts: u64 = undefined;
     if (p.frozen.load(.monotonic)) {
         blit_start_ts = p.frozen_blit_start_ts;
         blit_end_ts = p.frozen_blit_end_ts;
@@ -201,19 +200,15 @@ pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surfa
         }
     }.f;
     var active_worker_count: i32 = 0;
-    {
-        var i: i32 = 0;
-        while (i < num_workers) : (i += 1) {
-            if (worker_has_work(p, @intCast(i))) active_worker_count += 1;
-        }
+    for (0..@intCast(num_workers)) |i| {
+        if (worker_has_work(p, i)) active_worker_count += 1;
     }
 
-    var physics_has_work: bool = undefined;
-    {
+    const physics_has_work = blk: {
         p.physics_mtx.lock();
-        physics_has_work = p.physics_intervals.items.len != 0 or p.physics_intervals_prev.items.len != 0;
-        p.physics_mtx.unlock();
-    }
+        defer p.physics_mtx.unlock();
+        break :blk p.physics_intervals.items.len != 0 or p.physics_intervals_prev.items.len != 0;
+    };
 
     const total_lanes = (if (physics_has_work) @as(i32, 1) else 0) + active_worker_count;
     if (total_lanes == 0) return;
@@ -237,8 +232,10 @@ pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surfa
         }
     }
 
+    // One lane painter for all three interval kinds: a flat color when given
+    // (physics), otherwise per-tag raster/TL palettes.
     const draw_lane = struct {
-        fn f(pp: *ThreadProfiler, pix: [*]u8, pit: i32, lane_index: i32, intervals: []const ProfilerInterval, lts: Uint64, ledge: i32, redge: i32, sw: i32, sh: i32, is_raster: bool, format2: *const PixelFormat) void {
+        fn f(pp: *ThreadProfiler, pix: [*]u8, pit: i32, lane_index: i32, intervals: []const ProfilerInterval, lts: u64, ledge: i32, redge: i32, sw: i32, sh: i32, is_raster: bool, flat_color: ?u32, format2: *const PixelFormat) void {
             const y0 = pp.top_y + lane_index * (pp.lane_height_px + pp.lane_gap_px);
             const y1 = y0 + pp.lane_height_px;
             for (intervals) |iv| {
@@ -253,7 +250,7 @@ pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surfa
                 if (x_start < ledge) x_start = ledge;
                 if (x_end > redge) x_end = redge;
                 if (x_start == x_end) x_end = x_start + 1;
-                const color = if (is_raster) raster_color_for(format2, iv.tag) else tl_color_for(format2, iv.tag);
+                const color = flat_color orelse if (is_raster) raster_color_for(format2, iv.tag) else tl_color_for(format2, iv.tag);
                 fill_rect(pix, pit, x_start, y0, x_end, y1, color, sw, sh);
             }
         }
@@ -265,40 +262,18 @@ pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surfa
         p.physics_mtx.lock();
         defer p.physics_mtx.unlock();
         const physics_color = pixel.pack_rgb_fast(fmt, 255, 64, 64);
-        const phys_lane = struct {
-            fn f(pix: [*]u8, pit: i32, pp: *ThreadProfiler, lane_index: i32, intervals: []const ProfilerInterval, lts: Uint64, ledge: i32, redge: i32, sw: i32, sh: i32, color: u32) void {
-                const y0 = pp.top_y + lane_index * (pp.lane_height_px + pp.lane_gap_px);
-                const y1 = y0 + pp.lane_height_px;
-                for (intervals) |iv| {
-                    const ms_start = threading.perf_ms(lts, iv.start_ts);
-                    var cpu_ms = if (iv.cpu_ns > 0) @as(f64, @floatFromInt(iv.cpu_ns)) * 1.0e-6 else threading.perf_ms(iv.start_ts, iv.end_ts);
-                    const wall_ms = threading.perf_ms(iv.start_ts, iv.end_ts);
-                    if (cpu_ms > wall_ms) cpu_ms = wall_ms;
-                    var x_start = ledge + @as(i32, @intFromFloat(ms_start * pp.pixels_per_ms));
-                    var x_end = ledge + @as(i32, @intFromFloat((ms_start + cpu_ms) * pp.pixels_per_ms));
-                    if (x_end <= ledge) continue;
-                    if (x_start >= redge) continue;
-                    if (x_start < ledge) x_start = ledge;
-                    if (x_end > redge) x_end = redge;
-                    if (x_start == x_end) x_end = x_start + 1;
-                    fill_rect(pix, pit, x_start, y0, x_end, y1, color, sw, sh);
-                }
-            }
-        }.f;
-        if (have_prev_frame) phys_lane(pixels, pitch, p, lane, p.physics_intervals_prev.items, left_ts, left_edge, right_edge, surface_w, surface_h, physics_color);
-        phys_lane(pixels, pitch, p, lane, p.physics_intervals.items, left_ts, left_edge, right_edge, surface_w, surface_h, physics_color);
+        if (have_prev_frame) draw_lane(p, pixels, pitch, lane, p.physics_intervals_prev.items, left_ts, left_edge, right_edge, surface_w, surface_h, false, physics_color, fmt);
+        draw_lane(p, pixels, pitch, lane, p.physics_intervals.items, left_ts, left_edge, right_edge, surface_w, surface_h, false, physics_color, fmt);
         lane += 1;
     }
 
     {
-        var i: i32 = 0;
-        while (i < num_workers) : (i += 1) {
-            const ui: usize = @intCast(i);
+        for (0..@intCast(num_workers)) |ui| {
             if (!worker_has_work(p, ui)) continue;
-            if (have_prev_frame and ui < p.tl_intervals_prev.len) draw_lane(p, pixels, pitch, lane, p.tl_intervals_prev[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, false, fmt);
-            if (ui < p.tl_intervals.len) draw_lane(p, pixels, pitch, lane, p.tl_intervals[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, false, fmt);
-            if (have_prev_frame and ui < p.raster_intervals_prev.len) draw_lane(p, pixels, pitch, lane, p.raster_intervals_prev[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, true, fmt);
-            if (ui < p.raster_intervals.len) draw_lane(p, pixels, pitch, lane, p.raster_intervals[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, true, fmt);
+            if (have_prev_frame and ui < p.tl_intervals_prev.len) draw_lane(p, pixels, pitch, lane, p.tl_intervals_prev[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, false, null, fmt);
+            if (ui < p.tl_intervals.len) draw_lane(p, pixels, pitch, lane, p.tl_intervals[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, false, null, fmt);
+            if (have_prev_frame and ui < p.raster_intervals_prev.len) draw_lane(p, pixels, pitch, lane, p.raster_intervals_prev[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, true, null, fmt);
+            if (ui < p.raster_intervals.len) draw_lane(p, pixels, pitch, lane, p.raster_intervals[ui].items, left_ts, left_edge, right_edge, surface_w, surface_h, true, null, fmt);
             lane += 1;
         }
     }
@@ -306,7 +281,7 @@ pub fn thread_profiler_draw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surfa
     const purple_color = pixel.pack_rgb_fast(fmt, 220, 60, 220);
     const orange_color = pixel.pack_rgb_fast(fmt, 255, 150, 20);
     const draw_marker_at = struct {
-        fn f(pix: [*]u8, pit: i32, pp: *ThreadProfiler, ts: Uint64, color: u32, lts: Uint64, ledge: i32, redge: i32, py0: i32, py1: i32, sw: i32, sh: i32) void {
+        fn f(pix: [*]u8, pit: i32, pp: *ThreadProfiler, ts: u64, color: u32, lts: u64, ledge: i32, redge: i32, py0: i32, py1: i32, sw: i32, sh: i32) void {
             const ms = threading.perf_ms(lts, ts);
             var x = ledge + @as(i32, @intFromFloat(ms * pp.pixels_per_ms));
             if (x < ledge) x = ledge;

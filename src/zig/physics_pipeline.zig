@@ -12,7 +12,6 @@ const sync = @import("sync.zig");
 
 const Vec3 = jolt.Vec3;
 const Quat = jolt.Quat;
-const Uint64 = platform.Uint64;
 const PoseSnapshot = buffers.PoseSnapshot;
 const CubeInstance = scene.CubeInstance;
 const WallData = scene.WallData;
@@ -189,9 +188,9 @@ pub fn physics_worker_thread(pp: *PhysicsPipeline) void {
         pp.published_sequence.store(@truncate(sequence), .release);
         {
             pp.mtx.lock();
+            defer pp.mtx.unlock();
             pp.job_active = false;
             pp.idle_cv.broadcast();
-            pp.mtx.unlock();
         }
     }
 }

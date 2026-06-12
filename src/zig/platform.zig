@@ -14,10 +14,6 @@ const sync = @import("sync.zig");
 // call). We link libc, so the C runtime functions are always available.
 extern fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 
-pub const Uint8 = u8;
-pub const Uint32 = u32;
-pub const Uint64 = u64;
-
 pub const PixelFormat = extern struct {
     BytesPerPixel: c_int = 0,
     Rloss: u8 = 0,
@@ -68,42 +64,30 @@ const mac = if (is_mac) @import("platform_mac.zig") else struct {};
 // ===========================================================================
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
-pub fn ThreadCpuNs() Uint64 {
+pub fn ThreadCpuNs() u64 {
     var ts: std.c.timespec = undefined;
     // CLOCK_THREAD_CPUTIME_ID: CPU time consumed by the calling thread.
     if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
-    return @as(Uint64, @intCast(ts.sec)) * 1_000_000_000 + @as(Uint64, @intCast(ts.nsec));
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 // ===========================================================================
 //  Shared: portable BMP loader (24/32 bpp uncompressed -> RGBA8)
 // ===========================================================================
-var g_bmp_rgba_format: PixelFormat = .{};
-var g_bmp_format_inited = false;
-
-fn ensure_bmp_format() void {
-    if (g_bmp_format_inited) return;
-    g_bmp_rgba_format = .{};
-    g_bmp_rgba_format.BytesPerPixel = 4;
-    g_bmp_rgba_format.Rshift = 0;
-    g_bmp_rgba_format.Gshift = 8;
-    g_bmp_rgba_format.Bshift = 16;
-    g_bmp_rgba_format.Rmask = 0x000000ff;
-    g_bmp_rgba_format.Gmask = 0x0000ff00;
-    g_bmp_rgba_format.Bmask = 0x00ff0000;
-    g_bmp_rgba_format.Amask = 0xff000000;
-    g_bmp_format_inited = true;
-}
-
-inline fn rd16(p: [*]const u8) u16 {
-    return @as(u16, p[0]) | (@as(u16, p[1]) << 8);
-}
-inline fn rd32(p: [*]const u8) u32 {
-    return @as(u32, p[0]) | (@as(u32, p[1]) << 8) | (@as(u32, p[2]) << 16) | (@as(u32, p[3]) << 24);
-}
+// All loaded surfaces share this one format descriptor (var, not const: a
+// Surface holds a mutable *PixelFormat).
+var bmp_rgba_format: PixelFormat = .{
+    .BytesPerPixel = 4,
+    .Rshift = 0,
+    .Gshift = 8,
+    .Bshift = 16,
+    .Rmask = 0x000000ff,
+    .Gmask = 0x0000ff00,
+    .Bmask = 0x00ff0000,
+    .Amask = 0xff000000,
+};
 
 pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
-    ensure_bmp_format();
     const alloc = std.heap.c_allocator;
     const file = std.c.fopen(path, "rb") orelse return null;
     defer _ = std.c.fclose(file);
@@ -111,13 +95,13 @@ pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
     var header: [54]u8 = undefined;
     const n = std.c.fread(&header, 1, 54, file);
     if (n != 54 or header[0] != 'B' or header[1] != 'M') return null;
-    const data_off = rd32(header[10..].ptr);
-    if (rd32(header[14..].ptr) < 40) return null;
-    const width: i32 = @bitCast(rd32(header[18..].ptr));
-    const h_signed: i32 = @bitCast(rd32(header[22..].ptr));
-    const planes = rd16(header[26..].ptr);
-    const bpp = rd16(header[28..].ptr);
-    const compr = rd32(header[30..].ptr);
+    const data_off = std.mem.readInt(u32, header[10..14], .little);
+    if (std.mem.readInt(u32, header[14..18], .little) < 40) return null;
+    const width: i32 = @bitCast(std.mem.readInt(u32, header[18..22], .little));
+    const h_signed: i32 = @bitCast(std.mem.readInt(u32, header[22..26], .little));
+    const planes = std.mem.readInt(u16, header[26..28], .little);
+    const bpp = std.mem.readInt(u16, header[28..30], .little);
+    const compr = std.mem.readInt(u32, header[30..34], .little);
     if (width <= 0 or h_signed == 0 or planes != 1 or (bpp != 24 and bpp != 32) or compr != 0) return null;
     const height: i32 = if (h_signed < 0) -h_signed else h_signed;
     const top_down = h_signed < 0;
@@ -125,22 +109,29 @@ pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
 
     const row = alloc.alloc(u8, src_stride) catch return null;
     defer alloc.free(row);
-    const px_len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
-    const px = alloc.alloc(u8, px_len) catch return null;
-    defer alloc.free(px);
 
     if (fseek(file, @intCast(data_off), 0) != 0) return null;
+
+    // Decode straight into the malloc'd pixel buffer the Surface will own
+    // (FreeSurface releases it with free(), so it must come from malloc).
+    const px_len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
+    const pix = std.c.malloc(px_len) orelse return null;
+    const px = @as([*]u8, @ptrCast(pix))[0..px_len];
+
     var sy: i32 = 0;
     const bytes_pp: usize = @intCast(bpp / 8);
     while (sy < height) : (sy += 1) {
         const got = std.c.fread(row.ptr, 1, src_stride, file);
-        if (got != src_stride) return null;
+        if (got != src_stride) {
+            std.c.free(pix);
+            return null;
+        }
         const dy: i32 = if (top_down) sy else (height - 1 - sy);
         const d = px[@as(usize, @intCast(dy)) * @as(usize, @intCast(width)) * 4 ..];
-        var x: i32 = 0;
-        while (x < width) : (x += 1) {
-            const s = row[@as(usize, @intCast(x)) * bytes_pp ..];
-            const di = @as(usize, @intCast(x)) * 4;
+        var x: usize = 0;
+        while (x < @as(usize, @intCast(width))) : (x += 1) {
+            const s = row[x * bytes_pp ..];
+            const di = x * 4;
             d[di + 0] = s[2]; // R (BMP is BGR)
             d[di + 1] = s[1]; // G
             d[di + 2] = s[0]; // B
@@ -148,18 +139,16 @@ pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
         }
     }
 
-    const surf: *Surface = @ptrCast(@alignCast(std.c.malloc(@sizeOf(Surface)) orelse return null));
+    const surf: *Surface = @ptrCast(@alignCast(std.c.malloc(@sizeOf(Surface)) orelse {
+        std.c.free(pix);
+        return null;
+    }));
     surf.* = .{};
     surf.w = width;
     surf.h = height;
     surf.pitch = width * 4;
-    surf.format = &g_bmp_rgba_format;
+    surf.format = &bmp_rgba_format;
     surf.owns_pixels = true;
-    const pix = std.c.malloc(px_len) orelse {
-        std.c.free(surf);
-        return null;
-    };
-    @memcpy(@as([*]u8, @ptrCast(pix))[0..px_len], px);
     surf.pixels = pix;
     return surf;
 }
@@ -203,22 +192,22 @@ pub fn PollEvent(out: *Event) bool {
     if (is_web) return web.pollEvent(out);
     return false;
 }
-pub fn TicksMs() Uint64 {
+pub fn TicksMs() u64 {
     if (is_mac) return mac.TicksMs();
     if (is_web) return web.ticksMs();
     return @intCast(std.time.milliTimestamp());
 }
-pub fn PerfCounter() Uint64 {
+pub fn PerfCounter() u64 {
     if (is_mac) return mac.PerfCounter();
     if (is_web) return web.perfCounter();
     return @intCast(std.time.nanoTimestamp());
 }
-pub fn PerfFrequency() Uint64 {
+pub fn PerfFrequency() u64 {
     if (is_mac) return mac.PerfFrequency();
     if (is_web) return web.perfFrequency();
     return 1_000_000_000;
 }
-pub fn Delay(ms: Uint32) void {
+pub fn Delay(ms: u32) void {
     if (is_mac) return mac.Delay(ms);
     if (is_web) return web.delay(ms);
     std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
@@ -234,83 +223,83 @@ const web = struct {
     extern fn swr_js_setup_canvas(w: c_int, h: c_int) void;
     extern fn swr_js_present(ptr: [*]const u8, w: c_int, h: c_int) void;
 
-    var g_visible = true;
-    var g_fb_format: PixelFormat = .{};
-    var g_fb: Surface = .{};
-    var g_fb_pixels: []u32 = &[_]u32{};
+    var page_visible = true;
+    var fb_format: PixelFormat = .{};
+    var fb_surface: Surface = .{};
+    var fb_pixels: []u32 = &[_]u32{};
 
     const QueueLen = 256;
-    var g_event_mtx: sync.Mutex = .{};
-    var g_queue: [QueueLen]Event = undefined;
-    var g_q_head: usize = 0;
-    var g_q_tail: usize = 0;
+    var event_mtx: sync.Mutex = .{};
+    var event_queue: [QueueLen]Event = undefined;
+    var q_head: usize = 0;
+    var q_tail: usize = 0;
 
     fn push_event(ev: Event) void {
-        g_event_mtx.lock();
-        defer g_event_mtx.unlock();
-        const next = (g_q_tail + 1) % QueueLen;
-        if (next == g_q_head) return; // drop on overflow
-        g_queue[g_q_tail] = ev;
-        g_q_tail = next;
+        event_mtx.lock();
+        defer event_mtx.unlock();
+        const next = (q_tail + 1) % QueueLen;
+        if (next == q_head) return; // drop on overflow
+        event_queue[q_tail] = ev;
+        q_tail = next;
     }
 
     fn init(w: i32, h: i32, title: [*:0]const u8) bool {
         _ = title;
-        g_fb_format = .{};
-        g_fb_format.BytesPerPixel = 4;
-        g_fb_format.Rshift = 0;
-        g_fb_format.Gshift = 8;
-        g_fb_format.Bshift = 16;
-        g_fb_format.Rmask = 0x000000ff;
-        g_fb_format.Gmask = 0x0000ff00;
-        g_fb_format.Bmask = 0x00ff0000;
-        g_fb_format.Amask = 0xff000000;
-        g_fb = .{};
-        g_fb.w = w;
-        g_fb.h = h;
-        g_fb.pitch = w * 4;
+        fb_format = .{};
+        fb_format.BytesPerPixel = 4;
+        fb_format.Rshift = 0;
+        fb_format.Gshift = 8;
+        fb_format.Bshift = 16;
+        fb_format.Rmask = 0x000000ff;
+        fb_format.Gmask = 0x0000ff00;
+        fb_format.Bmask = 0x00ff0000;
+        fb_format.Amask = 0xff000000;
+        fb_surface = .{};
+        fb_surface.w = w;
+        fb_surface.h = h;
+        fb_surface.pitch = w * 4;
         const count: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h));
-        g_fb_pixels = std.heap.c_allocator.alloc(u32, count) catch return false;
-        @memset(g_fb_pixels, 0);
-        g_fb.pixels = g_fb_pixels.ptr;
-        g_fb.format = &g_fb_format;
+        fb_pixels = std.heap.c_allocator.alloc(u32, count) catch return false;
+        @memset(fb_pixels, 0);
+        fb_surface.pixels = fb_pixels.ptr;
+        fb_surface.format = &fb_format;
         swr_js_setup_canvas(w, h);
         return true;
     }
     fn shutdown() void {
-        if (g_fb_pixels.len > 0) std.heap.c_allocator.free(g_fb_pixels);
-        g_fb_pixels = &[_]u32{};
-        g_fb = .{};
+        if (fb_pixels.len > 0) std.heap.c_allocator.free(fb_pixels);
+        fb_pixels = &[_]u32{};
+        fb_surface = .{};
     }
     fn getFramebuffer() ?*Surface {
-        return &g_fb;
+        return &fb_surface;
     }
     fn present() void {
-        swr_js_present(@ptrCast(g_fb_pixels.ptr), g_fb.w, g_fb.h);
+        swr_js_present(@ptrCast(fb_pixels.ptr), fb_surface.w, fb_surface.h);
     }
     fn isRenderable() bool {
-        return g_visible;
+        return page_visible;
     }
     fn pollEvent(out: *Event) bool {
         out.* = .{};
-        g_event_mtx.lock();
-        defer g_event_mtx.unlock();
-        if (g_q_head == g_q_tail) return false;
-        out.* = g_queue[g_q_head];
-        g_q_head = (g_q_head + 1) % QueueLen;
+        event_mtx.lock();
+        defer event_mtx.unlock();
+        if (q_head == q_tail) return false;
+        out.* = event_queue[q_head];
+        q_head = (q_head + 1) % QueueLen;
         return true;
     }
-    fn ticksMs() Uint64 {
+    fn ticksMs() u64 {
         return @intFromFloat(emscripten_get_now());
     }
-    fn perfCounter() Uint64 {
+    fn perfCounter() u64 {
         return @intFromFloat(emscripten_get_now() * 1000.0);
     }
-    fn perfFrequency() Uint64 {
+    fn perfFrequency() u64 {
         return 1_000_000;
     }
     extern fn usleep(usec: c_uint) c_int;
-    fn delay(ms: Uint32) void {
+    fn delay(ms: u32) void {
         // Runs on a renderer pthread (PROXY_TO_PTHREAD), so a blocking libc
         // usleep is fine and keeps the browser main thread free.
         _ = usleep(ms * 1000);
@@ -330,7 +319,7 @@ const web = struct {
         push_event(.{ .type = .MouseWheel, .wheel_y = wy });
     }
     export fn swr_push_visibility(visible: c_int) void {
-        g_visible = visible != 0;
+        page_visible = visible != 0;
         push_event(.{ .type = .VisibilityChanged, .visible = visible != 0 });
     }
 };

@@ -230,10 +230,8 @@ pub const Mat4 = struct {
         det = 1.0 / det;
 
         var r = Mat4{};
-        var i: usize = 0;
-        while (i < 4) : (i += 1) {
-            var j: usize = 0;
-            while (j < 4) : (j += 1) r.m[i][j] = inv[i * 4 + j] * det;
+        for (0..4) |i| {
+            for (0..4) |j| r.m[i][j] = inv[i * 4 + j] * det;
         }
         return r;
     }

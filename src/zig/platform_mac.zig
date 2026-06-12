@@ -9,8 +9,6 @@ const platform = @import("platform.zig");
 const PixelFormat = platform.PixelFormat;
 const Surface = platform.Surface;
 const Event = platform.Event;
-const Uint64 = platform.Uint64;
-const Uint32 = platform.Uint32;
 
 // ---- Objective-C runtime ----
 const id = ?*anyopaque;
@@ -109,38 +107,38 @@ const NSEventTypeScrollWheel: usize = 22;
 
 const NUM_SURFACES = 3;
 
-var g_window: id = null;
-var g_view: id = null;
-var g_quit = false;
-var g_app: id = null;
-var g_delegate: id = null;
+var window: id = null;
+var view: id = null;
+var quit_requested = false;
+var app: id = null;
+var delegate: id = null;
 
-var g_fb_format: PixelFormat = .{};
-var g_fb: Surface = .{};
+var fb_format: PixelFormat = .{};
+var fb_surface: Surface = .{};
 
-var g_surfaces: [NUM_SURFACES]IOSurfaceRef = .{ null, null, null };
-var g_render: usize = 0;
+var surfaces: [NUM_SURFACES]IOSurfaceRef = .{ null, null, null };
+var render_idx: usize = 0;
 
 pub fn request_quit() void {
-    g_quit = true;
+    quit_requested = true;
 }
 
 fn init_format() void {
-    g_fb_format = .{};
-    g_fb_format.BytesPerPixel = 4;
-    g_fb_format.Rshift = 16;
-    g_fb_format.Gshift = 8;
-    g_fb_format.Bshift = 0;
-    g_fb_format.Rmask = 0x00ff0000;
-    g_fb_format.Gmask = 0x0000ff00;
-    g_fb_format.Bmask = 0x000000ff;
-    g_fb_format.Amask = 0xff000000;
+    fb_format = .{};
+    fb_format.BytesPerPixel = 4;
+    fb_format.Rshift = 16;
+    fb_format.Gshift = 8;
+    fb_format.Bshift = 0;
+    fb_format.Rmask = 0x00ff0000;
+    fb_format.Gmask = 0x0000ff00;
+    fb_format.Bmask = 0x000000ff;
+    fb_format.Amask = 0xff000000;
 }
 
 fn bind_render_surface(idx: usize) void {
-    const s = g_surfaces[idx];
-    g_fb.pixels = IOSurfaceGetBaseAddress(s);
-    g_fb.pitch = @intCast(IOSurfaceGetBytesPerRow(s));
+    const s = surfaces[idx];
+    fb_surface.pixels = IOSurfaceGetBaseAddress(s);
+    fb_surface.pitch = @intCast(IOSurfaceGetBytesPerRow(s));
 }
 
 fn makeNumber(comptime ty: c_int, comptime T: type, value: T) CFNumberRef {
@@ -171,18 +169,17 @@ fn create_surfaces(w: i32, h: i32) bool {
     if (props == null) return false;
     defer CFRelease(props);
 
-    var i: usize = 0;
-    while (i < NUM_SURFACES) : (i += 1) {
-        g_surfaces[i] = IOSurfaceCreate(props);
-        if (g_surfaces[i] == null) return false;
-        _ = IOSurfaceLock(g_surfaces[i], 0, null);
-        const base = IOSurfaceGetBaseAddress(g_surfaces[i]);
-        const size = IOSurfaceGetAllocSize(g_surfaces[i]);
+    for (&surfaces) |*surface| {
+        surface.* = IOSurfaceCreate(props);
+        if (surface.* == null) return false;
+        _ = IOSurfaceLock(surface.*, 0, null);
+        const base = IOSurfaceGetBaseAddress(surface.*);
+        const size = IOSurfaceGetAllocSize(surface.*);
         @memset(@as([*]u8, @ptrCast(base))[0..size], 0);
-        _ = IOSurfaceUnlock(g_surfaces[i], 0, null);
+        _ = IOSurfaceUnlock(surface.*, 0, null);
     }
-    g_render = 0;
-    _ = IOSurfaceLock(g_surfaces[0], 0, null);
+    render_idx = 0;
+    _ = IOSurfaceLock(surfaces[0], 0, null);
     bind_render_surface(0);
     return true;
 }
@@ -209,92 +206,91 @@ fn nsString(s: [*:0]const u8) id {
 
 pub fn Init(w: i32, h: i32, title: [*:0]const u8) bool {
     init_format();
-    g_fb = .{};
-    g_fb.w = w;
-    g_fb.h = h;
-    g_fb.format = &g_fb_format;
+    fb_surface = .{};
+    fb_surface.w = w;
+    fb_surface.h = h;
+    fb_surface.format = &fb_format;
     if (!create_surfaces(w, h)) return false;
 
-    g_app = msgSend(id, cls("NSApplication"), sel("sharedApplication"));
-    _ = msgSend1(void, isize, g_app, sel("setActivationPolicy:"), NSApplicationActivationPolicyRegular);
+    app = msgSend(id, cls("NSApplication"), sel("sharedApplication"));
+    _ = msgSend1(void, isize, app, sel("setActivationPolicy:"), NSApplicationActivationPolicyRegular);
 
     const rect = NSRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = @floatFromInt(w), .height = @floatFromInt(h) } };
     const style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable;
 
     const win_alloc = msgSend(id, cls("NSWindow"), sel("alloc"));
-    g_window = msgSend4(id, NSRect, usize, usize, bool, win_alloc, sel("initWithContentRect:styleMask:backing:defer:"), rect, style, NSBackingStoreBuffered, false);
-    if (g_window == null) return false;
-    _ = msgSend1(void, id, g_window, sel("setTitle:"), nsString(title));
-    _ = msgSend(void, g_window, sel("center"));
+    window = msgSend4(id, NSRect, usize, usize, bool, win_alloc, sel("initWithContentRect:styleMask:backing:defer:"), rect, style, NSBackingStoreBuffered, false);
+    if (window == null) return false;
+    _ = msgSend1(void, id, window, sel("setTitle:"), nsString(title));
+    _ = msgSend(void, window, sel("center"));
 
     const delegate_class = register_delegate_class();
     const del_alloc = msgSend(id, delegate_class, sel("alloc"));
-    g_delegate = msgSend(id, del_alloc, sel("init"));
-    _ = msgSend1(void, id, g_window, sel("setDelegate:"), g_delegate);
+    delegate = msgSend(id, del_alloc, sel("init"));
+    _ = msgSend1(void, id, window, sel("setDelegate:"), delegate);
 
     const view_alloc = msgSend(id, cls("NSView"), sel("alloc"));
-    g_view = msgSend1(id, NSRect, view_alloc, sel("initWithFrame:"), rect);
-    _ = msgSend1(void, bool, g_view, sel("setWantsLayer:"), true);
-    const layer = msgSend(id, g_view, sel("layer"));
+    view = msgSend1(id, NSRect, view_alloc, sel("initWithFrame:"), rect);
+    _ = msgSend1(void, bool, view, sel("setWantsLayer:"), true);
+    const layer = msgSend(id, view, sel("layer"));
     _ = msgSend1(void, bool, layer, sel("setOpaque:"), true);
     _ = msgSend1(void, id, layer, sel("setMagnificationFilter:"), kCAFilterNearest);
     _ = msgSend1(void, id, layer, sel("setContentsGravity:"), kCAGravityResize);
-    _ = msgSend1(void, id, g_window, sel("setContentView:"), g_view);
+    _ = msgSend1(void, id, window, sel("setContentView:"), view);
 
-    _ = msgSend1(void, id, g_window, sel("makeKeyAndOrderFront:"), null);
-    _ = msgSend1(void, bool, g_app, sel("activateIgnoringOtherApps:"), true);
-    _ = msgSend(void, g_app, sel("finishLaunching"));
+    _ = msgSend1(void, id, window, sel("makeKeyAndOrderFront:"), null);
+    _ = msgSend1(void, bool, app, sel("activateIgnoringOtherApps:"), true);
+    _ = msgSend(void, app, sel("finishLaunching"));
     return true;
 }
 
 pub fn Shutdown() void {
-    if (g_window != null) {
-        _ = msgSend1(void, id, g_window, sel("setDelegate:"), null);
-        _ = msgSend(void, g_window, sel("close"));
-        g_window = null;
+    if (window != null) {
+        _ = msgSend1(void, id, window, sel("setDelegate:"), null);
+        _ = msgSend(void, window, sel("close"));
+        window = null;
     }
-    g_view = null;
-    g_delegate = null;
-    var i: usize = 0;
-    while (i < NUM_SURFACES) : (i += 1) {
-        if (g_surfaces[i] != null) {
-            CFRelease(g_surfaces[i]);
-            g_surfaces[i] = null;
+    view = null;
+    delegate = null;
+    for (&surfaces) |*surface| {
+        if (surface.* != null) {
+            CFRelease(surface.*);
+            surface.* = null;
         }
     }
-    g_fb = .{};
+    fb_surface = .{};
 }
 
 pub fn GetFramebuffer() ?*Surface {
-    return &g_fb;
+    return &fb_surface;
 }
 
 pub fn Present() void {
-    if (g_view == null) return;
-    const done = g_surfaces[g_render];
+    if (view == null) return;
+    const done = surfaces[render_idx];
     _ = IOSurfaceUnlock(done, 0, null);
 
     const ct = cls("CATransaction");
     _ = msgSend(void, ct, sel("begin"));
     _ = msgSend1(void, bool, ct, sel("setDisableActions:"), true);
-    const layer = msgSend(id, g_view, sel("layer"));
+    const layer = msgSend(id, view, sel("layer"));
     _ = msgSend1(void, id, layer, sel("setContents:"), done);
     _ = msgSend(void, ct, sel("commit"));
 
-    g_render = (g_render + 1) % NUM_SURFACES;
-    _ = IOSurfaceLock(g_surfaces[g_render], 0, null);
-    bind_render_surface(g_render);
+    render_idx = (render_idx + 1) % NUM_SURFACES;
+    _ = IOSurfaceLock(surfaces[render_idx], 0, null);
+    bind_render_surface(render_idx);
 }
 
 pub fn IsRenderable() bool {
-    if (g_window == null) return false;
-    const visible = msgSend(bool, g_window, sel("isVisible"));
-    const mini = msgSend(bool, g_window, sel("isMiniaturized"));
+    if (window == null) return false;
+    const visible = msgSend(bool, window, sel("isVisible"));
+    const mini = msgSend(bool, window, sel("isMiniaturized"));
     return visible and !mini;
 }
 
 fn viewFrame() NSRect {
-    return msgSend(NSRect, g_view, sel("frame"));
+    return msgSend(NSRect, view, sel("frame"));
 }
 
 fn fill_mouse_in_view(e: id, out: *Event, down: bool) bool {
@@ -308,14 +304,14 @@ fn fill_mouse_in_view(e: id, out: *Event, down: bool) bool {
 
 pub fn PollEvent(out: *Event) bool {
     out.* = .{};
-    if (g_quit) {
+    if (quit_requested) {
         out.type = .Quit;
-        g_quit = false;
+        quit_requested = false;
         return true;
     }
     const distant_past = msgSend(id, cls("NSDate"), sel("distantPast"));
     while (true) {
-        const e = msgSend4(id, u64, id, id, bool, g_app, sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), NSEventMaskAny, distant_past, NSDefaultRunLoopMode, true);
+        const e = msgSend4(id, u64, id, id, bool, app, sel("nextEventMatchingMask:untilDate:inMode:dequeue:"), NSEventMaskAny, distant_past, NSDefaultRunLoopMode, true);
         if (e == null) return false;
         const etype = msgSend(usize, e, sel("type"));
         switch (etype) {
@@ -335,12 +331,12 @@ pub fn PollEvent(out: *Event) bool {
             },
             NSEventTypeLeftMouseDown => {
                 if (fill_mouse_in_view(e, out, true)) return true;
-                _ = msgSend1(void, id, g_app, sel("sendEvent:"), e);
+                _ = msgSend1(void, id, app, sel("sendEvent:"), e);
                 continue;
             },
             NSEventTypeLeftMouseUp => {
                 if (fill_mouse_in_view(e, out, false)) return true;
-                _ = msgSend1(void, id, g_app, sel("sendEvent:"), e);
+                _ = msgSend1(void, id, app, sel("sendEvent:"), e);
                 continue;
             },
             NSEventTypeLeftMouseDragged => {
@@ -351,7 +347,7 @@ pub fn PollEvent(out: *Event) bool {
                     out.yrel = @intFromFloat(msgSend(CGFloat, e, sel("deltaY")));
                     return true;
                 }
-                _ = msgSend1(void, id, g_app, sel("sendEvent:"), e);
+                _ = msgSend1(void, id, app, sel("sendEvent:"), e);
                 continue;
             },
             NSEventTypeScrollWheel => {
@@ -361,7 +357,7 @@ pub fn PollEvent(out: *Event) bool {
                 continue;
             },
             else => {
-                _ = msgSend1(void, id, g_app, sel("sendEvent:"), e);
+                _ = msgSend1(void, id, app, sel("sendEvent:"), e);
                 continue;
             },
         }
@@ -374,16 +370,16 @@ fn monoNs() u64 {
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
-pub fn TicksMs() Uint64 {
+pub fn TicksMs() u64 {
     return monoNs() / 1_000_000;
 }
-pub fn PerfCounter() Uint64 {
+pub fn PerfCounter() u64 {
     return monoNs();
 }
-pub fn PerfFrequency() Uint64 {
+pub fn PerfFrequency() u64 {
     return 1_000_000_000;
 }
-pub fn Delay(ms: Uint32) void {
+pub fn Delay(ms: u32) void {
     const total_ns = @as(u64, ms) * std.time.ns_per_ms;
     var req: std.c.timespec = .{
         .sec = @intCast(total_ns / std.time.ns_per_s),

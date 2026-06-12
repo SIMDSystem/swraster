@@ -41,11 +41,11 @@ const Frame = struct {
         var wake_main = false;
         {
             threading.mtx_pool.lock();
+            defer threading.mtx_pool.unlock();
             if (threading.raster_pass.load(.monotonic) < next) {
                 threading.raster_pass.store(next, .release);
                 wake_main = (next >= RPC);
             }
-            threading.mtx_pool.unlock();
         }
         threading.cv_pool.broadcast();
         if (wake_main) {
@@ -55,19 +55,22 @@ const Frame = struct {
         }
     }
 
-    fn cs_tile_rect(self: *Frame, tile_col: i32, strip_idx: i32, x_min: *i32, x_max: *i32, y_min: *i32, y_max: *i32) void {
-        config.tile_span(self.rs.screen_width, self.X, tile_col, x_min, x_max);
-        config.tile_span(self.rs.screen_height, self.R, strip_idx, y_min, y_max);
+    const TileRect = struct { x_min: i32, x_max: i32, y_min: i32, y_max: i32 };
+
+    fn cs_tile_rect(self: *Frame, tile_col: i32, strip_idx: i32) TileRect {
+        const xs = config.tile_span(self.rs.screen_width, self.X, tile_col);
+        const ys = config.tile_span(self.rs.screen_height, self.R, strip_idx);
+        return .{ .x_min = xs.lo, .x_max = xs.hi, .y_min = ys.lo, .y_max = ys.hi };
     }
 
     fn do_color_tile(self: *Frame, tile_col: i32, strip_idx: i32) void {
         const t0 = platform.PerfCounter();
         const c0 = platform.ThreadCpuNs();
-        var x_min: i32 = 0;
-        var x_max: i32 = 0;
-        var y_min: i32 = 0;
-        var y_max: i32 = 0;
-        self.cs_tile_rect(tile_col, strip_idx, &x_min, &x_max, &y_min, &y_max);
+        const tile = self.cs_tile_rect(tile_col, strip_idx);
+        const x_min = tile.x_min;
+        const x_max = tile.x_max;
+        const y_min = tile.y_min;
+        const y_max = tile.y_max;
         const rs = self.rs;
         const tile_idx: usize = @intCast(tile_col * config.NUM_STRIPS + strip_idx);
 
@@ -130,7 +133,7 @@ const Frame = struct {
         }
 
         const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler.?, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Color));
+        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Color));
     }
 
     fn draw_color_tri(self: *Frame, tri: *const RenderTriangle, depth_write: bool, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
@@ -141,38 +144,30 @@ const Frame = struct {
     fn do_ssao_tile(self: *Frame, tile_col: i32, strip_idx: i32) void {
         const t0 = platform.PerfCounter();
         const c0 = platform.ThreadCpuNs();
-        var x_min: i32 = 0;
-        var x_max: i32 = 0;
-        var y_min: i32 = 0;
-        var y_max: i32 = 0;
-        self.cs_tile_rect(tile_col, strip_idx, &x_min, &x_max, &y_min, &y_max);
+        const tile = self.cs_tile_rect(tile_col, strip_idx);
         const rs = self.rs;
         if (config.ENABLE_SSAO) {
-            draw.apply_ssao_strip(rs.pixels.?, rs.pitch, rs.linear_z.?, rs.normal_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, x_min, x_max, y_min, y_max, rs.frame_index, rs.projection.m[0][0], rs.projection.m[1][1]);
+            draw.apply_ssao_strip(rs.pixels.?, rs.pitch, rs.linear_z.?, rs.normal_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, tile.x_min, tile.x_max, tile.y_min, tile.y_max, rs.frame_index, rs.projection.m[0][0], rs.projection.m[1][1]);
         }
         const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler.?, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Ssao));
+        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Ssao));
     }
 
     fn do_lum_tile(self: *Frame, tile_col: i32, fstrip: i32) void {
         const t0 = platform.PerfCounter();
         const c0 = platform.ThreadCpuNs();
-        var x_min: i32 = 0;
-        var x_max: i32 = 0;
-        var y_min: i32 = 0;
-        var y_max: i32 = 0;
         const rs = self.rs;
-        config.tile_span(rs.screen_width, self.X, tile_col, &x_min, &x_max);
-        config.tile_span(rs.screen_height, self.R * 2, fstrip, &y_min, &y_max);
+        const xs = config.tile_span(rs.screen_width, self.X, tile_col);
+        const ys = config.tile_span(rs.screen_height, self.R * 2, fstrip);
         if (rs.use_spotlight) {
             if (rs.cone_buf_read) |cone| {
                 if (cone.valid) {
-                    draw.draw_spotlight_cone_strip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, cone, rs.light_pos, rs.spot_dir, rs.spot_outer_cos, x_min, x_max, y_min, y_max);
+                    draw.draw_spotlight_cone_strip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, cone, rs.light_pos, rs.spot_dir, rs.spot_outer_cos, xs.lo, xs.hi, ys.lo, ys.hi);
                 }
             }
         }
         const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler.?, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Luminaire));
+        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Luminaire));
     }
 
     fn run_lum_tile(self: *Frame, col: i32, fstrip: i32) bool {
@@ -261,12 +256,12 @@ const Frame = struct {
         const tile_start_ts = platform.PerfCounter();
         const tile_start_cpu_ns = platform.ThreadCpuNs();
 
-        var x_min: i32 = 0;
-        var x_max: i32 = 0;
-        var y_min: i32 = 0;
-        var y_max: i32 = 0;
-        config.tile_span(rs.shadow_size, cols_total, tile_col, &x_min, &x_max);
-        config.tile_span(rs.shadow_size, strips_total, strip_idx, &y_min, &y_max);
+        const xs = config.tile_span(rs.shadow_size, cols_total, tile_col);
+        const ys = config.tile_span(rs.shadow_size, strips_total, strip_idx);
+        const x_min = xs.lo;
+        const x_max = xs.hi;
+        const y_min = ys.lo;
+        const y_max = ys.hi;
 
         const sd = rs.shadow_depth_write.?;
         const ss: usize = @intCast(rs.shadow_size);
@@ -309,7 +304,7 @@ const Frame = struct {
 
         const tile_end_cpu_ns = platform.ThreadCpuNs();
         const tile_cpu_ns = if (tile_end_cpu_ns > tile_start_cpu_ns) tile_end_cpu_ns - tile_start_cpu_ns else 0;
-        profiler.profiler_record_raster(self.ctx.profiler.?, self.worker_id, tile_start_ts, platform.PerfCounter(), tile_cpu_ns, @intFromEnum(RasterJobMode.ShadowDepth));
+        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, tile_start_ts, platform.PerfCounter(), tile_cpu_ns, @intFromEnum(RasterJobMode.ShadowDepth));
     }
 
     fn draw_shadow_tri(self: *Frame, tri: *const RenderTriangle, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
@@ -331,7 +326,7 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
 
     const pool = threading.active_raster_job_thread_count;
     const buf_id = threading.active_raster_buf_id;
-    const rs = &ctx.raster_shared.?[@intCast(buf_id)];
+    const rs = &ctx.raster_shared[@intCast(buf_id)];
 
     const hard_barrier = threading.raster_hard_barrier.load(.monotonic);
 
@@ -358,16 +353,16 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
         if (job_mode == RasterJobMode.Ssao) {
             frame.ssao_drain();
             threading.mtx_pool.lock();
+            defer threading.mtx_pool.unlock();
             while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
-            threading.mtx_pool.unlock();
             continue;
         }
 
         if (job_mode == RasterJobMode.Luminaire) {
             frame.lum_drain();
             threading.mtx_pool.lock();
+            defer threading.mtx_pool.unlock();
             while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
-            threading.mtx_pool.unlock();
             continue;
         }
 
@@ -417,8 +412,10 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
 
         if (shadow_only) return;
 
-        threading.mtx_pool.lock();
-        while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
-        threading.mtx_pool.unlock();
+        {
+            threading.mtx_pool.lock();
+            defer threading.mtx_pool.unlock();
+            while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
+        }
     }
 }

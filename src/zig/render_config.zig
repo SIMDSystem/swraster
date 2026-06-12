@@ -47,15 +47,18 @@ pub var NUM_TILE_BINS: i32 = 0;
 // Divides [0,extent) into `splits` contiguous tiles. Tile `idx` covers pixels
 // [lo, hi] inclusive. The single floor-division formula every framebuffer pass
 // shares so they can never disagree on a tile boundary.
-pub inline fn tile_span(extent: i32, splits: i32, idx: i32, lo: *i32, hi: *i32) void {
-    lo.* = @divTrunc(idx * extent, splits);
-    hi.* = @divTrunc((idx + 1) * extent, splits) - 1;
-    if (lo.* < 0) lo.* = 0;
-    if (hi.* >= extent) hi.* = extent - 1;
+pub const TileSpan = struct { lo: i32, hi: i32 };
+
+pub inline fn tile_span(extent: i32, splits: i32, idx: i32) TileSpan {
+    var lo = @divTrunc(idx * extent, splits);
+    var hi = @divTrunc((idx + 1) * extent, splits) - 1;
+    if (lo < 0) lo = 0;
+    if (hi >= extent) hi = extent - 1;
+    return .{ .lo = lo, .hi = hi };
 }
 
-pub inline fn tile_column_range(width: i32, col: i32, x_min: *i32, x_max: *i32) void {
-    tile_span(width, TILE_X_SPLITS, col, x_min, x_max);
+pub inline fn tile_column_range(width: i32, col: i32) TileSpan {
+    return tile_span(width, TILE_X_SPLITS, col);
 }
 
 pub inline fn tile_column_for_x(width: i32, x: i32) i32 {

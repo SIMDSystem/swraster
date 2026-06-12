@@ -8,7 +8,6 @@ const platform = @import("platform.zig");
 const config = @import("render_config.zig");
 const dbg = @import("dbg.zig");
 const sync = @import("sync.zig");
-const Uint64 = platform.Uint64;
 
 pub const RASTER_PASS_COUNT: usize = 4;
 pub const MAX_RASTER_STRIPS: usize = 96;
@@ -97,7 +96,7 @@ pub fn init_thread_counts() void {
 
 // ---- Perf timing ----
 var inv_freq_ms: f64 = 0.0;
-pub fn perf_ms(start: Uint64, end: Uint64) f64 {
+pub fn perf_ms(start: u64, end: u64) f64 {
     if (inv_freq_ms == 0.0) inv_freq_ms = 1000.0 / @as(f64, @floatFromInt(platform.PerfFrequency()));
     return @as(f64, @floatFromInt(end - start)) * inv_freq_ms;
 }
@@ -126,8 +125,8 @@ pub const ThreadPerfSearch = struct {
     log: ?*std.c.FILE = null,
     variant_index: usize = 0,
     frames_this_variant: i32 = 0,
-    variant_start_ticks: Uint64 = 0,
-    search_start_ticks: Uint64 = 0,
+    variant_start_ticks: u64 = 0,
+    search_start_ticks: u64 = 0,
     total_frames: u64 = 0,
     raster_ms_this_variant: f64 = 0.0,
     tl_tail_wait_ms_this_variant: f64 = 0.0,

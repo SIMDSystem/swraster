@@ -17,7 +17,17 @@ const PackedTexture = tex.PackedTexture;
 const Vec3 = jolt.Vec3;
 const Quat = jolt.Quat;
 
-const M_PI: f32 = 3.14159265358979323846;
+// Mesh/material kind for a scene instance. enum(i32) keeps the field layout
+// byte-identical to the C++ `int type` (and the other three ports).
+pub const InstanceType = enum(i32) {
+    cube = 0,
+    sphere = 1,
+    torus = 2,
+    teapot = 3,
+    smallball = 4,
+    ground = 5,
+    lamp = 6,
+};
 
 pub const CubeInstance = struct {
     tx: f32 = 0,
@@ -31,7 +41,7 @@ pub const CubeInstance = struct {
     qz: f32 = 0,
     qw: f32 = 1,
     texture: ?*const PackedTexture = null,
-    type: i32 = 0,
+    type: InstanceType = .cube,
     color_r: f32 = 1,
     color_g: f32 = 1,
     color_b: f32 = 1,
@@ -115,12 +125,11 @@ pub fn build_torus_compound_shape(major_radius: f32, minor_radius: f32, num_segm
     const builder = jolt.jph_compound_builder_create() orelse return null;
     defer jolt.jph_compound_builder_destroy(builder);
     const capsule = jolt.jph_capsule_shape_create(half_height, minor_radius) orelse return null;
-    var i: i32 = 0;
-    while (i < num_segments) : (i += 1) {
-        const angle = @as(f32, @floatFromInt(i)) * 2.0 * M_PI / @as(f32, @floatFromInt(num_segments));
+    for (0..@intCast(num_segments)) |i| {
+        const angle = @as(f32, @floatFromInt(i)) * 2.0 * std.math.pi / @as(f32, @floatFromInt(num_segments));
         const x = major_radius * @cos(angle);
         const z = major_radius * @sin(angle);
-        const rot = Quat.sRotation(Vec3.init(@cos(angle), 0, @sin(angle)), M_PI * 0.5);
+        const rot = Quat.sRotation(Vec3.init(@cos(angle), 0, @sin(angle)), std.math.pi * 0.5);
         jolt.jph_compound_builder_add(builder, Vec3.init(x, 0, z), rot, capsule);
     }
     return jolt.jph_compound_builder_build(builder);
@@ -147,8 +156,7 @@ pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
                         var px: [4]f32 = undefined;
                         var py: [4]f32 = undefined;
                         var pz: [4]f32 = undefined;
-                        var k: usize = 0;
-                        while (k < 4) : (k += 1) {
+                        for (0..4) |k| {
                             const cpx = [4]f32{ geom.teapot_data[p][k][0][0], geom.teapot_data[p][k][1][0], geom.teapot_data[p][k][2][0], geom.teapot_data[p][k][3][0] };
                             const cpy = [4]f32{ geom.teapot_data[p][k][0][1], geom.teapot_data[p][k][1][1], geom.teapot_data[p][k][2][1], geom.teapot_data[p][k][3][1] };
                             const cpz = [4]f32{ geom.teapot_data[p][k][0][2], geom.teapot_data[p][k][1][2], geom.teapot_data[p][k][2][2], geom.teapot_data[p][k][3][2] };
@@ -201,7 +209,7 @@ pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const 
     var transparent_shadow_mask_counter: i32 = 0;
 
     const create_main_object = struct {
-        fn f(bi2: *jolt.BodyInterface, ty: i32, px: f32, py: f32, pz: f32, shape: *jolt.Shape, t: ?*const PackedTexture, mask_counter: *i32, insts: *std.array_list.Managed(CubeInstance)) void {
+        fn f(bi2: *jolt.BodyInterface, ty: InstanceType, px: f32, py: f32, pz: f32, shape: *jolt.Shape, t: ?*const PackedTexture, mask_counter: *i32, insts: *std.array_list.Managed(CubeInstance)) void {
             var inst = CubeInstance{};
             inst.tx = px;
             inst.ty = py;
@@ -212,68 +220,63 @@ pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const 
             inst.color_r = 1.0;
             inst.color_g = 1.0;
             inst.color_b = 1.0;
-            inst.shadow_screendoor_mask = if (ty == 2) blk: {
+            inst.shadow_screendoor_mask = if (ty == .torus) blk: {
                 const m = mask_counter.* & 7;
                 mask_counter.* += 1;
                 break :blk m;
             } else -1;
 
-            const rx = rand_unit() * 2.0 * M_PI;
-            const ry = rand_unit() * 2.0 * M_PI;
-            const rz = rand_unit() * 2.0 * M_PI;
+            const rx = rand_unit() * 2.0 * std.math.pi;
+            const ry = rand_unit() * 2.0 * std.math.pi;
+            const rz = rand_unit() * 2.0 * std.math.pi;
             const initial_rotation = Quat.sEulerAngles(Vec3.init(rx, ry, rz));
             inst.body_id = jolt.jph_body_create_and_add(bi2, shape, Vec3.init(px, py, pz), initial_rotation, .dynamic, setup.PhysicsLayers.MOVING, 0.8, .activate);
             insts.append(inst) catch unreachable;
         }
     }.f;
 
-    var i: i32 = 0;
-    while (i < 10) : (i += 1) {
+    for (0..10) |_| {
         const px = rand_unit() * 10.0 - 5.0;
         const py = rand_unit() * 10.0 - 5.0;
         const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, 0, px, py, pz, jolt.jph_box_shape_create(1.0, 1.0, 1.0).?, tex_main_cube, &transparent_shadow_mask_counter, instances);
+        create_main_object(bi, .cube, px, py, pz, jolt.jph_box_shape_create(1.0, 1.0, 1.0).?, tex_main_cube, &transparent_shadow_mask_counter, instances);
     }
-    i = 0;
-    while (i < 10) : (i += 1) {
+    for (0..10) |_| {
         const px = rand_unit() * 10.0 - 5.0;
         const py = rand_unit() * 10.0 - 5.0;
         const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, 1, px, py, pz, jolt.jph_sphere_shape_create(1.3).?, tex_main_sphere, &transparent_shadow_mask_counter, instances);
+        create_main_object(bi, .sphere, px, py, pz, jolt.jph_sphere_shape_create(1.3).?, tex_main_sphere, &transparent_shadow_mask_counter, instances);
     }
-    i = 0;
-    while (i < 10) : (i += 1) {
+    for (0..10) |_| {
         const px = rand_unit() * 10.0 - 5.0;
         const py = rand_unit() * 10.0 - 5.0;
         const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, 2, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances);
+        create_main_object(bi, .torus, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances);
     }
-    i = 0;
-    while (i < 10) : (i += 1) {
+    for (0..10) |_| {
         const px = rand_unit() * 10.0 - 5.0;
         const py = rand_unit() * 10.0 - 5.0;
         const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, 3, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances);
+        create_main_object(bi, .teapot, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances);
     }
 
-    i = 0;
-    while (i < 400) : (i += 1) {
+    for (0..400) |_| {
         var inst = CubeInstance{};
         inst.tx = rand_unit() * 10.0 - 5.0;
         inst.ty = rand_unit() * 10.0 - 5.0;
         inst.tz = rand_unit() * 10.0 - 5.0;
         inst.qw = 1.0;
         inst.texture = null;
-        inst.type = 4;
+        inst.type = .smallball;
         inst.shadow_screendoor_mask = -1;
         inst.color_r = 0.3 + rand_unit() * 0.7;
         inst.color_g = 0.3 + rand_unit() * 0.7;
         inst.color_b = 0.3 + rand_unit() * 0.7;
 
         const shape = jolt.jph_sphere_shape_create(0.3).?;
-        const rx = rand_unit() * 2.0 * M_PI;
-        const ry = rand_unit() * 2.0 * M_PI;
-        const rz = rand_unit() * 2.0 * M_PI;
+        const rx = rand_unit() * 2.0 * std.math.pi;
+        const ry = rand_unit() * 2.0 * std.math.pi;
+        const rz = rand_unit() * 2.0 * std.math.pi;
         const initial_rotation = Quat.sEulerAngles(Vec3.init(rx, ry, rz));
         inst.body_id = jolt.jph_body_create_and_add(bi, shape, Vec3.init(inst.tx, inst.ty, inst.tz), initial_rotation, .dynamic, setup.PhysicsLayers.MOVING, 0.9, .activate);
         instances.append(inst) catch unreachable;
@@ -283,7 +286,7 @@ pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const 
     ground.ty = ground_y;
     ground.qw = 1.0;
     ground.texture = tex_ground;
-    ground.type = 5;
+    ground.type = .ground;
     ground.color_r = 0.68;
     ground.color_g = 0.68;
     ground.color_b = 0.68;

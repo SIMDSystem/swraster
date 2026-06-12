@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const la = @import("linalg.zig");
 const config = @import("render_config.zig");
 const platform = @import("platform.zig");
 const pixel = @import("pixel.zig");
@@ -131,7 +132,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         threading.active_raster_job_thread_count = config.NUM_RASTER_THREADS;
         thread_perf.log = std.c.fopen("threaadperf.log", "wb") orelse {
             dbg.print("Failed to open threaadperf.log for writing\n", .{});
-            return;
+            return error.ThreadPerfLogOpenFailed;
         };
         const log = thread_perf.log.?;
         if (std.fmt.allocPrint(alloc, "threadperf frames_per_variant={d} variants={d} launched_tl={d} launched_raster={d} tl_range={d}-{d} raster_range={d}-{d}\n", .{ thread_perf.frames_per_variant, thread_perf.variants.items.len, thread_perf.launched_tl_threads, thread_perf.launched_raster_threads, thread_perf.min_tl_threads, thread_perf.max_tl_threads, thread_perf.min_raster_threads, thread_perf.max_raster_threads })) |hdr1| {
@@ -145,7 +146,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // ----- 2. Platform / window -----
     if (!platform.Init(1280, 1024, "swraster")) {
         dbg.print("Platform::Init failed\n", .{});
-        return;
+        return error.PlatformInitFailed;
     }
     const fb = platform.GetFramebuffer().?;
 
@@ -227,14 +228,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var lamp = scene.CubeInstance{};
         lamp.qw = 1.0;
         lamp.texture = null;
-        lamp.type = 6;
+        lamp.type = .lamp;
         lamp.color_r = 0.85;
         lamp.color_g = 0.85;
         lamp.color_b = 0.90;
         lamp.shadow_screendoor_mask = -1;
         lamp.body_id = .{};
         lamp_instance_index = @intCast(instances.items.len);
-        instances.append(lamp) catch unreachable;
+        try instances.append(lamp);
     }
 
     var initial_instance_states = scene.capture_initial_instance_states(&instances, body_interface);
@@ -264,46 +265,39 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var opaque_strip_buffers: [2]buffers.StripTriangleBuffer = undefined;
     var trans_strip_buffers: [2]buffers.StripTriangleBuffer = undefined;
     var shadow_strip_buffers: [2]buffers.StripTriangleBuffer = undefined;
-    {
-        var b: usize = 0;
-        while (b < 2) : (b += 1) {
-            opaque_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
-            trans_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
-            shadow_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
-            opaque_buffers[b].triangles.appendNTimes(.{}, 100000) catch unreachable;
-            trans_buffers[b].triangles.appendNTimes(.{}, 100000) catch unreachable;
-            shadow_buffers[b].triangles.appendNTimes(.{}, 200000) catch unreachable;
+    for (0..2) |b| {
+        opaque_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
+        trans_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
+        shadow_buffers[b] = .{ .triangles = buffers.RenderTriangleList.init(alloc), .count = 0 };
+        try opaque_buffers[b].triangles.appendNTimes(.{}, 100000);
+        try trans_buffers[b].triangles.appendNTimes(.{}, 100000);
+        try shadow_buffers[b].triangles.appendNTimes(.{}, 200000);
 
-            opaque_strip_buffers[b] = .{ .bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable };
-            trans_strip_buffers[b] = .{ .bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable };
-            shadow_strip_buffers[b] = .{ .bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable };
-            var s: usize = 0;
-            while (s < nb) : (s += 1) {
-                opaque_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
-                trans_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
-                shadow_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
-                opaque_strip_buffers[b].bins[s].ensureTotalCapacity(512) catch unreachable;
-                trans_strip_buffers[b].bins[s].ensureTotalCapacity(128) catch unreachable;
-                shadow_strip_buffers[b].bins[s].ensureTotalCapacity(512) catch unreachable;
-            }
+        opaque_strip_buffers[b] = .{ .bins = try alloc.alloc(buffers.RenderTriangleList, nb) };
+        trans_strip_buffers[b] = .{ .bins = try alloc.alloc(buffers.RenderTriangleList, nb) };
+        shadow_strip_buffers[b] = .{ .bins = try alloc.alloc(buffers.RenderTriangleList, nb) };
+        for (0..nb) |s| {
+            opaque_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
+            trans_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
+            shadow_strip_buffers[b].bins[s] = buffers.RenderTriangleList.init(alloc);
+            try opaque_strip_buffers[b].bins[s].ensureTotalCapacity(512);
+            try trans_strip_buffers[b].bins[s].ensureTotalCapacity(128);
+            try shadow_strip_buffers[b].bins[s].ensureTotalCapacity(512);
         }
     }
 
     var shadow_box_buffers: [2]buffers.ShadowBoxBuffer = .{ .{}, .{} };
     var cone_buffers: [2]buffers.LuminaireConeBuffer = undefined;
-    {
-        var b: usize = 0;
-        while (b < 2) : (b += 1) {
-            cone_buffers[b] = .{ .tris = std.array_list.Managed(buffers.LuminaireConeTri).init(alloc), .valid = false };
-            cone_buffers[b].tris.ensureTotalCapacity(@intCast(config.LUMINAIRE_CONE_SEGMENTS)) catch unreachable;
-        }
+    for (0..2) |b| {
+        cone_buffers[b] = .{ .tris = std.array_list.Managed(buffers.LuminaireConeTri).init(alloc), .valid = false };
+        try cone_buffers[b].tris.ensureTotalCapacity(@intCast(config.LUMINAIRE_CONE_SEGMENTS));
     }
-    var light_dir_buffers: [2]@import("linalg.zig").Vec3 = .{ .{}, .{} };
-    var light_pos_buffers: [2]@import("linalg.zig").Vec3 = .{ .{}, .{} };
-    var spot_dir_buffers: [2]@import("linalg.zig").Vec3 = .{ .{}, .{} };
-    var view_matrix_buffers: [2]@import("linalg.zig").Mat4 = .{ .{}, .{} };
-    var projection_buffers: [2]@import("linalg.zig").Mat4 = .{ .{}, .{} };
-    var shadow_matrix_buffers: [2]@import("linalg.zig").Mat4 = .{ .{}, .{} };
+    var light_dir_buffers: [2]la.Vec3 = .{ .{}, .{} };
+    var light_pos_buffers: [2]la.Vec3 = .{ .{}, .{} };
+    var spot_dir_buffers: [2]la.Vec3 = .{ .{}, .{} };
+    var view_matrix_buffers: [2]la.Mat4 = .{ .{}, .{} };
+    var projection_buffers: [2]la.Mat4 = .{ .{}, .{} };
+    var shadow_matrix_buffers: [2]la.Mat4 = .{ .{}, .{} };
     var time_buffers: [2]f32 = .{ 0.0, 0.0 };
 
     const launched_tl_threads: i32 = if (thread_perf.enabled) thread_perf.launched_tl_threads else config.NUM_TL_THREADS;
@@ -311,37 +305,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var tl_shared = buffers.TLSharedData{};
     var tl_thread_outputs = std.array_list.Managed(buffers.TLThreadOutput).init(alloc);
-    {
-        var i: i32 = 0;
-        while (i < launched_tl_threads) : (i += 1) {
-            var out = buffers.TLThreadOutput{
-                .opaque_list = buffers.RenderTriangleList.init(alloc),
-                .trans = buffers.RenderTriangleList.init(alloc),
-                .shadow = buffers.RenderTriangleList.init(alloc),
-                .opaque_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
-                .trans_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
-                .shadow_bins = alloc.alloc(buffers.RenderTriangleList, nb) catch unreachable,
-                .merge_scratch = buffers.RenderTriangleList.init(alloc),
-                .sort_keys = std.array_list.Managed(keysort.KeyIdx).init(alloc),
-                .eye_scratch = geom.RenderVertexList.init(alloc),
-                .clip_scratch = geom.RenderVertexList.init(alloc),
-            };
-            out.opaque_list.ensureTotalCapacity(1000) catch unreachable;
-            out.trans.ensureTotalCapacity(1000) catch unreachable;
-            out.shadow.ensureTotalCapacity(1000) catch unreachable;
-            out.merge_scratch.ensureTotalCapacity(2000) catch unreachable;
-            out.sort_keys.ensureTotalCapacity(2000) catch unreachable;
-            var s: usize = 0;
-            while (s < nb) : (s += 1) {
-                out.opaque_bins[s] = buffers.RenderTriangleList.init(alloc);
-                out.trans_bins[s] = buffers.RenderTriangleList.init(alloc);
-                out.shadow_bins[s] = buffers.RenderTriangleList.init(alloc);
-                out.opaque_bins[s].ensureTotalCapacity(256) catch unreachable;
-                out.trans_bins[s].ensureTotalCapacity(96) catch unreachable;
-                out.shadow_bins[s].ensureTotalCapacity(256) catch unreachable;
-            }
-            tl_thread_outputs.append(out) catch unreachable;
+    for (0..@intCast(launched_tl_threads)) |_| {
+        var out = buffers.TLThreadOutput{
+            .opaque_list = buffers.RenderTriangleList.init(alloc),
+            .trans = buffers.RenderTriangleList.init(alloc),
+            .shadow = buffers.RenderTriangleList.init(alloc),
+            .opaque_bins = try alloc.alloc(buffers.RenderTriangleList, nb),
+            .trans_bins = try alloc.alloc(buffers.RenderTriangleList, nb),
+            .shadow_bins = try alloc.alloc(buffers.RenderTriangleList, nb),
+            .merge_scratch = buffers.RenderTriangleList.init(alloc),
+            .sort_keys = std.array_list.Managed(keysort.KeyIdx).init(alloc),
+            .eye_scratch = geom.RenderVertexList.init(alloc),
+            .clip_scratch = geom.RenderVertexList.init(alloc),
+        };
+        try out.opaque_list.ensureTotalCapacity(1000);
+        try out.trans.ensureTotalCapacity(1000);
+        try out.shadow.ensureTotalCapacity(1000);
+        try out.merge_scratch.ensureTotalCapacity(2000);
+        try out.sort_keys.ensureTotalCapacity(2000);
+        for (0..nb) |s| {
+            out.opaque_bins[s] = buffers.RenderTriangleList.init(alloc);
+            out.trans_bins[s] = buffers.RenderTriangleList.init(alloc);
+            out.shadow_bins[s] = buffers.RenderTriangleList.init(alloc);
+            try out.opaque_bins[s].ensureTotalCapacity(256);
+            try out.trans_bins[s].ensureTotalCapacity(96);
+            try out.shadow_bins[s].ensureTotalCapacity(256);
         }
+        try tl_thread_outputs.append(out);
     }
     var raster_shared: [2]buffers.RasterSharedData = .{ .{}, .{} };
 
@@ -350,106 +340,108 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var depth_buffer = std.array_list.Managed(f32).init(alloc);
     var normal_buffer = std.array_list.Managed(f32).init(alloc);
     var linear_z_buffer = std.array_list.Managed(f32).init(alloc);
-    depth_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height)) catch unreachable;
-    normal_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height * 3)) catch unreachable;
-    linear_z_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height)) catch unreachable;
+    try depth_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height));
+    try normal_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height * 3));
+    try linear_z_buffer.appendNTimes(0.0, @intCast(screen_width * screen_height));
     var shadow_depth_buffers: [2]std.array_list.Managed(ShadowDepth) = undefined;
-    shadow_depth_buffers[0] = std.array_list.Managed(ShadowDepth).init(alloc);
-    shadow_depth_buffers[1] = std.array_list.Managed(ShadowDepth).init(alloc);
-    shadow_depth_buffers[0].appendNTimes(0, @intCast(config.SHADOW_MAP_SIZE * config.SHADOW_MAP_SIZE)) catch unreachable;
-    shadow_depth_buffers[1].appendNTimes(0, @intCast(config.SHADOW_MAP_SIZE * config.SHADOW_MAP_SIZE)) catch unreachable;
+    for (&shadow_depth_buffers) |*buf| {
+        buf.* = std.array_list.Managed(ShadowDepth).init(alloc);
+        try buf.appendNTimes(0, @intCast(config.SHADOW_MAP_SIZE * config.SHADOW_MAP_SIZE));
+    }
 
     var instance_depths = std.array_list.Managed(buffers.InstanceDepth).init(alloc);
-    instance_depths.ensureTotalCapacity(instances.items.len) catch unreachable;
+    try instance_depths.ensureTotalCapacity(instances.items.len);
     var occluders_eye = std.array_list.Managed(cull.OccluderEye).init(alloc);
-    occluders_eye.ensureTotalCapacity(instances.items.len) catch unreachable;
+    try occluders_eye.ensureTotalCapacity(instances.items.len);
 
     var fps_counter = fps.FpsCounter{};
 
     // ----- 8. RendererContext -----
-    var ctx = renderer_context.RendererContext{};
-    ctx.fb = fb;
-    ctx.screen_width = screen_width;
-    ctx.screen_height = screen_height;
+    // Built in one shot: every field is live before any worker thread can
+    // observe the context, so the struct carries no optionals.
+    var ctx = renderer_context.RendererContext{
+        .fb = fb,
+        .screen_width = screen_width,
+        .screen_height = screen_height,
 
-    ctx.cube_vertices = &cube_vertices;
-    ctx.cube_faces = &cube_faces;
-    ctx.sphere_vertices = &sphere_vertices;
-    ctx.sphere_faces = &sphere_faces;
-    ctx.torus_vertices = &torus_vertices;
-    ctx.torus_faces = &torus_faces;
-    ctx.teapot_vertices = &teapot_vertices;
-    ctx.teapot_faces = &teapot_faces;
-    ctx.smallball_vertices = &smallball_vertices;
-    ctx.smallball_faces = &smallball_faces;
-    ctx.ground_vertices = &ground_vertices;
-    ctx.ground_faces = &ground_faces;
-    ctx.lamp_vertices = &lamp_vertices;
-    ctx.lamp_faces = &lamp_faces;
+        .cube_vertices = &cube_vertices,
+        .cube_faces = &cube_faces,
+        .sphere_vertices = &sphere_vertices,
+        .sphere_faces = &sphere_faces,
+        .torus_vertices = &torus_vertices,
+        .torus_faces = &torus_faces,
+        .teapot_vertices = &teapot_vertices,
+        .teapot_faces = &teapot_faces,
+        .smallball_vertices = &smallball_vertices,
+        .smallball_faces = &smallball_faces,
+        .ground_vertices = &ground_vertices,
+        .ground_faces = &ground_faces,
+        .lamp_vertices = &lamp_vertices,
+        .lamp_faces = &lamp_faces,
 
-    ctx.cube_bound_radius = cube_bound_radius;
-    ctx.sphere_bound_radius = sphere_bound_radius;
-    ctx.torus_bound_radius = torus_bound_radius;
-    ctx.teapot_bound_radius = teapot_bound_radius;
-    ctx.smallball_bound_radius = smallball_bound_radius;
-    ctx.ground_bound_radius = ground_bound_radius;
-    ctx.lamp_bound_radius = lamp_bound_radius;
-    ctx.lamp_instance_index = lamp_instance_index;
+        .cube_bound_radius = cube_bound_radius,
+        .sphere_bound_radius = sphere_bound_radius,
+        .torus_bound_radius = torus_bound_radius,
+        .teapot_bound_radius = teapot_bound_radius,
+        .smallball_bound_radius = smallball_bound_radius,
+        .ground_bound_radius = ground_bound_radius,
+        .lamp_bound_radius = lamp_bound_radius,
+        .lamp_instance_index = lamp_instance_index,
 
-    ctx.instances = &instances;
-    ctx.initial_instance_states = &initial_instance_states;
-    ctx.walls = &walls;
-    ctx.box_half = box_half;
-    ctx.wall_thick = wall_thick;
-    ctx.ground_y = ground_y;
-    ctx.ground_half = ground_half;
+        .instances = &instances,
+        .initial_instance_states = &initial_instance_states,
+        .walls = &walls,
+        .box_half = box_half,
+        .wall_thick = wall_thick,
+        .ground_y = ground_y,
+        .ground_half = ground_half,
 
-    ctx.opaque_buffers = &opaque_buffers;
-    ctx.trans_buffers = &trans_buffers;
-    ctx.shadow_buffers = &shadow_buffers;
-    ctx.opaque_strip_buffers = &opaque_strip_buffers;
-    ctx.trans_strip_buffers = &trans_strip_buffers;
-    ctx.shadow_strip_buffers = &shadow_strip_buffers;
-    ctx.cone_buffers = &cone_buffers;
+        .opaque_buffers = &opaque_buffers,
+        .trans_buffers = &trans_buffers,
+        .shadow_buffers = &shadow_buffers,
+        .opaque_strip_buffers = &opaque_strip_buffers,
+        .trans_strip_buffers = &trans_strip_buffers,
+        .shadow_strip_buffers = &shadow_strip_buffers,
+        .cone_buffers = &cone_buffers,
 
-    ctx.shadow_box_buffers = &shadow_box_buffers;
-    ctx.light_dir_buffers = &light_dir_buffers;
-    ctx.light_pos_buffers = &light_pos_buffers;
-    ctx.spot_dir_buffers = &spot_dir_buffers;
-    ctx.view_matrix_buffers = &view_matrix_buffers;
-    ctx.projection_buffers = &projection_buffers;
-    ctx.shadow_matrix_buffers = &shadow_matrix_buffers;
-    ctx.time_buffers = &time_buffers;
-    ctx.shadow_depth_buffers = &shadow_depth_buffers;
-    ctx.depth_buffer = &depth_buffer;
-    ctx.normal_buffer = &normal_buffer;
-    ctx.linear_z_buffer = &linear_z_buffer;
+        .shadow_box_buffers = &shadow_box_buffers,
+        .light_dir_buffers = &light_dir_buffers,
+        .light_pos_buffers = &light_pos_buffers,
+        .spot_dir_buffers = &spot_dir_buffers,
+        .view_matrix_buffers = &view_matrix_buffers,
+        .projection_buffers = &projection_buffers,
+        .shadow_matrix_buffers = &shadow_matrix_buffers,
+        .time_buffers = &time_buffers,
+        .shadow_depth_buffers = &shadow_depth_buffers,
+        .depth_buffer = &depth_buffer,
+        .normal_buffer = &normal_buffer,
+        .linear_z_buffer = &linear_z_buffer,
 
-    ctx.tl_shared = &tl_shared;
-    ctx.tl_thread_outputs = &tl_thread_outputs;
-    ctx.launched_tl_threads = launched_tl_threads;
-    ctx.raster_shared = &raster_shared;
-    ctx.launched_raster_threads = launched_raster_threads;
+        .tl_shared = &tl_shared,
+        .tl_thread_outputs = &tl_thread_outputs,
+        .launched_tl_threads = launched_tl_threads,
+        .raster_shared = &raster_shared,
+        .launched_raster_threads = launched_raster_threads,
 
-    ctx.instance_depths = &instance_depths;
-    ctx.occluders_eye = &occluders_eye;
+        .instance_depths = &instance_depths,
+        .occluders_eye = &occluders_eye,
 
-    ctx.physics = &physics;
-    ctx.thread_perf = &thread_perf;
-    ctx.fps_counter = &fps_counter;
-    ctx.profiler = &profiler;
+        .physics = &physics,
+        .thread_perf = &thread_perf,
+        .fps_counter = &fps_counter,
+        .profiler = &profiler,
+    };
 
     profiler_mod.thread_profiler_init(&profiler, launched_tl_threads, launched_raster_threads);
 
     // ----- 9. Spawn workers -----
-    const pool_size: usize = @intCast(launched_raster_threads);
     var pool_workers = std.array_list.Managed(thread.Handle).init(alloc);
     defer pool_workers.deinit();
     {
         var i: i32 = 0;
         while (i < launched_raster_threads) : (i += 1) {
             const t = try thread.spawn(pool_worker.pool_worker_main, .{ i, &ctx });
-            pool_workers.append(t) catch unreachable;
+            try pool_workers.append(t);
         }
     }
     const physics_worker = try thread.spawn(physics_pipeline.physics_worker_thread, .{&physics});
@@ -470,5 +462,4 @@ pub fn main(init: std.process.Init.Minimal) !void {
     physics_worker.join();
 
     platform.Shutdown();
-    _ = pool_size;
 }

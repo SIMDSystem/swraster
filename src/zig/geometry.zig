@@ -7,7 +7,6 @@ const la = @import("linalg.zig");
 const Vec3 = la.Vec3;
 const Vec4 = la.Vec4;
 
-const M_PI: f32 = 3.14159265358979323846;
 
 pub const Vertex3D = struct {
     position: Vec4 = .{ .x = 0, .y = 0, .z = 0, .w = 1 },
@@ -142,11 +141,11 @@ pub fn generate_sphere(radius: f32, slices: i32, stacks: i32, vertices: *RenderV
     var i: i32 = 0;
     while (i <= stacks) : (i += 1) {
         const v = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(stacks));
-        const phi = v * M_PI;
+        const phi = v * std.math.pi;
         var j: i32 = 0;
         while (j <= slices) : (j += 1) {
             const u = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(slices));
-            const theta = u * 2.0 * M_PI;
+            const theta = u * 2.0 * std.math.pi;
             const x = -@cos(theta) * @sin(phi);
             const y = -@cos(phi);
             const z = @sin(theta) * @sin(phi);
@@ -182,11 +181,11 @@ pub fn generate_spotlight_housing(radius: f32, slices: i32, stacks: i32, opening
         var i: i32 = 0;
         while (i <= stacks) : (i += 1) {
             const v = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(stacks));
-            const phi = v * M_PI;
+            const phi = v * std.math.pi;
             var j: i32 = 0;
             while (j <= slices) : (j += 1) {
                 const u = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(slices));
-                const theta = u * 2.0 * M_PI;
+                const theta = u * 2.0 * std.math.pi;
                 const x = -@cos(theta) * @sin(phi);
                 const y = -@cos(phi);
                 const z = @sin(theta) * @sin(phi);
@@ -206,10 +205,10 @@ pub fn generate_spotlight_housing(radius: f32, slices: i32, stacks: i32, opening
     const in_g: f32 = 1.0;
     const in_b: f32 = 1.0;
 
-    const open_cos = @cos(opening_half_angle_deg * M_PI / 180.0);
+    const open_cos = @cos(opening_half_angle_deg * std.math.pi / 180.0);
     var i: i32 = 0;
     while (i < stacks) : (i += 1) {
-        const phi_top = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(stacks)) * M_PI;
+        const phi_top = @as(f32, @floatFromInt(i + 1)) / @as(f32, @floatFromInt(stacks)) * std.math.pi;
         const y_top = -@cos(phi_top);
         if (y_top > open_cos) continue;
         var j: i32 = 0;
@@ -232,12 +231,12 @@ pub fn generate_torus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i
 
     var i: i32 = 0;
     while (i <= slices) : (i += 1) {
-        const u = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(slices)) * 2.0 * M_PI;
+        const u = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(slices)) * 2.0 * std.math.pi;
         const cos_u = @cos(u);
         const sin_u = @sin(u);
         var j: i32 = 0;
         while (j <= stacks) : (j += 1) {
-            const v = (@as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(stacks)) * 2.0 * M_PI) + M_PI;
+            const v = (@as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(stacks)) * 2.0 * std.math.pi) + std.math.pi;
             const cos_v = @cos(v);
             const sin_v = @sin(v);
             const r = main_radius + tube_radius * cos_v;
@@ -278,10 +277,8 @@ fn bezier_curve(p: *const [4]Vec3, t: f32) Vec3 {
 
 fn bezier_patch(patch: *const [4][4]Vec3, u: f32, v: f32) Vec3 {
     var u_curve: [4]Vec3 = undefined;
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        const v_curve = [4]Vec3{ patch[i][0], patch[i][1], patch[i][2], patch[i][3] };
-        u_curve[i] = bezier_curve(&v_curve, v);
+    for (&u_curve, patch) |*uc, row| {
+        uc.* = bezier_curve(&row, v);
     }
     return bezier_curve(&u_curve, u);
 }
@@ -301,13 +298,10 @@ pub fn generate_teapot(vertices: *RenderVertexList, faces: *FaceList) void {
     var patch_vertex_indices = std.array_list.Managed(i32).init(alloc);
     defer patch_vertex_indices.deinit();
 
-    var patch_idx: usize = 0;
-    while (patch_idx < 32) : (patch_idx += 1) {
+    for (0..32) |patch_idx| {
         var patch: [4][4]Vec3 = undefined;
-        var pi: usize = 0;
-        while (pi < 4) : (pi += 1) {
-            var pj: usize = 0;
-            while (pj < 4) : (pj += 1) {
+        for (0..4) |pi| {
+            for (0..4) |pj| {
                 patch[pi][pj] = Vec3.init(
                     teapot_data[patch_idx][pi][pj][0] * scale,
                     teapot_data[patch_idx][pi][pj][1] * scale,

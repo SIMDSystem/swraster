@@ -11,8 +11,6 @@ const Mat4 = la.Mat4;
 const Vertex3D = geom.Vertex3D;
 const RenderVertexList = geom.RenderVertexList;
 
-const M_PI: f32 = 3.14159265358979323846;
-
 // Projected vertex plus attributes interpolated across pixels.
 pub const VertexVaryings = struct {
     x: f32 = 0,
@@ -49,33 +47,25 @@ pub const ClipVertex = struct {
     v: f32 = 0,
 };
 
-pub inline fn project_eye_point(projection: *const Mat4, p: Vec3, screen_width: i32, screen_height: i32, sx: *f32, sy: *f32, sz: *f32) bool {
-    const clip = projection.mulVec4(Vec4.init(p.x, p.y, p.z, 1.0));
-    if (clip.w <= 0.1) return false;
-    const inv_w = 1.0 / clip.w;
-    const nx = clip.x * inv_w;
-    const ny = clip.y * inv_w;
-    sz.* = clip.z * inv_w;
-    sx.* = (nx + 1.0) * 0.5 * @as(f32, @floatFromInt(screen_width));
-    sy.* = (1.0 - ny) * 0.5 * @as(f32, @floatFromInt(screen_height));
-    return true;
-}
+// Eye-space point projected to screen space; null when behind the near guard.
+pub const ScreenPoint = struct { x: f32, y: f32, z: f32, inv_w: f32 };
 
-pub inline fn project_eye_point_w(projection: *const Mat4, p: Vec3, screen_width: i32, screen_height: i32, sx: *f32, sy: *f32, sz: *f32, inv_w_out: *f32) bool {
+pub inline fn project_eye_point(projection: *const Mat4, p: Vec3, screen_width: i32, screen_height: i32) ?ScreenPoint {
     const clip = projection.mulVec4(Vec4.init(p.x, p.y, p.z, 1.0));
-    if (clip.w <= 0.1) return false;
+    if (clip.w <= 0.1) return null;
     const inv_w = 1.0 / clip.w;
-    inv_w_out.* = inv_w;
     const nx = clip.x * inv_w;
     const ny = clip.y * inv_w;
-    sz.* = clip.z * inv_w;
-    sx.* = (nx + 1.0) * 0.5 * @as(f32, @floatFromInt(screen_width));
-    sy.* = (1.0 - ny) * 0.5 * @as(f32, @floatFromInt(screen_height));
-    return true;
+    return .{
+        .x = (nx + 1.0) * 0.5 * @as(f32, @floatFromInt(screen_width)),
+        .y = (1.0 - ny) * 0.5 * @as(f32, @floatFromInt(screen_height)),
+        .z = clip.z * inv_w,
+        .inv_w = inv_w,
+    };
 }
 
 pub fn build_projection_matrix(fov_degrees: f32, aspect: f32, near_plane: f32, far_plane: f32) Mat4 {
-    const fov_rad = fov_degrees * M_PI / 180.0;
+    const fov_rad = fov_degrees * std.math.pi / 180.0;
     const f = 1.0 / @tan(fov_rad / 2.0);
 
     var proj = Mat4.zero();
@@ -122,12 +112,9 @@ pub fn build_shadow_tex_matrix(view_matrix: *const Mat4, light_dir: Vec3, scene_
     var max_y: f32 = -1e30;
     var max_d: f32 = -1e30;
 
-    var ix: i32 = 0;
-    while (ix < 2) : (ix += 1) {
-        var iy: i32 = 0;
-        while (iy < 2) : (iy += 1) {
-            var iz: i32 = 0;
-            while (iz < 2) : (iz += 1) {
+    for (0..2) |ix| {
+        for (0..2) |iy| {
+            for (0..2) |iz| {
                 const corner = Vec4.init(
                     if (ix != 0) scene_max.x else scene_min.x,
                     if (iy != 0) scene_max.y else scene_min.y,
@@ -191,14 +178,10 @@ pub fn build_spot_shadow_tex_matrix(light_view_eye: *const Mat4, fov_degrees: f3
 
 pub fn transform_vertices(source_vertices: *const RenderVertexList, transformed_vertices: *RenderVertexList, transform: *const Mat4) void {
     @setFloatMode(.optimized);
-    const n = source_vertices.items.len;
-    transformed_vertices.resize(n) catch unreachable;
+    transformed_vertices.resize(source_vertices.items.len) catch unreachable;
     const normal_matrix: Mat3 = transform.block33();
 
-    var i: usize = 0;
-    while (i < n) : (i += 1) {
-        const src = source_vertices.items[i];
-        var dst = &transformed_vertices.items[i];
+    for (transformed_vertices.items, source_vertices.items) |*dst, src| {
         dst.position = transform.mulVec4(src.position);
         dst.normal = normal_matrix.mulVec3(src.normal).normalized();
         dst.u = src.u;
@@ -278,9 +261,7 @@ pub fn clip_triangle_near(in: *const [3]ClipVertex, out: *[4]ClipVertex, view_ma
     var prev = in[2];
     var prev_inside = is_inside_near(&prev, view_matrix, near_plane);
 
-    var i: usize = 0;
-    while (i < 3) : (i += 1) {
-        const cur = in[i];
+    for (in) |cur| {
         const cur_inside = is_inside_near(&cur, view_matrix, near_plane);
         if (cur_inside != prev_inside) {
             out[@intCast(out_count)] = interpolate_clip_vertex(&prev, &cur, view_matrix, near_plane);

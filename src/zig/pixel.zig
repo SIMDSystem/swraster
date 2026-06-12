@@ -82,13 +82,10 @@ fn glyph_for(ch: u8) [7]u8 {
 pub fn draw_digit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: u32, format: *const PixelFormat) void {
     if (digit < 0 or digit > 9) return;
     const bpp: i32 = format.BytesPerPixel;
-    var row: usize = 0;
-    while (row < 7) : (row += 1) {
-        const bits = font_5x7[@intCast(digit)][row];
-        var col: u3 = 0;
-        while (col < 5) : (col += 1) {
-            if (bits & (@as(u8, 0x10) >> col) != 0) {
-                const px = x + @as(i32, col);
+    for (font_5x7[@intCast(digit)], 0..) |bits, row| {
+        for (0..5) |col| {
+            if (bits & (@as(u8, 0x10) >> @intCast(col)) != 0) {
+                const px = x + @as(i32, @intCast(col));
                 const py = y + @as(i32, @intCast(row));
                 const off: usize = @intCast(py * pitch + px * bpp);
                 const pixel: *u32 = @ptrCast(@alignCast(pixels + off));
@@ -104,13 +101,10 @@ pub fn draw_text(pixels: [*]u8, pitch: i32, x: i32, y: i32, text: []const u8, r:
     var pos: i32 = 0;
     for (text) |ch| {
         const glyph = glyph_for(ch);
-        var row: usize = 0;
-        while (row < 7) : (row += 1) {
-            const bits = glyph[row];
-            var col: u3 = 0;
-            while (col < 5) : (col += 1) {
-                if (bits & (@as(u8, 0x10) >> col) != 0) {
-                    const px = x + pos * 6 + @as(i32, col);
+        for (glyph, 0..) |bits, row| {
+            for (0..5) |col| {
+                if (bits & (@as(u8, 0x10) >> @intCast(col)) != 0) {
+                    const px = x + pos * 6 + @as(i32, @intCast(col));
                     const py = y + @as(i32, @intCast(row));
                     const off: usize = @intCast(py * pitch + px * bpp);
                     const pixel: *u32 = @ptrCast(@alignCast(pixels + off));

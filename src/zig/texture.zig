@@ -24,38 +24,49 @@ pub const PackedTexture = struct {
 };
 
 fn is_power_of_two(v: i32) bool {
-    return v > 0 and (v & (v - 1)) == 0;
+    return v > 0 and std.math.isPowerOfTwo(v);
 }
 
 fn previous_power_of_two(v: i32) i32 {
     if (v <= 1) return 1;
-    var p: i32 = 1;
-    while ((p << 1) > 0 and (p << 1) <= v) p <<= 1;
-    return p;
+    return std.math.floorPowerOfTwo(i32, v);
 }
 
+// Optional wrapper keeps the C++-shaped "null on any failure" contract for
+// callers; the error-union builder below gets errdefer-based cleanup so a
+// mid-build OOM cannot leak the texture, the mip levels, or the scratch.
 pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*PackedTexture {
     const s = src orelse return null;
     if (s.pixels == null or s.format == null) return null;
+    return build_packed_texture(allocator, s) catch null;
+}
+
+fn build_packed_texture(allocator: std.mem.Allocator, s: *Surface) !*PackedTexture {
     const fmt = s.format.?;
 
-    const tex = allocator.create(PackedTexture) catch return null;
+    const tex = try allocator.create(PackedTexture);
+    errdefer allocator.destroy(tex);
     tex.* = .{ .allocator = allocator };
 
     var levels = std.array_list.Managed(PackedTextureLevel).init(allocator);
+    errdefer {
+        for (levels.items) |level| allocator.free(level.rgb);
+        levels.deinit();
+    }
 
     // Unpack source into canonical 0x00RRGGBB.
     const src_w = s.w;
     const src_h = s.h;
-    var source_rgb = allocator.alloc(u32, @intCast(src_w * src_h)) catch return null;
+    const src_w_u: usize = @intCast(src_w);
+    const source_rgb = try allocator.alloc(u32, src_w_u * @as(usize, @intCast(src_h)));
     const bpp = fmt.BytesPerPixel;
+    const bpp_u: usize = @intCast(bpp);
+    const pitch: usize = @intCast(s.pitch);
     const base_pixels: [*]const u8 = @ptrCast(s.pixels.?);
-    var y: i32 = 0;
-    while (y < src_h) : (y += 1) {
-        const row = base_pixels + @as(usize, @intCast(y * s.pitch));
-        var x: i32 = 0;
-        while (x < src_w) : (x += 1) {
-            const p = row + @as(usize, @intCast(x * bpp));
+    for (0..@intCast(src_h)) |y| {
+        const row = base_pixels + y * pitch;
+        for (0..src_w_u) |x| {
+            const p = row + x * bpp_u;
             var px: u32 = 0;
             if (bpp == 4) {
                 px = std.mem.readInt(u32, p[0..4], .little);
@@ -67,7 +78,7 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
                 px = p[0];
             }
             const c = pixel.unpack_rgb_fast(px, fmt);
-            source_rgb[@intCast(y * src_w + x)] = (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
+            source_rgb[y * src_w_u + x] = (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
         }
     }
 
@@ -78,7 +89,8 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
     if (base.w == src_w and base.h == src_h) {
         base.rgb = source_rgb;
     } else {
-        base.rgb = allocator.alloc(u32, @intCast(base.w * base.h)) catch return null;
+        errdefer allocator.free(source_rgb);
+        base.rgb = try allocator.alloc(u32, @intCast(base.w * base.h));
         var by: i32 = 0;
         while (by < base.h) : (by += 1) {
             const sy = @min(src_h - 1, @as(i32, @intFromFloat((@as(f32, @floatFromInt(by)) + 0.5) * @as(f32, @floatFromInt(src_h)) / @as(f32, @floatFromInt(base.h)))));
@@ -91,14 +103,17 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
         allocator.free(source_rgb);
     }
 
-    levels.append(base) catch return null;
+    {
+        errdefer allocator.free(base.rgb);
+        try levels.append(base);
+    }
 
     while (levels.items[levels.items.len - 1].w > 1 or levels.items[levels.items.len - 1].h > 1) {
         const prev = levels.items[levels.items.len - 1];
         var next = PackedTextureLevel{};
         next.w = @max(1, prev.w >> 1);
         next.h = @max(1, prev.h >> 1);
-        next.rgb = allocator.alloc(u32, @intCast(next.w * next.h)) catch return null;
+        next.rgb = try allocator.alloc(u32, @intCast(next.w * next.h));
         var ny: i32 = 0;
         while (ny < next.h) : (ny += 1) {
             var nx: i32 = 0;
@@ -107,12 +122,10 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
                 var g: u32 = 0;
                 var b: u32 = 0;
                 var count: u32 = 0;
-                var oy: i32 = 0;
-                while (oy < 2) : (oy += 1) {
-                    const sy = @min(prev.h - 1, ny * 2 + oy);
-                    var ox: i32 = 0;
-                    while (ox < 2) : (ox += 1) {
-                        const sx = @min(prev.w - 1, nx * 2 + ox);
+                for (0..2) |oy| {
+                    const sy = @min(prev.h - 1, ny * 2 + @as(i32, @intCast(oy)));
+                    for (0..2) |ox| {
+                        const sx = @min(prev.w - 1, nx * 2 + @as(i32, @intCast(ox)));
                         const c = prev.rgb[@intCast(sy * prev.w + sx)];
                         r += (c >> 16) & 0xff;
                         g += (c >> 8) & 0xff;
@@ -123,10 +136,13 @@ pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*Packe
                 next.rgb[@intCast(ny * next.w + nx)] = ((r / count) << 16) | ((g / count) << 8) | (b / count);
             }
         }
-        levels.append(next) catch return null;
+        {
+            errdefer allocator.free(next.rgb);
+            try levels.append(next);
+        }
     }
 
-    tex.levels = levels.toOwnedSlice() catch return null;
+    tex.levels = try levels.toOwnedSlice();
     return tex;
 }
 

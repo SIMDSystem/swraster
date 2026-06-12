@@ -24,8 +24,6 @@ const ShadowDepth = config.ShadowDepth;
 const Pixel32 = config.Pixel32;
 const LuminaireConeBuffer = buffers.LuminaireConeBuffer;
 
-const M_PI: f32 = 3.14159265358979323846;
-
 pub const TriangleShader = enum { Lit, DebugUnlitRed, LuminaireCone };
 
 // On wasm, @min/@max lower to f32x4.min/max — NaN-propagating forms that
@@ -185,31 +183,31 @@ pub fn draw_pixel(pixels: [*]u8, pitch: i32, x: i32, y: i32, color: u32, w: i32,
     row[@intCast(x)] = color;
 }
 
-pub inline fn clip_line_to_rect(x0: f32, y0: f32, x1: f32, y1: f32, xmin: f32, ymin: f32, xmax: f32, ymax: f32, t_a: *f32, t_b: *f32) bool {
+// Liang-Barsky span of the line inside the rect, or null if fully outside.
+pub const LineClip = struct { t0: f32, t1: f32 };
+
+pub inline fn clip_line_to_rect(x0: f32, y0: f32, x1: f32, y1: f32, xmin: f32, ymin: f32, xmax: f32, ymax: f32) ?LineClip {
     const dx = x1 - x0;
     const dy = y1 - y0;
     var t0: f32 = 0.0;
     var t1: f32 = 1.0;
     const p = [4]f32{ -dx, dx, -dy, dy };
     const q = [4]f32{ x0 - xmin, xmax - x0, y0 - ymin, ymax - y0 };
-    var i: usize = 0;
-    while (i < 4) : (i += 1) {
-        if (p[i] == 0.0) {
-            if (q[i] < 0.0) return false;
+    for (p, q) |pe, qe| {
+        if (pe == 0.0) {
+            if (qe < 0.0) return null;
         } else {
-            const r = q[i] / p[i];
-            if (p[i] < 0.0) {
-                if (r > t1) return false;
+            const r = qe / pe;
+            if (pe < 0.0) {
+                if (r > t1) return null;
                 if (r > t0) t0 = r;
             } else {
-                if (r < t0) return false;
+                if (r < t0) return null;
                 if (r < t1) t1 = r;
             }
         }
     }
-    t_a.* = t0;
-    t_b.* = t1;
-    return true;
+    return .{ .t0 = t0, .t1 = t1 };
 }
 
 pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i32, y0_in: i32, z0_in: f32, x1_in: i32, y1_in: i32, z1_in: f32, color: u32, w: i32, h: i32) void {
@@ -220,18 +218,16 @@ pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i
     var y1 = y1_in;
     var z1 = z1_in;
     {
-        var t_a: f32 = 0;
-        var t_b: f32 = 0;
-        if (!clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1), &t_a, &t_b)) return;
+        const span = clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
         const dx_f: f32 = @floatFromInt(x1 - x0);
         const dy_f: f32 = @floatFromInt(y1 - y0);
         const dz_f = z1 - z0;
-        const nx0: i32 = @intFromFloat(@as(f32, @floatFromInt(x0)) + t_a * dx_f + 0.5);
-        const ny0: i32 = @intFromFloat(@as(f32, @floatFromInt(y0)) + t_a * dy_f + 0.5);
-        const nz0 = z0 + t_a * dz_f;
-        const nx1: i32 = @intFromFloat(@as(f32, @floatFromInt(x0)) + t_b * dx_f + 0.5);
-        const ny1: i32 = @intFromFloat(@as(f32, @floatFromInt(y0)) + t_b * dy_f + 0.5);
-        const nz1 = z0 + t_b * dz_f;
+        const nx0: i32 = @intFromFloat(@as(f32, @floatFromInt(x0)) + span.t0 * dx_f + 0.5);
+        const ny0: i32 = @intFromFloat(@as(f32, @floatFromInt(y0)) + span.t0 * dy_f + 0.5);
+        const nz0 = z0 + span.t0 * dz_f;
+        const nx1: i32 = @intFromFloat(@as(f32, @floatFromInt(x0)) + span.t1 * dx_f + 0.5);
+        const ny1: i32 = @intFromFloat(@as(f32, @floatFromInt(y0)) + span.t1 * dy_f + 0.5);
+        const nz1 = z0 + span.t1 * dz_f;
         x0 = nx0;
         y0 = ny0;
         z0 = nz0;
@@ -279,9 +275,9 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
     var inv_w0 = inv_w0_in;
     var inv_w1 = inv_w1_in;
     {
-        var t_a: f32 = 0;
-        var t_b: f32 = 0;
-        if (!clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1), &t_a, &t_b)) return;
+        const span = clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
+        const t_a = span.t0;
+        const t_b = span.t1;
         if (t_a > 0.0 or t_b < 1.0) {
             const dx_f: f32 = @floatFromInt(x1 - x0);
             const dy_f: f32 = @floatFromInt(y1 - y0);
@@ -363,17 +359,14 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
 }
 
 pub fn draw_spotlight_luminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, projection: *const Mat4, light_pos: Vec3) void {
-    var lx: f32 = 0;
-    var ly: f32 = 0;
-    var lz: f32 = 0;
-    if (!clip.project_eye_point(projection, light_pos, screen_width, screen_height, &lx, &ly, &lz)) return;
+    const lp = clip.project_eye_point(projection, light_pos, screen_width, screen_height) orelse return;
+    const lx = lp.x;
+    const ly = lp.y;
+    const lz = lp.z;
 
     const glare_radius_3d: f32 = 0.42;
-    var ex: f32 = 0;
-    var ey: f32 = 0;
-    var ez: f32 = 0;
-    if (!clip.project_eye_point(projection, light_pos.add(Vec3.init(glare_radius_3d, 0, 0)), screen_width, screen_height, &ex, &ey, &ez)) return;
-    var disk_radius = @abs(ex - lx);
+    const edge = clip.project_eye_point(projection, light_pos.add(Vec3.init(glare_radius_3d, 0, 0)), screen_width, screen_height) orelse return;
+    var disk_radius = @abs(edge.x - lx);
     if (disk_radius < 1.0) disk_radius = 1.0;
 
     const x_min = @max(0, @as(i32, @intFromFloat(@floor(lx - disk_radius))));
@@ -909,7 +902,7 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
                     const cone_len: f32 = 4.5;
                     var cone_t = (px * spot_dir.x + py * spot_dir.y + pz * spot_dir.z) / cone_len;
                     cone_t = @min(1.0, @max(0.0, cone_t));
-                    const distal_fade = 0.5 + 0.5 * @cos(M_PI * cone_t);
+                    const distal_fade = 0.5 + 0.5 * @cos(std.math.pi * cone_t);
 
                     const n_len2 = nx * nx + ny * ny + nz * nz;
                     const p_len2 = ex * ex + ey * ey + ez * ez;
@@ -980,7 +973,11 @@ pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat
 
     const make_vertex = struct {
         fn f(proj: *const Mat4, p: Vec3, n: Vec3, sw: i32, sh: i32, vv: *VertexVaryings) bool {
-            if (!clip.project_eye_point_w(proj, p, sw, sh, &vv.x, &vv.y, &vv.z, &vv.inv_w)) return false;
+            const sp = clip.project_eye_point(proj, p, sw, sh) orelse return false;
+            vv.x = sp.x;
+            vv.y = sp.y;
+            vv.z = sp.z;
+            vv.inv_w = sp.inv_w;
             vv.r = 1.0;
             vv.g = 1.0;
             vv.b = 1.0;
@@ -1013,8 +1010,8 @@ pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat
         tri.v2.inv_w = 0.0;
 
         const seg: f32 = @floatFromInt(config.LUMINAIRE_CONE_SEGMENTS);
-        const a0 = (2.0 * M_PI * @as(f32, @floatFromInt(i))) / seg;
-        const a1 = (2.0 * M_PI * @as(f32, @floatFromInt(i + 1))) / seg;
+        const a0 = (2.0 * std.math.pi * @as(f32, @floatFromInt(i))) / seg;
+        const a1 = (2.0 * std.math.pi * @as(f32, @floatFromInt(i + 1))) / seg;
         const radial0 = u.scale(@cos(a0)).add(v.scale(@sin(a0)));
         const radial1 = u.scale(@cos(a1)).add(v.scale(@sin(a1)));
         const n0 = radial0.scale(cone_len).sub(axis.scale(radius)).normalized();
