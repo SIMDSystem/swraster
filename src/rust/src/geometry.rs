@@ -4,8 +4,7 @@
 
 use crate::linalg::{Vec3, Vec4};
 use std::collections::HashMap;
-
-const M_PI: f32 = std::f32::consts::PI;
+use std::f32::consts::PI;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Vertex3D {
@@ -95,9 +94,9 @@ pub const TEAPOT_DATA: [[[[f32; 3]; 4]; 4]; 32] = [
     [[[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,0.0]],[[0.0,0.0,-1.425],[0.798,0.0,-1.425],[1.425,0.0,-0.798],[1.425,0.0,0.0]],[[0.0,0.075,-1.5],[0.84,0.075,-1.5],[1.5,0.075,-0.84],[1.5,0.075,0.0]],[[0.0,0.15,-1.5],[0.84,0.15,-1.5],[1.5,0.15,-0.84],[1.5,0.15,0.0]]],
 ];
 
-pub fn generate_cube(vertices: &mut RenderVertexList, faces: &mut FaceList) {
-    vertices.clear();
-    faces.clear();
+pub fn generate_cube() -> (RenderVertexList, FaceList) {
+    let mut vertices = RenderVertexList::new();
+    let mut faces = FaceList::new();
 
     let mk = |verts: &mut RenderVertexList,
               x: f32,
@@ -118,65 +117,61 @@ pub fn generate_cube(vertices: &mut RenderVertexList, faces: &mut FaceList) {
     };
 
     // Front (Z+)
-    let f0 = mk(vertices, -1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0);
-    let f1 = mk(vertices, 1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
-    let f2 = mk(vertices, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0);
-    let f3 = mk(vertices, -1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
+    let f0 = mk(&mut vertices, -1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0);
+    let f1 = mk(&mut vertices, 1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0);
+    let f2 = mk(&mut vertices, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.0);
+    let f3 = mk(&mut vertices, -1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0);
     faces.push(face(f0, f1, f2, 1.0, 0.0, 0.0, 1.0));
     faces.push(face(f0, f2, f3, 1.0, 0.0, 0.0, 1.0));
     // Back (Z-)
-    let b0 = mk(vertices, 1.0, -1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0);
-    let b1 = mk(vertices, -1.0, -1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 1.0);
-    let b2 = mk(vertices, -1.0, 1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0);
-    let b3 = mk(vertices, 1.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0);
+    let b0 = mk(&mut vertices, 1.0, -1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0);
+    let b1 = mk(&mut vertices, -1.0, -1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 1.0);
+    let b2 = mk(&mut vertices, -1.0, 1.0, -1.0, 0.0, 0.0, -1.0, 1.0, 0.0);
+    let b3 = mk(&mut vertices, 1.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0);
     faces.push(face(b0, b1, b2, 0.0, 1.0, 0.0, 1.0));
     faces.push(face(b0, b2, b3, 0.0, 1.0, 0.0, 1.0));
     // Right (X+)
-    let r0 = mk(vertices, 1.0, -1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0);
-    let r1 = mk(vertices, 1.0, -1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 1.0);
-    let r2 = mk(vertices, 1.0, 1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 0.0);
-    let r3 = mk(vertices, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0);
+    let r0 = mk(&mut vertices, 1.0, -1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+    let r1 = mk(&mut vertices, 1.0, -1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 1.0);
+    let r2 = mk(&mut vertices, 1.0, 1.0, -1.0, 1.0, 0.0, 0.0, 1.0, 0.0);
+    let r3 = mk(&mut vertices, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0);
     faces.push(face(r0, r1, r2, 1.0, 0.0, 1.0, 1.0));
     faces.push(face(r0, r2, r3, 1.0, 0.0, 1.0, 1.0));
     // Left (X-)
-    let l0 = mk(vertices, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0);
-    let l1 = mk(vertices, -1.0, -1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0);
-    let l2 = mk(vertices, -1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0);
-    let l3 = mk(vertices, -1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0);
+    let l0 = mk(&mut vertices, -1.0, -1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 1.0);
+    let l1 = mk(&mut vertices, -1.0, -1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 1.0);
+    let l2 = mk(&mut vertices, -1.0, 1.0, 1.0, -1.0, 0.0, 0.0, 1.0, 0.0);
+    let l3 = mk(&mut vertices, -1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0);
     faces.push(face(l0, l1, l2, 0.0, 1.0, 1.0, 1.0));
     faces.push(face(l0, l2, l3, 0.0, 1.0, 1.0, 1.0));
     // Top (Y+)
-    let t0 = mk(vertices, -1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0);
-    let t1 = mk(vertices, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0);
-    let t2 = mk(vertices, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0);
-    let t3 = mk(vertices, -1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0);
+    let t0 = mk(&mut vertices, -1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0);
+    let t1 = mk(&mut vertices, 1.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0);
+    let t2 = mk(&mut vertices, 1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0);
+    let t3 = mk(&mut vertices, -1.0, 1.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0);
     faces.push(face(t0, t1, t2, 0.0, 0.0, 1.0, 1.0));
     faces.push(face(t0, t2, t3, 0.0, 0.0, 1.0, 1.0));
     // Bottom (Y-)
-    let bt0 = mk(vertices, -1.0, -1.0, -1.0, 0.0, -1.0, 0.0, 0.0, 1.0);
-    let bt1 = mk(vertices, 1.0, -1.0, -1.0, 0.0, -1.0, 0.0, 1.0, 1.0);
-    let bt2 = mk(vertices, 1.0, -1.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0);
-    let bt3 = mk(vertices, -1.0, -1.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0);
+    let bt0 = mk(&mut vertices, -1.0, -1.0, -1.0, 0.0, -1.0, 0.0, 0.0, 1.0);
+    let bt1 = mk(&mut vertices, 1.0, -1.0, -1.0, 0.0, -1.0, 0.0, 1.0, 1.0);
+    let bt2 = mk(&mut vertices, 1.0, -1.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0);
+    let bt3 = mk(&mut vertices, -1.0, -1.0, 1.0, 0.0, -1.0, 0.0, 0.0, 0.0);
     faces.push(face(bt0, bt1, bt2, 1.0, 1.0, 0.0, 1.0));
     faces.push(face(bt0, bt2, bt3, 1.0, 1.0, 0.0, 1.0));
+
+    (vertices, faces)
 }
 
-pub fn generate_sphere(
-    radius: f32,
-    slices: i32,
-    stacks: i32,
-    vertices: &mut RenderVertexList,
-    faces: &mut FaceList,
-) {
-    vertices.clear();
-    faces.clear();
+pub fn generate_sphere(radius: f32, slices: i32, stacks: i32) -> (RenderVertexList, FaceList) {
+    let mut vertices = RenderVertexList::new();
+    let mut faces = FaceList::new();
 
     for i in 0..=stacks {
         let v = i as f32 / stacks as f32;
-        let phi = v * M_PI;
+        let phi = v * PI;
         for j in 0..=slices {
             let u = j as f32 / slices as f32;
-            let theta = u * 2.0 * M_PI;
+            let theta = u * 2.0 * PI;
             let x = -theta.cos() * phi.sin();
             let y = -phi.cos();
             let z = theta.sin() * phi.sin();
@@ -196,6 +191,8 @@ pub fn generate_sphere(
             faces.push(face(second, first + 1, second + 1, 1.0, 1.0, 1.0, 1.0));
         }
     }
+
+    (vertices, faces)
 }
 
 pub fn generate_spotlight_housing(
@@ -203,11 +200,9 @@ pub fn generate_spotlight_housing(
     slices: i32,
     stacks: i32,
     opening_half_angle_deg: f32,
-    vertices: &mut RenderVertexList,
-    faces: &mut FaceList,
-) {
-    vertices.clear();
-    faces.clear();
+) -> (RenderVertexList, FaceList) {
+    let mut vertices = RenderVertexList::new();
+    let mut faces = FaceList::new();
 
     let ring = slices + 1;
     let vcount = (stacks + 1) * ring;
@@ -215,10 +210,10 @@ pub fn generate_spotlight_housing(
         let nsign: f32 = if block == 0 { 1.0 } else { -1.0 };
         for i in 0..=stacks {
             let v = i as f32 / stacks as f32;
-            let phi = v * M_PI;
+            let phi = v * PI;
             for j in 0..=slices {
                 let u = j as f32 / slices as f32;
-                let theta = u * 2.0 * M_PI;
+                let theta = u * 2.0 * PI;
                 let x = -theta.cos() * phi.sin();
                 let y = -phi.cos();
                 let z = theta.sin() * phi.sin();
@@ -238,9 +233,9 @@ pub fn generate_spotlight_housing(
     let in_g = 1.0;
     let in_b = 1.0;
 
-    let open_cos = (opening_half_angle_deg * M_PI / 180.0).cos();
+    let open_cos = (opening_half_angle_deg * PI / 180.0).cos();
     for i in 0..stacks {
-        let phi_top = (i + 1) as f32 / stacks as f32 * M_PI;
+        let phi_top = (i + 1) as f32 / stacks as f32 * PI;
         let y_top = -phi_top.cos();
         if y_top > open_cos {
             continue;
@@ -256,25 +251,20 @@ pub fn generate_spotlight_housing(
             faces.push(face(si, si + 1, fi + 1, in_r, in_g, in_b, 1.0));
         }
     }
+
+    (vertices, faces)
 }
 
-pub fn generate_torus(
-    main_radius: f32,
-    tube_radius: f32,
-    slices: i32,
-    stacks: i32,
-    vertices: &mut RenderVertexList,
-    faces: &mut FaceList,
-) {
-    vertices.clear();
-    faces.clear();
+pub fn generate_torus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i32) -> (RenderVertexList, FaceList) {
+    let mut vertices = RenderVertexList::new();
+    let mut faces = FaceList::new();
 
     for i in 0..=slices {
-        let u = i as f32 / slices as f32 * 2.0 * M_PI;
+        let u = i as f32 / slices as f32 * 2.0 * PI;
         let cos_u = u.cos();
         let sin_u = u.sin();
         for j in 0..=stacks {
-            let v = (j as f32 / stacks as f32 * 2.0 * M_PI) + M_PI;
+            let v = (j as f32 / stacks as f32 * 2.0 * PI) + PI;
             let cos_v = v.cos();
             let sin_v = v.sin();
             let r = main_radius + tube_radius * cos_v;
@@ -300,6 +290,8 @@ pub fn generate_torus(
             faces.push(face(second, first + 1, second + 1, 1.0, 1.0, 1.0, 0.5));
         }
     }
+
+    (vertices, faces)
 }
 
 fn bezier_curve(p: &[Vec3; 4], t: f32) -> Vec3 {
@@ -324,9 +316,9 @@ fn bezier_patch(patch: &[[Vec3; 4]; 4], u: f32, v: f32) -> Vec3 {
     bezier_curve(&u_curve, u)
 }
 
-pub fn generate_teapot(vertices: &mut RenderVertexList, faces: &mut FaceList) {
-    vertices.clear();
-    faces.clear();
+pub fn generate_teapot() -> (RenderVertexList, FaceList) {
+    let mut vertices = RenderVertexList::new();
+    let mut faces = FaceList::new();
 
     let scale: f32 = 0.5;
     let tessellation: i32 = 8;
@@ -419,4 +411,6 @@ pub fn generate_teapot(vertices: &mut RenderVertexList, faces: &mut FaceList) {
             vert.normal = Vec3::new(0.0, 0.0, 1.0);
         }
     }
+
+    (vertices, faces)
 }

@@ -60,42 +60,58 @@ extern "C" {
 
 #[inline]
 unsafe fn sel(name: &'static [u8]) -> Sel {
-    sel_registerName(name.as_ptr().cast())
+    unsafe {
+        sel_registerName(name.as_ptr().cast())
+    }
 }
 
 #[inline]
 unsafe fn class(name: &'static [u8]) -> Class {
-    objc_getClass(name.as_ptr().cast())
+    unsafe {
+        objc_getClass(name.as_ptr().cast())
+    }
 }
 
 #[inline]
 unsafe fn msg_id(obj: Id, selector: &'static [u8]) -> Id {
-    let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc_msgSend as *const ());
-    f(obj, sel(selector))
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> Id = std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel(selector))
+    }
 }
 
 #[inline]
 unsafe fn msg_void_id(obj: Id, selector: &'static [u8], arg: Id) {
-    let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc_msgSend as *const ());
-    f(obj, sel(selector), arg);
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, Id) = std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel(selector), arg);
+    }
 }
 
 #[inline]
 unsafe fn msg_void_bool(obj: Id, selector: &'static [u8], arg: bool) {
-    let f: unsafe extern "C" fn(Id, Sel, bool) = std::mem::transmute(objc_msgSend as *const ());
-    f(obj, sel(selector), arg);
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel, bool) = std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel(selector), arg);
+    }
 }
 
 unsafe fn make_number_i32(value: i32) -> CFNumberRef {
-    CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE, (&value as *const i32).cast())
+    unsafe {
+        CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE, (&value as *const i32).cast())
+    }
 }
 
 unsafe fn make_number_u32(value: u32) -> CFNumberRef {
-    CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE, (&value as *const u32).cast())
+    unsafe {
+        CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT32_TYPE, (&value as *const u32).cast())
+    }
 }
 
 unsafe fn make_number_i64(value: i64) -> CFNumberRef {
-    CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT64_TYPE, (&value as *const i64).cast())
+    unsafe {
+        CFNumberCreate(kCFAllocatorDefault, K_CF_NUMBER_SINT64_TYPE, (&value as *const i64).cast())
+    }
 }
 
 struct IOSurface {
@@ -106,64 +122,72 @@ struct IOSurface {
 
 impl IOSurface {
     unsafe fn new(width: usize, height: usize) -> Self {
-        let bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, width * 4);
-        let n_w = make_number_i32(width as i32);
-        let n_h = make_number_i32(height as i32);
-        let n_bpe = make_number_i32(4);
-        let n_bpr = make_number_i64(bpr as i64);
-        let n_fmt = make_number_u32(K_IOSURFACE_PIXEL_FORMAT_BGRA);
+        unsafe {
+            let bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, width * 4);
+            let n_w = make_number_i32(width as i32);
+            let n_h = make_number_i32(height as i32);
+            let n_bpe = make_number_i32(4);
+            let n_bpr = make_number_i64(bpr as i64);
+            let n_fmt = make_number_u32(K_IOSURFACE_PIXEL_FORMAT_BGRA);
 
-        let keys = [
-            kIOSurfaceWidth.cast::<c_void>(),
-            kIOSurfaceHeight.cast::<c_void>(),
-            kIOSurfaceBytesPerElement.cast::<c_void>(),
-            kIOSurfaceBytesPerRow.cast::<c_void>(),
-            kIOSurfacePixelFormat.cast::<c_void>(),
-        ];
-        let vals = [
-            n_w.cast::<c_void>(),
-            n_h.cast::<c_void>(),
-            n_bpe.cast::<c_void>(),
-            n_bpr.cast::<c_void>(),
-            n_fmt.cast::<c_void>(),
-        ];
-        let props = CFDictionaryCreate(
-            kCFAllocatorDefault,
-            keys.as_ptr(),
-            vals.as_ptr(),
-            keys.len() as isize,
-            &kCFTypeDictionaryKeyCallBacks,
-            &kCFTypeDictionaryValueCallBacks,
-        );
-        CFRelease(n_w.cast());
-        CFRelease(n_h.cast());
-        CFRelease(n_bpe.cast());
-        CFRelease(n_bpr.cast());
-        CFRelease(n_fmt.cast());
-        if props.is_null() {
-            panic!("CFDictionaryCreate for IOSurface failed");
+            let keys = [
+                kIOSurfaceWidth.cast::<c_void>(),
+                kIOSurfaceHeight.cast::<c_void>(),
+                kIOSurfaceBytesPerElement.cast::<c_void>(),
+                kIOSurfaceBytesPerRow.cast::<c_void>(),
+                kIOSurfacePixelFormat.cast::<c_void>(),
+            ];
+            let vals = [
+                n_w.cast::<c_void>(),
+                n_h.cast::<c_void>(),
+                n_bpe.cast::<c_void>(),
+                n_bpr.cast::<c_void>(),
+                n_fmt.cast::<c_void>(),
+            ];
+            let props = CFDictionaryCreate(
+                kCFAllocatorDefault,
+                keys.as_ptr(),
+                vals.as_ptr(),
+                keys.len() as isize,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks,
+            );
+            CFRelease(n_w.cast());
+            CFRelease(n_h.cast());
+            CFRelease(n_bpe.cast());
+            CFRelease(n_bpr.cast());
+            CFRelease(n_fmt.cast());
+            if props.is_null() {
+                panic!("CFDictionaryCreate for IOSurface failed");
+            }
+
+            let raw = IOSurfaceCreate(props);
+            CFRelease(props.cast());
+            if raw.is_null() {
+                panic!("IOSurfaceCreate failed");
+            }
+
+            let rc = IOSurfaceLock(raw, 0, ptr::null_mut());
+            assert_eq!(rc, 0, "IOSurfaceLock failed: {rc}");
+            ptr::write_bytes(IOSurfaceGetBaseAddress(raw), 0, IOSurfaceGetAllocSize(raw));
+            let rc = IOSurfaceUnlock(raw, 0, ptr::null_mut());
+            assert_eq!(rc, 0, "IOSurfaceUnlock failed: {rc}");
+
+            Self { raw, pitch_pixels: bpr / 4, len_pixels: (bpr / 4) * height }
         }
-
-        let raw = IOSurfaceCreate(props);
-        CFRelease(props.cast());
-        if raw.is_null() {
-            panic!("IOSurfaceCreate failed");
-        }
-
-        IOSurfaceLock(raw, 0, ptr::null_mut());
-        ptr::write_bytes(IOSurfaceGetBaseAddress(raw), 0, IOSurfaceGetAllocSize(raw));
-        IOSurfaceUnlock(raw, 0, ptr::null_mut());
-
-        Self { raw, pitch_pixels: bpr / 4, len_pixels: (bpr / 4) * height }
     }
 
-    unsafe fn lock_pixels(&self) -> &mut [u32] {
-        IOSurfaceLock(self.raw, 0, ptr::null_mut());
-        std::slice::from_raw_parts_mut(IOSurfaceGetBaseAddress(self.raw).cast::<u32>(), self.len_pixels)
+    fn lock_pixels(&mut self) -> &mut [u32] {
+        unsafe {
+            let rc = IOSurfaceLock(self.raw, 0, ptr::null_mut());
+            assert_eq!(rc, 0, "IOSurfaceLock failed: {rc}");
+            std::slice::from_raw_parts_mut(IOSurfaceGetBaseAddress(self.raw).cast::<u32>(), self.len_pixels)
+        }
     }
 
-    unsafe fn unlock(&self) {
-        IOSurfaceUnlock(self.raw, 0, ptr::null_mut());
+    fn unlock(&self) {
+        let rc = unsafe { IOSurfaceUnlock(self.raw, 0, ptr::null_mut()) };
+        assert_eq!(rc, 0, "IOSurfaceUnlock failed: {rc}");
     }
 }
 
@@ -186,7 +210,9 @@ pub struct SurfaceFrame<'a> {
 
 impl SurfaceFrame<'_> {
     pub fn as_framebuffer_mut(&mut self) -> &mut [u32] {
-        debug_assert_eq!(self.pitch_pixels, self.width);
+        // The renderer assumes a dense framebuffer; a padded IOSurface row
+        // pitch would silently shear every row, so fail loudly.
+        assert_eq!(self.pitch_pixels, self.width, "IOSurface row pitch must equal width");
         &mut self.pixels[..self.width * self.height]
     }
 }
@@ -226,10 +252,10 @@ impl CocoaBlitter {
     }
 
     pub fn framebuffer_mut(&mut self) -> SurfaceFrame<'_> {
-        unsafe {
-            let s = &self.surfaces[self.render];
-            SurfaceFrame { pixels: s.lock_pixels(), width: self.width, height: self.height, pitch_pixels: s.pitch_pixels }
-        }
+        let (width, height) = (self.width, self.height);
+        let s = &mut self.surfaces[self.render];
+        let pitch_pixels = s.pitch_pixels;
+        SurfaceFrame { pixels: s.lock_pixels(), width, height, pitch_pixels }
     }
 
     pub fn present(&mut self) {

@@ -1,4 +1,5 @@
 #![cfg_attr(target_os = "emscripten", no_main)]
+#![deny(unsafe_op_in_unsafe_fn)]
 //! main.rs — swraster Rust port entry point.
 //!
 //! Brings up a winit window with a softbuffer CPU framebuffer, constructs the
@@ -28,10 +29,9 @@ mod scene;
 mod shadow;
 mod texture;
 
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-#[cfg(target_os = "macos")]
-use std::rc::Rc;
 #[cfg(target_os = "macos")]
 use winit::application::ApplicationHandler;
 #[cfg(target_os = "macos")]
@@ -54,7 +54,7 @@ const INITIAL_HEIGHT: u32 = 1024;
 
 #[cfg(target_os = "macos")]
 struct App {
-    window: Option<Rc<Window>>,
+    window: Option<Window>,
     blitter: Option<CocoaBlitter>,
     state: Option<RenderState>,
     start: Instant,
@@ -84,7 +84,7 @@ impl ApplicationHandler for App {
             .with_title("swraster")
             .with_inner_size(LogicalSize::new(INITIAL_WIDTH, INITIAL_HEIGHT))
             .with_resizable(false);
-        let window = Rc::new(event_loop.create_window(attrs).expect("failed to create window"));
+        let window = event_loop.create_window(attrs).expect("failed to create window");
 
         // Match the C++/Zig native backends: render into a fixed logical CPU
         // framebuffer and let the Cocoa layer nearest-scale it to the window.
@@ -119,6 +119,10 @@ impl ApplicationHandler for App {
                             if let Some(s) = self.state.as_mut() {
                                 s.toggle_raster_hard_barrier();
                             }
+                        }
+                        Key::Character("q") | Key::Character("Q") => {
+                            let was = draw::QUAD_PATH_ENABLED.load(Ordering::Relaxed);
+                            draw::QUAD_PATH_ENABLED.store(!was, Ordering::Relaxed);
                         }
                         Key::Character("-") | Key::Character("_") => {
                             if let Some(s) = self.state.as_mut() {
@@ -216,7 +220,7 @@ fn main() {
 mod web {
     use super::*;
     use std::collections::VecDeque;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
     enum Event {
         Key(i32),
@@ -230,24 +234,19 @@ mod web {
         state: RenderState,
         framebuffer: Vec<u32>,
         start: Instant,
-        last_physics_ms: u64,
         visible: bool,
         mouse_down: bool,
     }
 
-    static EVENTS: OnceLock<Mutex<VecDeque<Event>>> = OnceLock::new();
+    static EVENTS: Mutex<VecDeque<Event>> = Mutex::new(VecDeque::new());
 
     extern "C" {
         fn swr_js_setup_canvas(w: i32, h: i32);
         fn swr_js_present(ptr: *const u32, w: i32, h: i32);
     }
 
-    fn events() -> &'static Mutex<VecDeque<Event>> {
-        EVENTS.get_or_init(|| Mutex::new(VecDeque::new()))
-    }
-
     fn push_event(ev: Event) {
-        events().lock().unwrap().push_back(ev);
+        EVENTS.lock().unwrap().push_back(ev);
     }
 
     #[no_mangle]
@@ -276,13 +275,17 @@ mod web {
     }
 
     fn pump_events(app: &mut WebApp) {
-        while let Some(ev) = events().lock().unwrap().pop_front() {
+        while let Some(ev) = EVENTS.lock().unwrap().pop_front() {
             match ev {
                 Event::Key(32) => app.state.toggle_pause(),
                 Event::Key(k) if k == 's' as i32 || k == 'S' as i32 => app.state.toggle_stats(),
                 Event::Key(k) if k == 'f' as i32 || k == 'F' as i32 => app.state.toggle_profiler_unfreeze(),
                 Event::Key(k) if k == 'b' as i32 || k == 'B' as i32 => {
                     app.state.toggle_raster_hard_barrier();
+                }
+                Event::Key(k) if k == 'q' as i32 || k == 'Q' as i32 => {
+                    let was = draw::QUAD_PATH_ENABLED.load(Ordering::Relaxed);
+                    draw::QUAD_PATH_ENABLED.store(!was, Ordering::Relaxed);
                 }
                 Event::Key(k) if k == '-' as i32 || k == '_' as i32 => {
                     app.state.adjust_active_workers(-1);
@@ -313,7 +316,6 @@ mod web {
     }
 
     pub fn main() -> i32 {
-        events();
         unsafe {
             swr_js_setup_canvas(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
         }
@@ -332,7 +334,6 @@ mod web {
                     state: RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32),
                     framebuffer: vec![0; (INITIAL_WIDTH * INITIAL_HEIGHT) as usize],
                     start: Instant::now(),
-                    last_physics_ms: 0,
                     visible: true,
                     mouse_down: false,
                 };

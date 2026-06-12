@@ -25,10 +25,9 @@ use crate::scene::{self, CubeInstance, InitialInstanceState, WallData};
 use crate::profiler::{self, Interval, Profiler};
 use crate::shadow::{self, ShadowVertex};
 use crate::texture::{self, PackedTexture};
+use std::f32::consts::PI;
 use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::time::Instant;
-
-const M_PI: f32 = std::f32::consts::PI;
 
 struct Mesh {
     vertices: RenderVertexList,
@@ -44,6 +43,12 @@ impl Mesh {
 }
 
 pub struct RenderState {
+    // Persistent worker pool (spawned once; kicked per frame). Mirrors the
+    // pool_worker.cpp / pool_worker.zig persistent threads. Declared FIRST so
+    // it drops first: Drop joins every worker before the buffers the FramePlan
+    // points into are freed, even on unwind.
+    pool: RenderPool,
+
     // Static geometry prototypes, indexed by instance kind.
     cube: Mesh,
     sphere: Mesh,
@@ -106,6 +111,9 @@ pub struct RenderState {
     // Worker count for parallel T&L + raster passes.
     num_threads: usize,
     active_workers: usize,
+    // Worker count of the most recent kicked frame; merge_flat_globals clamps
+    // to it so locals of workers that sat that frame out are never re-merged.
+    tl_locals_workers: usize,
 
     // Camera + state.
     pub camera_yaw: f32,
@@ -128,10 +136,6 @@ pub struct RenderState {
 
     // Per-thread concurrency profiler overlay (toggled with 's').
     profiler: Profiler,
-
-    // Persistent worker pool (spawned once; kicked per frame). Mirrors the
-    // pool_worker.cpp / pool_worker.zig persistent threads.
-    pool: RenderPool,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -235,7 +239,7 @@ fn ensure_vec_capacity<T>(v: &mut Vec<T>, target_capacity: usize) {
 }
 
 #[inline]
-fn sort_triangles_by_key(items: &mut Vec<RenderTriangle>, ascending: bool, keys: &mut Vec<KeyIdx>, gather: &mut Vec<RenderTriangle>) {
+fn sort_triangles_by_key(items: &mut [RenderTriangle], ascending: bool, keys: &mut Vec<KeyIdx>, gather: &mut Vec<RenderTriangle>) {
     let n = items.len();
     if n < 2 {
         return;
@@ -263,27 +267,62 @@ fn sort_triangles_by_key(items: &mut Vec<RenderTriangle>, ascending: bool, keys:
 // only draws its own bin merged with the flat global list; larger triangles
 // fall back to the flat global lists.
 #[derive(Default)]
+struct TileBins {
+    opaque: Vec<RenderTriangle>,
+    trans: Vec<RenderTriangle>,
+    shadow: Vec<RenderTriangle>,
+}
+
+// Published scatter-merge target: each tile's three lists live inside the
+// Mutex that guards them, so the lock<->data association is compiler-checked
+// (one lock per tile — identical granularity to the C++ per-bin locks).
+// Writers (tl_phase scatter) lock per tile; next frame's raster reads the
+// completed buffer through Mutex::get_mut on exclusively claimed tiles —
+// synchronized by the frame barrier, so the read path stays lock-free.
 struct TriBins {
+    tiles: Vec<std::sync::Mutex<TileBins>>,
+}
+impl TriBins {
+    fn published() -> TriBins {
+        TriBins {
+            tiles: (0..NTILES)
+                .map(|_| {
+                    std::sync::Mutex::new(TileBins {
+                        opaque: Vec::with_capacity(PUBLISHED_OPAQUE_BIN_RESERVE),
+                        trans: Vec::with_capacity(PUBLISHED_TRANS_BIN_RESERVE),
+                        shadow: Vec::with_capacity(PUBLISHED_SHADOW_BIN_RESERVE),
+                    })
+                })
+                .collect(),
+        }
+    }
+    fn clear(&mut self) {
+        for tile in &mut self.tiles {
+            let tile = tile.get_mut().unwrap();
+            tile.opaque.clear();
+            tile.trans.clear();
+            tile.shadow.clear();
+        }
+    }
+}
+
+// Worker-local category-major bins (single-owner scratch; no locks needed).
+#[derive(Default)]
+struct LocalBins {
     opaque: Vec<Vec<RenderTriangle>>,
     trans: Vec<Vec<RenderTriangle>>,
     shadow: Vec<Vec<RenderTriangle>>,
 }
-impl TriBins {
-    fn new_with_caps(opaque_cap: usize, trans_cap: usize, shadow_cap: usize) -> TriBins {
+impl LocalBins {
+    fn worker() -> LocalBins {
         let make_bins = |cap: usize| -> Vec<Vec<RenderTriangle>> {
             (0..NTILES).map(|_| Vec::with_capacity(cap)).collect()
         };
-        TriBins {
-            opaque: make_bins(opaque_cap),
-            trans: make_bins(trans_cap),
-            shadow: make_bins(shadow_cap),
+        LocalBins {
+            opaque: make_bins(WORKER_OPAQUE_BIN_RESERVE),
+            trans: make_bins(WORKER_TRANS_BIN_RESERVE),
+            shadow: make_bins(WORKER_SHADOW_BIN_RESERVE),
         }
-    }
-    fn published() -> TriBins {
-        TriBins::new_with_caps(PUBLISHED_OPAQUE_BIN_RESERVE, PUBLISHED_TRANS_BIN_RESERVE, PUBLISHED_SHADOW_BIN_RESERVE)
-    }
-    fn worker() -> TriBins {
-        TriBins::new_with_caps(WORKER_OPAQUE_BIN_RESERVE, WORKER_TRANS_BIN_RESERVE, WORKER_SHADOW_BIN_RESERVE)
     }
     fn clear(&mut self) {
         for b in &mut self.opaque {
@@ -305,7 +344,7 @@ struct WorkerLocal {
     opaque: Vec<RenderTriangle>,
     trans: Vec<RenderTriangle>,
     shadow: Vec<RenderTriangle>,
-    bins: TriBins,
+    bins: LocalBins,
     eye_scratch: RenderVertexList,
     clip_scratch: RenderVertexList,
     sort_keys: Vec<KeyIdx>,
@@ -319,7 +358,7 @@ impl WorkerLocal {
             opaque: Vec::with_capacity(WORKER_FLAT_RESERVE),
             trans: Vec::with_capacity(WORKER_FLAT_RESERVE),
             shadow: Vec::with_capacity(WORKER_FLAT_RESERVE),
-            bins: TriBins::worker(),
+            bins: LocalBins::worker(),
             eye_scratch: RenderVertexList::new(),
             clip_scratch: RenderVertexList::new(),
             sort_keys: Vec::with_capacity(SORT_SCRATCH_RESERVE),
@@ -393,32 +432,18 @@ fn bin_or_flat(tri: RenderTriangle, sx: [f32; 3], sy: [f32; 3], width: i32, heig
 impl RenderState {
     pub fn new(screen_width: i32, screen_height: i32) -> RenderState {
         // ----- Geometry -----
-        let mut cube_v = RenderVertexList::new();
-        let mut cube_f = Vec::new();
-        geom::generate_cube(&mut cube_v, &mut cube_f);
-        let mut sphere_v = RenderVertexList::new();
-        let mut sphere_f = Vec::new();
-        geom::generate_sphere(1.3, 16, 16, &mut sphere_v, &mut sphere_f);
-        let mut torus_v = RenderVertexList::new();
-        let mut torus_f = Vec::new();
-        geom::generate_torus(1.0, 0.4, 32, 10, &mut torus_v, &mut torus_f);
-        let mut teapot_v = RenderVertexList::new();
-        let mut teapot_f = Vec::new();
-        geom::generate_teapot(&mut teapot_v, &mut teapot_f);
-        let mut smallball_v = RenderVertexList::new();
-        let mut smallball_f = Vec::new();
-        geom::generate_sphere(0.3, 8, 6, &mut smallball_v, &mut smallball_f);
-        let mut lamp_v = RenderVertexList::new();
-        let mut lamp_f = Vec::new();
-        geom::generate_spotlight_housing(0.5, 20, 12, 35.0, &mut lamp_v, &mut lamp_f);
+        let (cube_v, cube_f) = geom::generate_cube();
+        let (sphere_v, sphere_f) = geom::generate_sphere(1.3, 16, 16);
+        let (torus_v, torus_f) = geom::generate_torus(1.0, 0.4, 32, 10);
+        let (teapot_v, teapot_f) = geom::generate_teapot();
+        let (smallball_v, smallball_f) = geom::generate_sphere(0.3, 8, 6);
+        let (lamp_v, lamp_f) = geom::generate_spotlight_housing(0.5, 20, 12, 35.0);
 
         let box_half: f32 = 6.0;
         let wall_thick: f32 = 1.0;
         let ground_y: f32 = -(3.0f32.sqrt() * box_half + wall_thick + 0.5);
         let ground_half: f32 = 48.0;
-        let mut ground_v = RenderVertexList::new();
-        let mut ground_f = Vec::new();
-        scene::build_ground_geometry(ground_half, &mut ground_v, &mut ground_f);
+        let (ground_v, ground_f) = scene::build_ground_geometry(ground_half);
 
         let cube = Mesh::new(cube_v, cube_f);
         let sphere = Mesh::new(sphere_v, sphere_f);
@@ -446,8 +471,8 @@ impl RenderState {
 
         // ----- Jolt physics -----
         physics_setup::register_jolt_callbacks();
-        // Leak the factory scope for the program lifetime.
-        std::mem::forget(physics_setup::JoltScope::new());
+        // The Jolt factory deliberately lives for the program lifetime.
+        physics_setup::JoltScope::leak();
 
         let (system, body_interface, temp_allocator, job_system, mut instances, walls, initial_states);
         unsafe {
@@ -509,10 +534,7 @@ impl RenderState {
             let hw = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(2);
             (2 * hw).clamp(16, 20)
         };
-        config::NUM_RASTER_THREADS.store(num_threads as i32, Ordering::Relaxed);
         config::NUM_TL_THREADS.store(16.min(num_threads) as i32, Ordering::Relaxed);
-        config::NUM_STRIPS.store(R as i32, Ordering::Relaxed);
-        config::NUM_TILE_BINS.store(NTILES as i32, Ordering::Relaxed);
         let pool = RenderPool::new(num_threads);
 
         let opaque = [Vec::with_capacity(WORKER_FLAT_RESERVE), Vec::with_capacity(WORKER_FLAT_RESERVE)];
@@ -565,6 +587,7 @@ impl RenderState {
             frame_tl_params: TlParams::default(),
             num_threads,
             active_workers: 16.min(num_threads),
+            tl_locals_workers: num_threads,
             camera_yaw: 0.0,
             camera_pitch,
             camera_distance,
@@ -666,9 +689,24 @@ impl RenderState {
         if do_raster {
             self.merge_flat_globals(raster_idx);
         }
+        // Record this frame's worker count: next frame's merge_flat_globals
+        // must only fold locals from workers that run this frame.
+        self.tl_locals_workers = nthreads;
 
         // Clear this frame's scatter-merge target before the pool can touch it.
         self.bins[tl_idx].clear();
+
+        // Derive each framebuffer/G-buffer pointer exactly once per frame:
+        // Phase-A workers write through these from the moment kick_raster
+        // fires, so the publish_tl plan must reuse the same derivations instead
+        // of re-borrowing buffers the workers are already writing through.
+        let pix_ptr = fb.as_mut_ptr();
+        let depth_ptr = self.depth.as_mut_ptr();
+        let normal_ptr = self.normal.as_mut_ptr();
+        let linz_ptr = self.linear_z.as_mut_ptr();
+        let sdepth_ptr = self.shadow_depth.as_mut_ptr();
+        let r_bins_ptr = self.bins[raster_idx].tiles.as_mut_ptr();
+        let w_bins_ptr = self.bins[tl_idx].tiles.as_mut_ptr();
 
         // ----- Phase 1 kick: fire the previous frame's raster NOW. The shadow
         // pre-pass overlaps the main-thread T&L setup that follows. The plan's
@@ -677,11 +715,11 @@ impl RenderState {
             do_raster,
             nthreads: nthreads as i32,
             tl_workers,
-            pix: fb.as_mut_ptr(),
-            depth: self.depth.as_mut_ptr(),
-            normal: self.normal.as_mut_ptr(),
-            linz: self.linear_z.as_mut_ptr(),
-            sdepth: self.shadow_depth.as_mut_ptr(),
+            pix: pix_ptr,
+            depth: depth_ptr,
+            normal: normal_ptr,
+            linz: linz_ptr,
+            sdepth: sdepth_ptr,
             w,
             h,
             pitch: w,
@@ -699,16 +737,14 @@ impl RenderState {
             r_trans_len: self.trans[raster_idx].len(),
             r_shadow: self.shadow[raster_idx].as_ptr(),
             r_shadow_len: self.shadow[raster_idx].len(),
-            r_bins: &self.bins[raster_idx] as *const TriBins,
+            r_bins: r_bins_ptr,
             r_cone: &self.cone[raster_idx] as *const LuminaireConeBuffer,
             r_box: &self.shadow_box[raster_idx] as *const ShadowBoxBuffer,
             textures: self.textures.as_ptr(),
             textures_len: self.textures.len(),
             // T&L (Phase B) scatter targets + per-instance inputs: filled by
             // publish_tl. Unused by the shadow pre-pass (Phase A).
-            w_opaque: std::ptr::null_mut(),
-            w_trans: std::ptr::null_mut(),
-            w_shadow: std::ptr::null_mut(),
+            w_bins: std::ptr::null_mut(),
             w_cone: std::ptr::null_mut(),
             meshes: [std::ptr::null(); 7],
             instances: std::ptr::null(),
@@ -737,8 +773,8 @@ impl RenderState {
         let shadow_scene_min = Vec3::new(-self.ground_half, self.ground_y, -self.ground_half);
         let shadow_scene_max = Vec3::new(self.ground_half, shadow_cube_extent, self.ground_half);
 
-        let spot_inner_cos = (18.0f32 * M_PI / 180.0).cos();
-        let spot_outer_cos = (30.0f32 * M_PI / 180.0).cos();
+        let spot_inner_cos = (18.0f32 * PI / 180.0).cos();
+        let spot_outer_cos = (30.0f32 * PI / 180.0).cos();
         let shadow_near = 1.0f32;
         let shadow_far = 80.0f32;
         let mut light_dir = Vec3::zero();
@@ -831,7 +867,7 @@ impl RenderState {
             shadow_near,
             shadow_far,
             camera_aspect: aspect,
-            camera_tan_half_fov_y: (60.0f32 * M_PI / 360.0).tan(),
+            camera_tan_half_fov_y: (60.0f32 * PI / 360.0).tan(),
             camera_far: config::CAMERA_FAR_PLANE,
             screen_width: w,
             screen_height: h,
@@ -873,11 +909,11 @@ impl RenderState {
             do_raster,
             nthreads: nthreads as i32,
             tl_workers,
-            pix: fb.as_mut_ptr(),
-            depth: self.depth.as_mut_ptr(),
-            normal: self.normal.as_mut_ptr(),
-            linz: self.linear_z.as_mut_ptr(),
-            sdepth: self.shadow_depth.as_mut_ptr(),
+            pix: pix_ptr,
+            depth: depth_ptr,
+            normal: normal_ptr,
+            linz: linz_ptr,
+            sdepth: sdepth_ptr,
             w,
             h,
             pitch: w,
@@ -895,14 +931,12 @@ impl RenderState {
             r_trans_len: self.trans[raster_idx].len(),
             r_shadow: self.shadow[raster_idx].as_ptr(),
             r_shadow_len: self.shadow[raster_idx].len(),
-            r_bins: &self.bins[raster_idx] as *const TriBins,
+            r_bins: r_bins_ptr,
             r_cone: &self.cone[raster_idx] as *const LuminaireConeBuffer,
             r_box: &self.shadow_box[raster_idx] as *const ShadowBoxBuffer,
             textures: self.textures.as_ptr(),
             textures_len: self.textures.len(),
-            w_opaque: self.bins[tl_idx].opaque.as_mut_ptr(),
-            w_trans: self.bins[tl_idx].trans.as_mut_ptr(),
-            w_shadow: self.bins[tl_idx].shadow.as_mut_ptr(),
+            w_bins: w_bins_ptr,
             w_cone: w_cone_ptr,
             meshes: [
                 &self.cube as *const Mesh,
@@ -995,7 +1029,12 @@ impl RenderState {
         self.opaque[idx].clear();
         self.trans[idx].clear();
         self.shadow[idx].clear();
-        let nthreads = self.num_threads.max(1);
+        // Only the workers that actually ran the frame which produced these
+        // locals cleared + filled them; workers that sat out (worker_id >=
+        // that frame's nthreads) still hold an older frame's triangles, so
+        // clamp the merge to the recorded count (C++ k_eff guard,
+        // render_loop.cpp merge clamping to active_tl_job_thread_count).
+        let nthreads = self.tl_locals_workers.clamp(1, self.num_threads.max(1));
         for wid in 0..nthreads {
             let lo = self.pool.local(wid);
             self.opaque[idx].extend_from_slice(&lo.opaque);
@@ -1300,8 +1339,7 @@ impl RenderState {
                         ClipVertex { position: v2_eye.position, normal: v2_eye.normal, r: s2.x, g: s2.y, b: s2.z, a: face.a, u: v2_eye.u, v: v2_eye.v },
                     ];
                     if p.use_spotlight {
-                        let mut shadow_clipped = [ClipVertex::default(); 4];
-                        let shadow_count = clip::clip_triangle_near(&shadow_in, &mut shadow_clipped, &p.shadow_view, p.shadow_near);
+                        let (shadow_clipped, shadow_count) = clip::clip_triangle_near(&shadow_in, &p.shadow_view, p.shadow_near);
                         if shadow_count >= 3 {
                             emit_shadow_triangle(p, local, shadow_clipped[0], shadow_clipped[1], shadow_clipped[2], inst.shadow_screendoor_mask);
                             if shadow_count == 4 {
@@ -1345,9 +1383,8 @@ impl RenderState {
                         ClipVertex { position: v1_eye.position, normal: v1_eye.normal, r: s1.x, g: s1.y, b: s1.z, a: face.a, u: v1_eye.u, v: v1_eye.v },
                         ClipVertex { position: v2_eye.position, normal: v2_eye.normal, r: s2.x, g: s2.y, b: s2.z, a: face.a, u: v2_eye.u, v: v2_eye.v },
                     ];
-                    let mut clipped = [ClipVertex::default(); 4];
                     let identity = Mat4::identity();
-                    let clipped_count = clip::clip_triangle_near(&input, &mut clipped, &identity, config::NEAR_PLANE);
+                    let (clipped, clipped_count) = clip::clip_triangle_near(&input, &identity, config::NEAR_PLANE);
                     if clipped_count < 3 {
                         continue;
                     }
@@ -1424,10 +1461,12 @@ const SHADOW_BOX_EDGES: [[usize; 2]; 12] = [
 
 #[inline]
 unsafe fn slice_from<'a, T>(p: *const T, len: usize) -> &'a [T] {
-    if len == 0 {
-        &[]
-    } else {
-        std::slice::from_raw_parts(p, len)
+    unsafe {
+        if len == 0 {
+            &[]
+        } else {
+            std::slice::from_raw_parts(p, len)
+        }
     }
 }
 
@@ -1553,15 +1592,16 @@ struct FramePlan {
     r_trans_len: usize,
     r_shadow: *const RenderTriangle,
     r_shadow_len: usize,
-    r_bins: *const TriBins,
+    // Previous frame's completed per-tile bins (NTILES Mutex<TileBins>); read
+    // lock-free via Mutex::get_mut under the frame barrier.
+    r_bins: *mut std::sync::Mutex<TileBins>,
     r_cone: *const LuminaireConeBuffer,
     r_box: *const ShadowBoxBuffer,
     textures: *const PackedTexture,
     textures_len: usize,
-    // Scatter-merge target: base pointers of this frame's NTILES bin arrays.
-    w_opaque: *mut Vec<RenderTriangle>,
-    w_trans: *mut Vec<RenderTriangle>,
-    w_shadow: *mut Vec<RenderTriangle>,
+    // Scatter-merge target: base pointer of this frame's NTILES tile bins,
+    // each locked through the Mutex that owns it.
+    w_bins: *mut std::sync::Mutex<TileBins>,
     // This frame's luminaire cone buffer, built by worker 0 during T&L.
     w_cone: *mut LuminaireConeBuffer,
     meshes: [*const Mesh; 7],
@@ -1605,14 +1645,12 @@ impl Default for FramePlan {
             r_trans_len: 0,
             r_shadow: std::ptr::null(),
             r_shadow_len: 0,
-            r_bins: std::ptr::null(),
+            r_bins: std::ptr::null_mut(),
             r_cone: std::ptr::null(),
             r_box: std::ptr::null(),
             textures: std::ptr::null(),
             textures_len: 0,
-            w_opaque: std::ptr::null_mut(),
-            w_trans: std::ptr::null_mut(),
-            w_shadow: std::ptr::null_mut(),
+            w_bins: std::ptr::null_mut(),
             w_cone: std::ptr::null_mut(),
             meshes: [std::ptr::null(); 7],
             instances: std::ptr::null(),
@@ -1648,15 +1686,15 @@ struct PoolShared {
     cv_pool: std::sync::Condvar,
     cv_main: std::sync::Condvar,
     sched: Sched,
-    bin_locks: Vec<std::sync::Mutex<()>>,
     plan: std::cell::UnsafeCell<FramePlan>,
     locals: Vec<std::cell::UnsafeCell<WorkerLocal>>,
 }
-// Sound: `plan` is written by main only while the pool is parked (no readers),
-// and read by workers only after the kick (the mutex provides happens-before);
-// each `locals[i]` is touched exclusively by worker i during the frame and by
-// main only after all workers report done; `bin_locks` serialize the only shared
-// bin writes; framebuffer tiles are disjoint per the pass state machine.
+// Sound: `plan` is written by main only under the kick mutex and read by
+// workers only while holding it (happens-before + mutual exclusion); each
+// `locals[i]` is touched exclusively by worker i during the frame and by main
+// only after all workers report done; the per-tile bin Mutexes (TriBins)
+// serialize the only shared bin writes; framebuffer tiles are disjoint per the
+// pass state machine.
 unsafe impl Sync for PoolShared {}
 unsafe impl Send for PoolShared {}
 
@@ -1676,7 +1714,6 @@ impl RenderPool {
             cv_pool: std::sync::Condvar::new(),
             cv_main: std::sync::Condvar::new(),
             sched: Sched::new(),
-            bin_locks: (0..NTILES).map(|_| std::sync::Mutex::new(())).collect(),
             plan: std::cell::UnsafeCell::new(FramePlan::default()),
             locals: (0..nthreads).map(|_| std::cell::UnsafeCell::new(WorkerLocal::new())).collect(),
         });
@@ -1752,6 +1789,7 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
     let mut last_processed: u64 = 0;
     loop {
         let this_frame;
+        let plan_a;
         {
             let mut k = shared.mtx.lock().unwrap();
             while shared.running.load(Ordering::Acquire) && k.frame_target <= last_processed {
@@ -1762,11 +1800,12 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
             }
             last_processed = k.frame_target;
             this_frame = k.frame_target;
+            // Phase A reads only the previous frame's raster inputs (published
+            // by kick_raster). Copy the plan while still holding the kick mutex:
+            // main rewrites the whole plan in publish_tl under this same mutex,
+            // so an unlocked copy here would race with that rewrite.
+            plan_a = unsafe { *shared.plan.get() };
         }
-
-        // Phase A reads only the previous frame's raster inputs (published by
-        // kick_raster), so copy the plan now for the shadow pre-pass.
-        let plan_a = unsafe { *shared.plan.get() };
         if worker_id >= plan_a.nthreads.max(1) as usize {
             let mut k = shared.mtx.lock().unwrap();
             k.workers_done += 1;
@@ -1915,9 +1954,13 @@ impl<'a> WorkerCtx<'a> {
     fn textures(&self) -> &[PackedTexture] {
         unsafe { slice_from(self.plan.textures, self.plan.textures_len) }
     }
+    // Previous frame's bins for one tile. The buffer was completed last frame
+    // and is read-only this frame (frame barrier), and each tile is claimed by
+    // exactly one worker per pass, so Mutex::get_mut is sound here and keeps
+    // this path lock-free (no atomic acquire per tile).
     #[inline]
-    fn r_bins(&self) -> &TriBins {
-        unsafe { &*self.plan.r_bins }
+    fn r_tile(&self, tile_idx: usize) -> &TileBins {
+        unsafe { (*self.plan.r_bins.add(tile_idx)).get_mut().unwrap() }
     }
     #[inline]
     fn r_cone(&self) -> &LuminaireConeBuffer {
@@ -1941,7 +1984,7 @@ impl<'a> WorkerCtx<'a> {
             return;
         }
         let tile_idx = row as usize * X + col as usize;
-        let bin = &self.r_bins().shadow[tile_idx];
+        let bin = &self.r_tile(tile_idx).shadow;
         let global = self.r_shadow();
         let bx = self.r_box();
         unsafe {
@@ -1950,14 +1993,12 @@ impl<'a> WorkerCtx<'a> {
                 std::slice::from_raw_parts_mut(sd.add((y * ss + x0) as usize), (x1 - x0 + 1) as usize).fill(config::SHADOW_DEPTH_CLEAR);
             }
             let draw_tri = |tri: &RenderTriangle| {
-                let mut sv0 = ShadowVertex::default();
-                let mut sv1 = ShadowVertex::default();
-                let mut sv2 = ShadowVertex::default();
-                if shadow::shadow_vertex_from_varying(&tri.v0, &mut sv0)
-                    && shadow::shadow_vertex_from_varying(&tri.v1, &mut sv1)
-                    && shadow::shadow_vertex_from_varying(&tri.v2, &mut sv2)
-                {
-                    unsafe { shadow::draw_shadow_triangle_strip(sd, ss, &sv0, &sv1, &sv2, x0, x1, y0, y1, tri.shadow_screendoor_mask) };
+                if let (Some(sv0), Some(sv1), Some(sv2)) = (
+                    shadow::shadow_vertex_from_varying(&tri.v0),
+                    shadow::shadow_vertex_from_varying(&tri.v1),
+                    shadow::shadow_vertex_from_varying(&tri.v2),
+                ) {
+                    shadow::draw_shadow_triangle_strip(sd, ss, &sv0, &sv1, &sv2, x0, x1, y0, y1, tri.shadow_screendoor_mask);
                 }
             };
             if config::ENABLE_SHADOW_TRIANGLE_SORT {
@@ -2001,7 +2042,7 @@ impl<'a> WorkerCtx<'a> {
         let tile_idx = row as usize * X + col as usize;
         let fp = self.plan.fp;
         let fmt = self.plan.format;
-        let bins = self.r_bins();
+        let tile = self.r_tile(tile_idx);
         let textures = self.textures();
         unsafe {
             let pix = self.plan.pix;
@@ -2017,17 +2058,15 @@ impl<'a> WorkerCtx<'a> {
             }
             let draw = |tri: &RenderTriangle, depth_write: bool| {
                 let shader = if tri.debug_unlit_red { TriangleShader::DebugUnlitRed } else { TriangleShader::Lit };
-                unsafe {
-                    draw::draw_triangle_barycentric_strip(
-                        pix, pitch, depth, normal, linz, w, h, tri.v0, tri.v1, tri.v2, &fmt, tex_opt(textures, tri.texture_id),
-                        fp.light_dir, fp.light_pos, fp.spot_dir, fp.use_spotlight, fp.spot_inner_cos, fp.spot_outer_cos, sdc,
-                        self.plan.shadow_size, x0, x1, y0, y1, depth_write, shader, Some(&tri.rgb_setup),
-                    );
-                }
+                draw::draw_triangle_barycentric_strip(
+                    pix, pitch, depth, normal, linz, w, h, tri.v0, tri.v1, tri.v2, &fmt, tex_opt(textures, tri.texture_id),
+                    fp.light_dir, fp.light_pos, fp.spot_dir, fp.use_spotlight, fp.spot_inner_cos, fp.spot_outer_cos, sdc,
+                    self.plan.shadow_size, x0, x1, y0, y1, depth_write, shader, Some(&tri.rgb_setup),
+                );
             };
             // Opaque front-to-back: merge the global flat list with this tile's bin.
             let go = self.r_opaque();
-            let bo = &bins.opaque[tile_idx];
+            let bo = &tile.opaque;
             if config::ENABLE_RGB_TRIANGLE_SORT {
                 let (mut gi, mut si) = (0usize, 0usize);
                 while gi < go.len() || si < bo.len() {
@@ -2050,7 +2089,7 @@ impl<'a> WorkerCtx<'a> {
             }
             // Transparent back-to-front: merge the global flat list with the bin.
             let gt = self.r_trans();
-            let bt = &bins.trans[tile_idx];
+            let bt = &tile.trans;
             if config::ENABLE_RGB_TRIANGLE_SORT {
                 let (mut gi, mut si) = (0usize, 0usize);
                 while gi < gt.len() || si < bt.len() {
@@ -2426,15 +2465,13 @@ impl<'a> WorkerCtx<'a> {
             if so.is_empty() && st.is_empty() && ssd.is_empty() {
                 continue;
             }
-            let _lock = self.shared.bin_locks[s].lock().unwrap();
-            // Each &mut targets a distinct tile Vec (guarded by bin_locks[s]); no
-            // reference to the whole bin array is ever formed, so disjoint tiles
-            // are mutated concurrently without aliasing.
-            unsafe {
-                append_bin(&mut *self.plan.w_opaque.add(s), so, config::ENABLE_RGB_TRIANGLE_SORT, true, &mut local.sort_gather);
-                append_bin(&mut *self.plan.w_trans.add(s), st, config::ENABLE_RGB_TRIANGLE_SORT, false, &mut local.sort_gather);
-                append_bin(&mut *self.plan.w_shadow.add(s), ssd, config::ENABLE_SHADOW_TRIANGLE_SORT, true, &mut local.sort_gather);
-            }
+            // Lock the Mutex that owns this tile's three lists; no reference to
+            // the whole bin array is ever formed, so disjoint tiles are merged
+            // concurrently without aliasing.
+            let mut tile = unsafe { &*self.plan.w_bins.add(s) }.lock().unwrap();
+            append_bin(&mut tile.opaque, so, config::ENABLE_RGB_TRIANGLE_SORT, true, &mut local.sort_gather);
+            append_bin(&mut tile.trans, st, config::ENABLE_RGB_TRIANGLE_SORT, false, &mut local.sort_gather);
+            append_bin(&mut tile.shadow, ssd, config::ENABLE_SHADOW_TRIANGLE_SORT, true, &mut local.sort_gather);
         }
         local.tl_ivs.push(Interval { start: s1, end: self.ts(), tag: profiler::TL_BIN_MERGE });
     }
@@ -2591,13 +2628,11 @@ fn emit_shadow_triangle(
     shadow_tri.v2.sq = sh2.w;
     shadow_tri.shadow_backface = true;
     shadow_tri.shadow_screendoor_mask = inst_shadow_screendoor_mask;
-    let mut sv0 = ShadowVertex::default();
-    let mut sv1 = ShadowVertex::default();
-    let mut sv2 = ShadowVertex::default();
-    if shadow::shadow_vertex_from_varying(&shadow_tri.v0, &mut sv0)
-        && shadow::shadow_vertex_from_varying(&shadow_tri.v1, &mut sv1)
-        && shadow::shadow_vertex_from_varying(&shadow_tri.v2, &mut sv2)
-    {
+    if let (Some(sv0), Some(sv1), Some(sv2)) = (
+        shadow::shadow_vertex_from_varying(&shadow_tri.v0),
+        shadow::shadow_vertex_from_varying(&shadow_tri.v1),
+        shadow::shadow_vertex_from_varying(&shadow_tri.v2),
+    ) {
         shadow_tri.sort_z = (sv0.z + sv1.z + sv2.z) * (1.0 / 3.0);
         // Bin by shadow-map tile (shadow space, SHADOW_MAP_SIZE square).
         let sm = config::SHADOW_MAP_SIZE;

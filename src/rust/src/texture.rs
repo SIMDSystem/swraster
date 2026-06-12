@@ -162,39 +162,43 @@ fn unpack_rgb_f32(c: u32) -> [f32; 4] {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn blend_rgb_bilinear_neon(c00: u32, c10: u32, c01: u32, c11: u32, s00: f32, s10: f32, s01: f32, s11: f32) -> u32 {
-    let mut acc = vmulq_n_f32(vld1q_f32(unpack_rgb_f32(c00).as_ptr()), s00);
-    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c10).as_ptr()), s10);
-    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c01).as_ptr()), s01);
-    acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c11).as_ptr()), s11);
-    acc = vaddq_f32(acc, vdupq_n_f32(0.5));
-    let mut out = [0.0f32; 4];
-    vst1q_f32(out.as_mut_ptr(), acc);
-    ((out[0] as u32) << 16) | ((out[1] as u32) << 8) | (out[2] as u32)
+    unsafe {
+        let mut acc = vmulq_n_f32(vld1q_f32(unpack_rgb_f32(c00).as_ptr()), s00);
+        acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c10).as_ptr()), s10);
+        acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c01).as_ptr()), s01);
+        acc = vfmaq_n_f32(acc, vld1q_f32(unpack_rgb_f32(c11).as_ptr()), s11);
+        acc = vaddq_f32(acc, vdupq_n_f32(0.5));
+        let mut out = [0.0f32; 4];
+        vst1q_f32(out.as_mut_ptr(), acc);
+        ((out[0] as u32) << 16) | ((out[1] as u32) << 8) | (out[2] as u32)
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
 #[inline(always)]
 unsafe fn blend_rgb_bilinear_wasm(c00: u32, c10: u32, c01: u32, c11: u32, s00: f32, s10: f32, s01: f32, s11: f32) -> u32 {
-    let mut acc = f32x4_mul(
-        v128_load(unpack_rgb_f32(c00).as_ptr().cast::<v128>()),
-        f32x4_splat(s00),
-    );
-    acc = f32x4_add(
-        acc,
-        f32x4_mul(v128_load(unpack_rgb_f32(c10).as_ptr().cast::<v128>()), f32x4_splat(s10)),
-    );
-    acc = f32x4_add(
-        acc,
-        f32x4_mul(v128_load(unpack_rgb_f32(c01).as_ptr().cast::<v128>()), f32x4_splat(s01)),
-    );
-    acc = f32x4_add(
-        acc,
-        f32x4_mul(v128_load(unpack_rgb_f32(c11).as_ptr().cast::<v128>()), f32x4_splat(s11)),
-    );
-    acc = f32x4_add(acc, f32x4_splat(0.5));
-    let mut out = [0.0f32; 4];
-    v128_store(out.as_mut_ptr().cast::<v128>(), acc);
-    ((out[0] as u32) << 16) | ((out[1] as u32) << 8) | (out[2] as u32)
+    unsafe {
+        let mut acc = f32x4_mul(
+            v128_load(unpack_rgb_f32(c00).as_ptr().cast::<v128>()),
+            f32x4_splat(s00),
+        );
+        acc = f32x4_add(
+            acc,
+            f32x4_mul(v128_load(unpack_rgb_f32(c10).as_ptr().cast::<v128>()), f32x4_splat(s10)),
+        );
+        acc = f32x4_add(
+            acc,
+            f32x4_mul(v128_load(unpack_rgb_f32(c01).as_ptr().cast::<v128>()), f32x4_splat(s01)),
+        );
+        acc = f32x4_add(
+            acc,
+            f32x4_mul(v128_load(unpack_rgb_f32(c11).as_ptr().cast::<v128>()), f32x4_splat(s11)),
+        );
+        acc = f32x4_add(acc, f32x4_splat(0.5));
+        let mut out = [0.0f32; 4];
+        v128_store(out.as_mut_ptr().cast::<v128>(), acc);
+        ((out[0] as u32) << 16) | ((out[1] as u32) << 8) | (out[2] as u32)
+    }
 }
 
 #[inline]

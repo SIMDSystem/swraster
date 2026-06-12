@@ -70,12 +70,14 @@ pub unsafe fn add_pixel_rgb_ptr(
     add_g: f32,
     add_b: f32,
 ) {
-    let cell = row.add(x as usize);
-    let d = unpack_rgb_fast(*cell, format);
-    let r = d.r as i32 + add_r as i32;
-    let g = d.g as i32 + add_g as i32;
-    let b = d.b as i32 + add_b as i32;
-    *cell = pack_rgb_fast(format, r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+    unsafe {
+        let cell = row.add(x as usize);
+        let d = unpack_rgb_fast(*cell, format);
+        let r = d.r as i32 + add_r as i32;
+        let g = d.g as i32 + add_g as i32;
+        let b = d.b as i32 + add_b as i32;
+        *cell = pack_rgb_fast(format, r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+    }
 }
 
 // Simple 5x7 font for digits 0-9. Each row's low 5 bits are pixels.

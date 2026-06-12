@@ -43,29 +43,14 @@ pub fn shadow_depth_to_u16(z_in: f32) -> ShadowDepth {
     (z * 65535.0 + 0.5) as ShadowDepth
 }
 
-// Runtime-configured thread/strip counts (set by threading::init_thread_counts).
-// The C++/Zig versions are plain globals written once at startup then read-only;
-// atomics give us safe shared access without unsafe statics.
+// Runtime-configured T&L thread count ([ / ] keys). The C++/Zig versions are
+// plain globals written once at startup then adjusted from the event loop; an
+// atomic gives us safe shared access without unsafe statics.
 pub static NUM_TL_THREADS: AtomicI32 = AtomicI32::new(0);
-pub static NUM_RASTER_THREADS: AtomicI32 = AtomicI32::new(0);
-pub static NUM_STRIPS: AtomicI32 = AtomicI32::new(0);
-pub static NUM_TILE_BINS: AtomicI32 = AtomicI32::new(0);
 
 #[inline]
 pub fn num_tl_threads() -> i32 {
     NUM_TL_THREADS.load(Ordering::Relaxed)
-}
-#[inline]
-pub fn num_raster_threads() -> i32 {
-    NUM_RASTER_THREADS.load(Ordering::Relaxed)
-}
-#[inline]
-pub fn num_strips() -> i32 {
-    NUM_STRIPS.load(Ordering::Relaxed)
-}
-#[inline]
-pub fn num_tile_bins() -> i32 {
-    NUM_TILE_BINS.load(Ordering::Relaxed)
 }
 
 /// Divides [0,extent) into `splits` contiguous tiles. Tile `idx` covers pixels

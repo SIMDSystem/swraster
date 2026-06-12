@@ -17,10 +17,13 @@ pub struct PhysicsPipeline {
     pub sequence: u64,
 }
 
-// The pipeline owns raw Jolt handles (not auto-Send). Sound to move a `&mut`
-// across the per-frame scope: only the single physics worker touches it during
-// the frame, and the main thread does not access it until after the scope joins
-// (mirrors the dedicated physics thread in physics_pipeline.zig/.cpp).
+// The pipeline owns raw Jolt handles (not auto-Send). Send is needed because
+// the owning RenderState moves onto a spawned render-loop thread on the
+// emscripten build; physics itself always steps synchronously on whichever
+// thread calls RenderState::frame, so the handles are only ever used from one
+// thread at a time. The system/body-interface/allocator/job-system handles are
+// created once at startup and deliberately live for the program lifetime
+// (never destroyed), so no Drop ordering concerns apply.
 unsafe impl Send for PhysicsPipeline {}
 
 impl PhysicsPipeline {
@@ -44,51 +47,51 @@ impl PhysicsPipeline {
         walls: &[WallData],
         out_snapshot: &mut PoseSnapshot,
     ) {
+        let box_rot = Quat::s_euler_angles(Vec3::new(target_time * 0.8, target_time * 0.6, target_time * 0.4));
+        for wall in walls {
+            let rotated_pos = box_rot.rotate(wall.local_pos);
+            unsafe { jolt::jph_body_move_kinematic(self.body_interface, wall.id, rotated_pos, box_rot, delta_time) };
+        }
+
+        let mut collision_steps = (delta_time * 60.0).ceil() as i32;
+        if collision_steps < 1 {
+            collision_steps = 1;
+        }
+        if collision_steps > 4 {
+            collision_steps = 4;
+        }
         unsafe {
-            let box_rot = Quat::s_euler_angles(Vec3::new(target_time * 0.8, target_time * 0.6, target_time * 0.4));
-            for wall in walls {
-                let rotated_pos = box_rot.rotate(wall.local_pos);
-                jolt::jph_body_move_kinematic(self.body_interface, wall.id, rotated_pos, box_rot, delta_time);
-            }
-
-            let mut collision_steps = (delta_time * 60.0).ceil() as i32;
-            if collision_steps < 1 {
-                collision_steps = 1;
-            }
-            if collision_steps > 4 {
-                collision_steps = 4;
-            }
             jolt::jph_physics_system_update(self.system, delta_time, collision_steps, self.temp_allocator, self.job_system);
+        }
 
-            out_snapshot.sim_time = target_time;
-            out_snapshot.sequence = sequence;
-            if out_snapshot.poses.len() != instances.len() {
-                out_snapshot.poses.resize(instances.len(), Default::default());
+        out_snapshot.sim_time = target_time;
+        out_snapshot.sequence = sequence;
+        if out_snapshot.poses.len() != instances.len() {
+            out_snapshot.poses.resize(instances.len(), Default::default());
+        }
+        for (i, inst) in instances.iter().enumerate() {
+            let mut pose = InstancePose {
+                tx: inst.tx,
+                ty: inst.ty,
+                tz: inst.tz,
+                qx: inst.qx,
+                qy: inst.qy,
+                qz: inst.qz,
+                qw: inst.qw,
+            };
+            if !inst.body_id.is_invalid() {
+                let mut pos = Vec3::zero();
+                let mut rot = Quat::identity();
+                unsafe { jolt::jph_body_get_position_and_rotation(self.body_interface, inst.body_id, &mut pos, &mut rot) };
+                pose.tx = pos.x;
+                pose.ty = pos.y;
+                pose.tz = pos.z;
+                pose.qx = rot.x;
+                pose.qy = rot.y;
+                pose.qz = rot.z;
+                pose.qw = rot.w;
             }
-            for (i, inst) in instances.iter().enumerate() {
-                let mut pose = InstancePose {
-                    tx: inst.tx,
-                    ty: inst.ty,
-                    tz: inst.tz,
-                    qx: inst.qx,
-                    qy: inst.qy,
-                    qz: inst.qz,
-                    qw: inst.qw,
-                };
-                if !inst.body_id.is_invalid() {
-                    let mut pos = Vec3::zero();
-                    let mut rot = Quat::identity();
-                    jolt::jph_body_get_position_and_rotation(self.body_interface, inst.body_id, &mut pos, &mut rot);
-                    pose.tx = pos.x;
-                    pose.ty = pos.y;
-                    pose.tz = pos.z;
-                    pose.qx = rot.x;
-                    pose.qy = rot.y;
-                    pose.qz = rot.z;
-                    pose.qw = rot.w;
-                }
-                out_snapshot.poses[i] = pose;
-            }
+            out_snapshot.poses[i] = pose;
         }
         self.sim_time = target_time;
         self.sequence = sequence;
@@ -101,8 +104,8 @@ impl PhysicsPipeline {
         walls: &[WallData],
         initial: &[crate::scene::InitialInstanceState],
     ) {
-        unsafe {
-            for wall in walls {
+        for wall in walls {
+            unsafe {
                 jolt::jph_body_set_position_and_rotation(
                     self.body_interface,
                     wall.id,
@@ -112,12 +115,14 @@ impl PhysicsPipeline {
                 );
                 jolt::jph_body_set_velocities(self.body_interface, wall.id, Vec3::zero(), Vec3::zero());
             }
-            for (i, inst) in instances.iter().enumerate() {
-                if i >= initial.len() {
-                    break;
-                }
-                let st = initial[i];
-                if !inst.body_id.is_invalid() {
+        }
+        for (i, inst) in instances.iter().enumerate() {
+            if i >= initial.len() {
+                break;
+            }
+            let st = initial[i];
+            if !inst.body_id.is_invalid() {
+                unsafe {
                     jolt::jph_body_set_position_and_rotation(
                         self.body_interface,
                         inst.body_id,
@@ -128,8 +133,8 @@ impl PhysicsPipeline {
                     jolt::jph_body_set_velocities(self.body_interface, inst.body_id, st.linear_velocity, st.angular_velocity);
                 }
             }
-            jolt::jph_physics_system_optimize_broadphase(self.system);
         }
+        unsafe { jolt::jph_physics_system_optimize_broadphase(self.system) };
         self.sim_time = 0.0;
         self.sequence = 0;
     }

@@ -3,8 +3,7 @@
 
 use crate::geometry::{RenderVertexList, Vertex3D};
 use crate::linalg::{Mat3, Mat4, Vec3, Vec4};
-
-const M_PI: f32 = std::f32::consts::PI;
+use std::f32::consts::PI;
 
 /// Projected vertex plus attributes interpolated across pixels.
 #[derive(Clone, Copy, Debug)]
@@ -98,7 +97,7 @@ pub fn project_eye_point_w(
 }
 
 pub fn build_projection_matrix(fov_degrees: f32, aspect: f32, near_plane: f32, far_plane: f32) -> Mat4 {
-    let fov_rad = fov_degrees * M_PI / 180.0;
+    let fov_rad = fov_degrees * PI / 180.0;
     let f = 1.0 / (fov_rad / 2.0).tan();
     let mut proj = Mat4::zero();
     proj.m[0][0] = f / aspect;
@@ -292,14 +291,14 @@ fn interpolate_clip_vertex(a: &ClipVertex, b: &ClipVertex, view_matrix: &Mat4, n
     out
 }
 
-/// Sutherland-Hodgman clip against the near plane. Returns the count written
-/// into `out` (0..=4).
+/// Sutherland-Hodgman clip against the near plane. Returns the clipped
+/// vertices and how many of them are valid (0..=4).
 pub fn clip_triangle_near(
     input: &[ClipVertex; 3],
-    out: &mut [ClipVertex; 4],
     view_matrix: &Mat4,
     near_plane: f32,
-) -> i32 {
+) -> ([ClipVertex; 4], i32) {
+    let mut out = [ClipVertex::default(); 4];
     let mut out_count: i32 = 0;
     let mut prev = input[2];
     let mut prev_inside = is_inside_near(&prev, view_matrix, near_plane);
@@ -318,7 +317,7 @@ pub fn clip_triangle_near(
         prev = cur;
         prev_inside = cur_inside;
     }
-    out_count
+    (out, out_count)
 }
 
 pub fn is_back_face_clip_vertices(v0: &ClipVertex, v1: &ClipVertex, v2: &ClipVertex) -> bool {

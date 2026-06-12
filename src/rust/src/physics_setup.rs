@@ -26,6 +26,13 @@ impl JoltScope {
         unsafe { jolt::jph_factory_create() };
         JoltScope
     }
+
+    /// Create the factory and intentionally leak it for the program lifetime:
+    /// the Jolt factory must outlive every physics object, and this program
+    /// never tears physics down.
+    pub fn leak() {
+        std::mem::forget(JoltScope::new());
+    }
 }
 impl Drop for JoltScope {
     fn drop(&mut self) {
