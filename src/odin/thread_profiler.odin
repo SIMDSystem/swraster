@@ -12,15 +12,15 @@ TL_Job_Tag :: enum u8 {
 }
 
 Profiler_Interval :: struct {
-	start_ts: Uint64,
-	end_ts:   Uint64,
-	cpu_ns:   Uint64,
+	start_ts: u64,
+	end_ts:   u64,
+	cpu_ns:   u64,
 	tag:      u8,
 }
 
 Present_Blit :: struct {
-	start_ts: Uint64,
-	end_ts:   Uint64,
+	start_ts: u64,
+	end_ts:   u64,
 }
 
 Interval_List :: [dynamic]Profiler_Interval
@@ -28,9 +28,9 @@ Interval_List :: [dynamic]Profiler_Interval
 Thread_Profiler :: struct {
 	enabled:              b32,
 	frozen:               b32,
-	frozen_blit_start_ts: Uint64,
-	frozen_blit_end_ts:   Uint64,
-	frozen_draw_end_ts:   Uint64,
+	frozen_blit_start_ts: u64,
+	frozen_blit_end_ts:   u64,
+	frozen_draw_end_ts:   u64,
 
 	present_history: [2]Present_Blit,
 
@@ -43,11 +43,11 @@ Thread_Profiler :: struct {
 	tl_intervals_prev:      []Interval_List,
 	raster_intervals_prev:  []Interval_List,
 	physics_intervals_prev: Interval_List,
-	prev_blit_start_ts:     Uint64,
-	prev_blit_end_ts:       Uint64,
-	prev_draw_end_ts:       Uint64,
+	prev_blit_start_ts:     u64,
+	prev_blit_end_ts:       u64,
+	prev_draw_end_ts:       u64,
 
-	last_draw_end_ts: Uint64,
+	last_draw_end_ts: u64,
 
 	right_margin_px: i32,
 	left_margin_px:  i32,
@@ -101,7 +101,7 @@ thread_profiler_begin_frame :: proc(p: ^Thread_Profiler) {
 	for &v in p.raster_intervals do clear(&v)
 }
 
-profiler_record_tl :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, cpu_ns: Uint64, tag: u8) {
+profiler_record_tl :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, cpu_ns: u64, tag: u8) {
 	if !sync.atomic_load_explicit(&p.enabled, .Relaxed) do return
 	if sync.atomic_load_explicit(&p.frozen, .Relaxed) do return
 	if int(thread_id) < len(p.tl_intervals) {
@@ -109,7 +109,7 @@ profiler_record_tl :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, cpu_
 	}
 }
 
-profiler_record_raster :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, cpu_ns: Uint64, tag: u8) {
+profiler_record_raster :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, cpu_ns: u64, tag: u8) {
 	if !sync.atomic_load_explicit(&p.enabled, .Relaxed) do return
 	if sync.atomic_load_explicit(&p.frozen, .Relaxed) do return
 	if int(thread_id) < len(p.raster_intervals) {
@@ -117,7 +117,7 @@ profiler_record_raster :: proc(p: ^Thread_Profiler, thread_id: i32, start, end, 
 	}
 }
 
-profiler_record_physics :: proc(p: ^Thread_Profiler, start, end, cpu_ns: Uint64) {
+profiler_record_physics :: proc(p: ^Thread_Profiler, start, end, cpu_ns: u64) {
 	if !sync.atomic_load_explicit(&p.enabled, .Relaxed) do return
 	if sync.atomic_load_explicit(&p.frozen, .Relaxed) do return
 	mutex_lock(&p.physics_mtx)
@@ -141,7 +141,7 @@ fill_hline :: proc(pixels: [^]u8, pitch, x0_in, x1_in, y: i32, color: u32, surfa
 	if x1 > surface_w do x1 = surface_w
 	row := cast([^]Pixel32)(rawptr(uintptr(pixels) + uintptr(y) * uintptr(pitch)))
 	for x in x0 ..< x1 {
-		row[x] = Pixel32(color)
+		row[x] = color
 	}
 }
 
@@ -182,12 +182,12 @@ thread_profiler_draw :: proc(
 	pixels: [^]u8,
 	pitch, surface_w, surface_h: i32,
 	format: ^Pixel_Format,
-	draw_end_ts: Uint64,
+	draw_end_ts: u64,
 ) {
 	if !sync.atomic_load_explicit(&p.enabled, .Relaxed) do return
 	if format == nil do return
 
-	blit_start_ts, blit_end_ts, orange_ts: Uint64
+	blit_start_ts, blit_end_ts, orange_ts: u64
 	if sync.atomic_load_explicit(&p.frozen, .Relaxed) {
 		blit_start_ts = p.frozen_blit_start_ts
 		blit_end_ts = p.frozen_blit_end_ts
@@ -228,8 +228,8 @@ thread_profiler_draw :: proc(
 	physics_has_work: bool
 	{
 		mutex_lock(&p.physics_mtx)
+		defer mutex_unlock(&p.physics_mtx)
 		physics_has_work = len(p.physics_intervals) != 0 || len(p.physics_intervals_prev) != 0
-		mutex_unlock(&p.physics_mtx)
 	}
 
 	total_lanes := (physics_has_work ? 1 : 0) + active_worker_count
@@ -247,7 +247,7 @@ thread_profiler_draw :: proc(
 			for y in panel_y0 ..< panel_y1 {
 				if y >= 0 && y < surface_h {
 					row := cast([^]Pixel32)(rawptr(uintptr(pixels) + uintptr(y) * uintptr(pitch)))
-					row[x] = Pixel32(tick_color)
+					row[x] = tick_color
 				}
 			}
 		}
@@ -259,7 +259,7 @@ thread_profiler_draw :: proc(
 		pix: [^]u8,
 		pit, lane_index: i32,
 		intervals: []Profiler_Interval,
-		lts: Uint64,
+		lts: u64,
 		ledge, redge, sw, sh: i32,
 		is_raster: bool,
 		format2: ^Pixel_Format,
@@ -295,7 +295,7 @@ thread_profiler_draw :: proc(
 			pp: ^Thread_Profiler,
 			lane_index: i32,
 			intervals: []Profiler_Interval,
-			lts: Uint64,
+			lts: u64,
 			ledge, redge, sw, sh: i32,
 			color: u32,
 		) {
@@ -346,9 +346,9 @@ thread_profiler_draw :: proc(
 		pix: [^]u8,
 		pit: i32,
 		pp: ^Thread_Profiler,
-		ts: Uint64,
+		ts: u64,
 		color: u32,
-		lts: Uint64,
+		lts: u64,
 		ledge, redge, py0, py1, sw, sh: i32,
 	) {
 		ms := perf_ms(lts, ts)
@@ -359,7 +359,7 @@ thread_profiler_draw :: proc(
 		for y in py0 ..< py1 {
 			if y < 0 || y >= sh do continue
 			row := cast([^]Pixel32)(rawptr(uintptr(pix) + uintptr(y) * uintptr(pit)))
-			row[x] = Pixel32(color)
+			row[x] = color
 		}
 	}
 

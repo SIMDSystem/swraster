@@ -162,9 +162,6 @@ mat4_from_pose :: proc(tx, ty, tz, qx, qy, qz, qw: f32) -> Mat4 {
 	return model
 }
 
-mat4_get :: #force_inline proc(a: ^Mat4, row, col: int) -> f32 { return a.m[row][col] }
-mat4_set :: #force_inline proc(a: ^Mat4, row, col: int, v: f32) { a.m[row][col] = v }
-
 mat4_mul :: proc(a, b: Mat4) -> Mat4 {
 	b0 := simd.f32x4{b.m[0][0], b.m[0][1], b.m[0][2], b.m[0][3]}
 	b1 := simd.f32x4{b.m[1][0], b.m[1][1], b.m[1][2], b.m[1][3]}

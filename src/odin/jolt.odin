@@ -12,12 +12,12 @@ Body_ID :: struct {
 	id: u32,
 }
 
-Body_ID_INVALID :: u32(0xffffffff)
+BODY_ID_INVALID :: u32(0xffffffff)
 
-BODY_ID_NONE :: Body_ID{id = Body_ID_INVALID}
+BODY_ID_NONE :: Body_ID{id = BODY_ID_INVALID}
 
 is_invalid :: proc(b: Body_ID) -> bool {
-	return b.id == Body_ID_INVALID
+	return b.id == BODY_ID_INVALID
 }
 
 Motion_Type :: enum c.int {

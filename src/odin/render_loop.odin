@@ -3,20 +3,18 @@
 
 package main
 
-import "core:c"
 import "core:fmt"
 import "core:math"
-import "core:mem"
 import "core:sync"
 
 @(private="file")
 merge_warned := false
 
 @(private="file")
-g_merge_scratch: Render_Triangle_List
+merge_scratch: Render_Triangle_List
 
 init_global_merge_scratch :: proc() {
-	g_merge_scratch = make([dynamic]Render_Triangle)
+	merge_scratch = make([dynamic]Render_Triangle)
 }
 
 reset_animation :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame_num: ^i32, frame_sequence: ^i32, last_physics_time: ^u64) {
@@ -60,7 +58,7 @@ reset_animation :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame_num: ^i32,
 		ctx.opaque_buffers[b].count = 0
 		ctx.trans_buffers[b].count = 0
 		ctx.shadow_buffers[b].count = 0
-		for s := 0; s < int(NUM_TILE_BINS); s += 1 {
+		for s in 0 ..< int(NUM_TILE_BINS) {
 			clear_render_triangle_list(&ctx.opaque_strip_buffers[b].bins[s])
 			clear_render_triangle_list(&ctx.trans_strip_buffers[b].bins[s])
 			clear_render_triangle_list(&ctx.shadow_strip_buffers[b].bins[s])
@@ -79,16 +77,16 @@ reset_animation :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame_num: ^i32,
 	sync.atomic_store_explicit(&raster_pass, i32(RASTER_PASS_COUNT), .Relaxed)
 	for p in 0 ..< RASTER_PASS_COUNT {
 		sync.atomic_store_explicit(&raster_pass_tiles_done[p], 0, .Relaxed)
-		for r := 0; r < int(NUM_STRIPS * 2); r += 1 {
+		for r in 0 ..< int(NUM_STRIPS * 2) {
 			sync.atomic_store_explicit(&raster_row_next_col[p][r], 0, .Relaxed)
 		}
 	}
-	for t := 0; t < int(NUM_STRIPS * TILE_X_SPLITS); t += 1 {
+	for t in 0 ..< int(NUM_STRIPS * TILE_X_SPLITS) {
 		sync.atomic_store_explicit(&color_tile_done[t], 0, .Relaxed)
 		sync.atomic_store_explicit(&ssao_tile_claimed[t], 0, .Relaxed)
 		sync.atomic_store_explicit(&ssao_tile_done[t], 0, .Relaxed)
 	}
-	for t := 0; t < int(NUM_STRIPS * 2 * TILE_X_SPLITS); t += 1 {
+	for t in 0 ..< int(NUM_STRIPS * 2 * TILE_X_SPLITS) {
 		sync.atomic_store_explicit(&lum_tile_claimed[t], 0, .Relaxed)
 	}
 }
@@ -129,7 +127,7 @@ merge_tl_globals :: proc(ctx: ^Renderer_Context, tl_buf_idx: int, k_eff: i32) {
 	count_opaque, count_trans, count_shadow: int = 0, 0, 0
 	dropped_opaque, dropped_trans, dropped_shadow: int = 0, 0, 0
 
-	scratch := &g_merge_scratch
+	scratch := &merge_scratch
 
 	for tid in 0 ..< k_eff {
 		out := ctx.tl_thread_outputs[tid]
@@ -207,12 +205,14 @@ threadperf_advance_variant :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame
 	pp := ctx.physics
 	physics_wait_for_idle(pp)
 	current_time := ticks_ms()
-	mutex_lock(&pp.mtx)
-	tp.physics_ms_this_variant = pp.wall_ms_accum
-	tp.physics_cpu_ms_this_variant = pp.cpu_ms_accum
-	tp.physics_update_ms_this_variant = pp.update_wall_ms_accum
-	tp.physics_sync_ms_this_variant = pp.sync_wall_ms_accum
-	mutex_unlock(&pp.mtx)
+	{
+		mutex_lock(&pp.mtx)
+		defer mutex_unlock(&pp.mtx)
+		tp.physics_ms_this_variant = pp.wall_ms_accum
+		tp.physics_cpu_ms_this_variant = pp.cpu_ms_accum
+		tp.physics_update_ms_this_variant = pp.update_wall_ms_accum
+		tp.physics_sync_ms_this_variant = pp.sync_wall_ms_accum
+	}
 	elapsed_ms := current_time - tp.variant_start_ticks
 	tp.total_frames += u64(tp.frames_this_variant)
 	total_elapsed_ms := current_time - tp.search_start_ticks
@@ -245,12 +245,14 @@ threadperf_write_partial_at_exit :: proc(ctx: ^Renderer_Context) {
 	pp := ctx.physics
 	if tp.log == nil do return
 	if tp.enabled && tp.frames_this_variant > 0 {
-		mutex_lock(&pp.mtx)
-		tp.physics_ms_this_variant = pp.wall_ms_accum
-		tp.physics_cpu_ms_this_variant = pp.cpu_ms_accum
-		tp.physics_update_ms_this_variant = pp.update_wall_ms_accum
-		tp.physics_sync_ms_this_variant = pp.sync_wall_ms_accum
-		mutex_unlock(&pp.mtx)
+		{
+			mutex_lock(&pp.mtx)
+			defer mutex_unlock(&pp.mtx)
+			tp.physics_ms_this_variant = pp.wall_ms_accum
+			tp.physics_cpu_ms_this_variant = pp.cpu_ms_accum
+			tp.physics_update_ms_this_variant = pp.update_wall_ms_accum
+			tp.physics_sync_ms_this_variant = pp.sync_wall_ms_accum
+		}
 		now := ticks_ms()
 		elapsed_ms := now - tp.variant_start_ticks
 		partial_total := tp.total_frames + u64(tp.frames_this_variant)
@@ -261,16 +263,11 @@ threadperf_write_partial_at_exit :: proc(ctx: ^Renderer_Context) {
 	tp.log = nil
 }
 
-@(private="file")
-last_aspect: f32 = 0.0
-
-@(private="file")
-ll_projection: Mat4
-
 run_render_loop :: proc(ctx: ^Renderer_Context) {
 	pp := ctx.physics
 	tp := ctx.thread_perf
-	ll_projection = mat4_identity()
+	last_aspect: f32 = 0.0
+	cached_projection := mat4_identity()
 
 	running := true
 	paused := false
@@ -328,7 +325,7 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 				}
 				if event.key == 'f' || event.key == 'F' do profiler_unfreeze = !profiler_unfreeze
 				if event.key == 'q' || event.key == 'Q' {
-					sync.atomic_store_explicit(&g_quad_path_enabled, !sync.atomic_load_explicit(&g_quad_path_enabled, .Relaxed), .Relaxed)
+					sync.atomic_store_explicit(&quad_path_enabled, !sync.atomic_load_explicit(&quad_path_enabled, .Relaxed), .Relaxed)
 				}
 				if event.key == 'b' || event.key == 'B' {
 					sync.atomic_store_explicit(&raster_hard_barrier, !sync.atomic_load_explicit(&raster_hard_barrier, .Relaxed), .Relaxed)
@@ -341,15 +338,15 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 				}
 				if event.key == '+' || event.key == '=' || event.key == '-' || event.key == '_' {
 					delta: i32 = (event.key == '+' || event.key == '=') ? 1 : -1
-					cur := sync.atomic_load_explicit(&g_active_workers, .Relaxed)
+					cur := sync.atomic_load_explicit(&active_workers, .Relaxed)
 					next := clamp(cur + delta, 1, NUM_RASTER_THREADS)
-					if next != cur do sync.atomic_store_explicit(&g_active_workers, next, .Relaxed)
+					if next != cur do sync.atomic_store_explicit(&active_workers, next, .Relaxed)
 				}
 				if event.key == '[' || event.key == '{' || event.key == ']' || event.key == '}' {
 					delta: i32 = (event.key == ']' || event.key == '}') ? 1 : -1
-					cur := sync.atomic_load_explicit(&g_tl_workers, .Relaxed)
+					cur := sync.atomic_load_explicit(&tl_workers, .Relaxed)
 					next := clamp(cur + delta, 1, NUM_RASTER_THREADS)
-					if next != cur do sync.atomic_store_explicit(&g_tl_workers, next, .Relaxed)
+					if next != cur do sync.atomic_store_explicit(&tl_workers, next, .Relaxed)
 				}
 			case .MouseButton:
 				if event.button == 1 do camera_orbiting = event.pressed
@@ -414,10 +411,10 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 
 		aspect := f32(fb.w) / f32(fb.h)
 		if aspect != last_aspect {
-			ll_projection = build_projection_matrix(60.0, aspect, NEAR_PLANE, CAMERA_FAR_PLANE)
+			cached_projection = build_projection_matrix(60.0, aspect, NEAR_PLANE, CAMERA_FAR_PLANE)
 			last_aspect = aspect
 		}
-		projection := ll_projection
+		projection := cached_projection
 
 		cp := math.cos(camera_pitch)
 		camera_pos := Vec3{camera_distance * cp * math.sin(camera_yaw), camera_distance * math.sin(camera_pitch), camera_distance * cp * math.cos(camera_yaw)}
@@ -480,16 +477,17 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 			pose := read_snapshot.poses[i]
 			center_view := mat4_mul_vec4(&view_matrix, vec4_init(pose.tx, pose.ty, pose.tz, 1.0))
 			append_instance_depth(instance_depths, Instance_Depth{center_view.z, i})
-			if inst.type == 0 {
+			#partial switch inst.type {
+			case .Cube:
 				append_occluder(occluders_eye, Occluder_Eye{vec4_head3(center_view), cube_inner_occluder_radius})
-			} else if inst.type == 1 {
+			case .Sphere:
 				append_occluder(occluders_eye, Occluder_Eye{vec4_head3(center_view), sphere_inner_occluder_radius})
 			}
 		}
 		sort_instance_depths(instance_depths, instances)
 
 		tl_buf_idx, raster_buf_idx := frame_buffer_indices(frame_num)
-		for s := 0; s < int(NUM_TILE_BINS); s += 1 {
+		for s in 0 ..< int(NUM_TILE_BINS) {
 			clear_render_triangle_list(&ctx.opaque_strip_buffers[tl_buf_idx].bins[s])
 			clear_render_triangle_list(&ctx.trans_strip_buffers[tl_buf_idx].bins[s])
 			clear_render_triangle_list(&ctx.shadow_strip_buffers[tl_buf_idx].bins[s])
@@ -611,9 +609,9 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 			pool_active = NUM_RASTER_THREADS
 			tl_pref = NUM_TL_THREADS
 		} else {
-			pool_active = sync.atomic_load_explicit(&g_active_workers, .Relaxed)
+			pool_active = sync.atomic_load_explicit(&active_workers, .Relaxed)
 			pool_active = clamp(pool_active, 1, NUM_RASTER_THREADS)
-			tl_pref = sync.atomic_load_explicit(&g_tl_workers, .Relaxed)
+			tl_pref = sync.atomic_load_explicit(&tl_workers, .Relaxed)
 			tl_pref = clamp(tl_pref, 1, NUM_RASTER_THREADS)
 		}
 		k_eff := min(tl_pref, pool_active)
@@ -631,16 +629,16 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 		sync.atomic_store_explicit(&tl_done_counter, 0, .Relaxed)
 		for p in 0 ..< RASTER_PASS_COUNT {
 			sync.atomic_store_explicit(&raster_pass_tiles_done[p], 0, .Relaxed)
-			for r := 0; r < int(NUM_STRIPS * 2); r += 1 {
+			for r in 0 ..< int(NUM_STRIPS * 2) {
 				sync.atomic_store_explicit(&raster_row_next_col[p][r], 0, .Relaxed)
 			}
 		}
-		for t := 0; t < int(NUM_STRIPS * TILE_X_SPLITS); t += 1 {
+		for t in 0 ..< int(NUM_STRIPS * TILE_X_SPLITS) {
 			sync.atomic_store_explicit(&color_tile_done[t], 0, .Relaxed)
 			sync.atomic_store_explicit(&ssao_tile_claimed[t], 0, .Relaxed)
 			sync.atomic_store_explicit(&ssao_tile_done[t], 0, .Relaxed)
 		}
-		for t := 0; t < int(NUM_STRIPS * 2 * TILE_X_SPLITS); t += 1 {
+		for t in 0 ..< int(NUM_STRIPS * 2 * TILE_X_SPLITS) {
 			sync.atomic_store_explicit(&lum_tile_claimed[t], 0, .Relaxed)
 		}
 		sync.atomic_store_explicit(&raster_pass, do_raster ? 0 : i32(RASTER_PASS_COUNT), .Relaxed)
@@ -691,8 +689,7 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 				visible[i] = false
 			}
 		}
-		edges := [12][2]int{{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}}
-		for e in edges {
+		for e in shadow_box_edges {
 			a, b := e[0], e[1]
 			if visible[a] && visible[b] {
 				if do_raster {

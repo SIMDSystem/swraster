@@ -5,8 +5,6 @@ package main
 
 import "core:math"
 
-M_PI :: math.PI
-
 Vertex3D :: struct {
 	position: Vec4,
 	normal:   Vec3,
@@ -32,6 +30,7 @@ resize_render_vertices :: proc(list: ^Render_Vertex_List, n: int) {
 	resize(list, n)
 }
 
+@(rodata)
 teapot_data: [32][4][4][3]f32 = {
 
     { { { 1.4, 2.25, 0.0 }, { 1.3375, 2.38125, 0.0 }, { 1.4375, 2.38125, 0.0 }, { 1.5, 2.25, 0.0 } }, { { 1.4, 2.25, 0.784 }, { 1.3375, 2.38125, 0.749 }, { 1.4375, 2.38125, 0.805 }, { 1.5, 2.25, 0.84 } }, { { 0.784, 2.25, 1.4 }, { 0.749, 2.38125, 1.3375 }, { 0.805, 2.38125, 1.4375 }, { 0.84, 2.25, 1.5 } }, { { 0.0, 2.25, 1.4 }, { 0.0, 2.38125, 1.3375 }, { 0.0, 2.38125, 1.4375 }, { 0.0, 2.25, 1.5 } } },
@@ -286,7 +285,7 @@ generate_teapot :: proc(vertices: ^[dynamic]Vertex3D, faces: ^[dynamic]Face) {
 	patch_vertex_indices: [dynamic]i32
 	defer delete(patch_vertex_indices)
 
-	for patch_idx in 0 ..< 32 {
+	for patch_idx in 0 ..< len(teapot_data) {
 		patch: [4][4]Vec3
 		for pi in 0 ..< 4 {
 			for pj in 0 ..< 4 {
@@ -344,8 +343,8 @@ generate_teapot :: proc(vertices: ^[dynamic]Vertex3D, faces: ^[dynamic]Face) {
 		v1 := vec4_head3(vertices[face.v1].position)
 		v2 := vec4_head3(vertices[face.v2].position)
 		normal := vec3_cross(vec3_sub(v1, v0), vec3_sub(v2, v0))
-		len := vec3_norm(normal)
-		face_normals[f] = len > 0.0001 ? vec3_scale(normal, 1.0 / len) : vec3_init(0, 0, 1)
+		length := vec3_norm(normal)
+		face_normals[f] = length > 0.0001 ? vec3_scale(normal, 1.0 / length) : vec3_init(0, 0, 1)
 	}
 
 	sums := make([]Vec3, len(vertices), allocator)
@@ -365,8 +364,8 @@ generate_teapot :: proc(vertices: ^[dynamic]Vertex3D, faces: ^[dynamic]Face) {
 
 	for &vert, vi in vertices {
 		if counts[vi] > 0 {
-			len := vec3_norm(sums[vi])
-			vert.normal = len > 0.0001 ? vec3_scale(sums[vi], 1.0 / len) : vec3_init(0, 0, 1)
+			length := vec3_norm(sums[vi])
+			vert.normal = length > 0.0001 ? vec3_scale(sums[vi], 1.0 / length) : vec3_init(0, 0, 1)
 		} else {
 			vert.normal = vec3_init(0, 0, 1)
 		}

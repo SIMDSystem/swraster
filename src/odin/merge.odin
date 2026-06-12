@@ -133,10 +133,8 @@ instance_depth_sort_ctx: ^[dynamic]Cube_Instance
 @(private="file")
 instance_depth_less :: proc(a, b: Instance_Depth) -> bool {
 	instances := instance_depth_sort_ctx
-	type_a := instances[a.index].type
-	type_b := instances[b.index].type
-	trans_a: bool = type_a == 2
-	trans_b: bool = type_b == 2
+	trans_a := instances[a.index].type == .Torus
+	trans_b := instances[b.index].type == .Torus
 	if trans_a != trans_b do return !trans_a
 	if trans_a do return a.depth < b.depth
 	return a.depth > b.depth

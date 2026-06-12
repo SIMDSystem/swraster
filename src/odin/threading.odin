@@ -10,8 +10,10 @@ import "core:time"
 
 RASTER_PASS_COUNT :: 4
 MAX_RASTER_STRIPS :: 96
-TILE_X_SPLITS_USIZE :: int(TILE_X_SPLITS)
-MAX_RASTER_TILES :: MAX_RASTER_STRIPS * TILE_X_SPLITS_USIZE
+MAX_RASTER_TILES :: MAX_RASTER_STRIPS * int(TILE_X_SPLITS)
+
+// Hard ceiling on launched pool workers (and on threadperf sweep bounds).
+POOL_CAPACITY_MAX :: i32(20)
 
 Raster_Job_Mode :: enum u8 {
 	ShadowDepth = 0,
@@ -29,8 +31,8 @@ pool_workers_done:    i32
 
 active_tl_job_thread_count:     i32
 active_raster_job_thread_count: i32
-g_active_workers:               i32
-g_tl_workers:                   i32
+active_workers:               i32
+tl_workers:                   i32
 
 // Published under mtx_pool each frame; workers snapshot this whole struct.
 // Buffer slots are derived from frame_num only — frame_pool_target / frame_sequence
@@ -147,15 +149,12 @@ init_thread_counts :: proc() {
 		hw = ok ? i32(logical) : 2
 	}
 	if hw < 2 do hw = 2
-	POOL_CAPACITY_MAX: i32 = 20
-	cap := 2 * hw
-	if cap > POOL_CAPACITY_MAX do cap = POOL_CAPACITY_MAX
-	NUM_RASTER_THREADS = cap
+	pool_cap := min(2 * hw, POOL_CAPACITY_MAX)
+	NUM_RASTER_THREADS = pool_cap
 	NUM_TL_THREADS = NUM_RASTER_THREADS
-	start_active := cap
-	if 16 < cap do start_active = 16
-	sync.atomic_store_explicit(&g_active_workers, start_active, .Relaxed)
-	sync.atomic_store_explicit(&g_tl_workers, start_active, .Relaxed)
+	start_active := min(pool_cap, 16)
+	sync.atomic_store_explicit(&active_workers, start_active, .Relaxed)
+	sync.atomic_store_explicit(&tl_workers, start_active, .Relaxed)
 	NUM_STRIPS = 16
 	NUM_TILE_BINS = NUM_STRIPS * TILE_X_SPLITS
 
@@ -177,7 +176,7 @@ init_thread_counts :: proc() {
 // ---- Perf timing ----
 inv_freq_ms: f64
 
-perf_ms :: proc(start, end: Uint64) -> f64 {
+perf_ms :: proc(start, end: u64) -> f64 {
 	if inv_freq_ms == 0.0 {
 		inv_freq_ms = 1000.0 / f64(perf_frequency())
 	}
@@ -213,8 +212,8 @@ Thread_Perf_Search :: struct {
 	log:                             ^Swr_FILE,
 	variant_index:                   int,
 	frames_this_variant:             i32,
-	variant_start_ticks:             Uint64,
-	search_start_ticks:              Uint64,
+	variant_start_ticks:             u64,
+	search_start_ticks:              u64,
 	total_frames:                    u64,
 	raster_ms_this_variant:          f64,
 	tl_tail_wait_ms_this_variant:    f64,
@@ -281,7 +280,7 @@ make_thread_perf_search :: proc(args: []string) -> Thread_Perf_Search {
 	}
 	if !search.enabled do return search
 
-	max_threads: i32 = 20
+	max_threads := POOL_CAPACITY_MAX
 	if search.max_tl_threads == 0 do search.max_tl_threads = max_threads
 	if search.max_raster_threads == 0 do search.max_raster_threads = max_threads
 	search.min_tl_threads = min(search.min_tl_threads, max_threads)

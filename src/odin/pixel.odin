@@ -18,14 +18,14 @@ expand_channel :: proc(value_in: u32, loss: u8) -> u8 {
 	return u8(value)
 }
 
-pack_rgb_fast :: proc(format: ^PixelFormat, r, g, b: u8) -> u32 {
+pack_rgb_fast :: proc(format: ^Pixel_Format, r, g, b: u8) -> u32 {
 	return ((u32(r >> format.Rloss) << format.Rshift) & format.Rmask) |
 	       ((u32(g >> format.Gloss) << format.Gshift) & format.Gmask) |
 	       ((u32(b >> format.Bloss) << format.Bshift) & format.Bmask) |
 	       format.Amask
 }
 
-unpack_rgb_fast :: proc(pixel: u32, format: ^PixelFormat) -> Rgb {
+unpack_rgb_fast :: proc(pixel: u32, format: ^Pixel_Format) -> Rgb {
 	return {
 		r = expand_channel((pixel & format.Rmask) >> format.Rshift, format.Rloss),
 		g = expand_channel((pixel & format.Gmask) >> format.Gshift, format.Gloss),
@@ -33,7 +33,7 @@ unpack_rgb_fast :: proc(pixel: u32, format: ^PixelFormat) -> Rgb {
 	}
 }
 
-add_pixel_rgb :: proc(row_pixels: [^]Pixel32, x: i32, format: ^PixelFormat, add_r, add_g, add_b: f32) {
+add_pixel_rgb :: proc(row_pixels: [^]Pixel32, x: i32, format: ^Pixel_Format, add_r, add_g, add_b: f32) {
 	xi := int(x)
 	d := unpack_rgb_fast(row_pixels[xi], format)
 	r := i32(d.r) + i32(add_r)
@@ -48,6 +48,7 @@ add_pixel_rgb :: proc(row_pixels: [^]Pixel32, x: i32, format: ^PixelFormat, add_
 }
 
 // Simple 5x7 font for digits 0-9. Each row's low 5 bits are pixels.
+@(rodata)
 font_5x7 := [10][7]u8{
 	{0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // 0
 	{0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E}, // 1
@@ -97,7 +98,7 @@ glyph_for :: proc(ch: u8) -> [7]u8 {
 	}
 }
 
-draw_digit :: proc(pixels: [^]u8, pitch, x, y, digit: i32, color: u32, format: ^PixelFormat) {
+draw_digit :: proc(pixels: [^]u8, pitch, x, y, digit: i32, color: u32, format: ^Pixel_Format) {
 	if digit < 0 || digit > 9 do return
 	bpp := format.BytesPerPixel
 	for row in 0 ..< 7 {
@@ -114,7 +115,7 @@ draw_digit :: proc(pixels: [^]u8, pitch, x, y, digit: i32, color: u32, format: ^
 	}
 }
 
-draw_text :: proc(pixels: [^]u8, pitch, x, y: i32, text: string, r, g, b: u8, format: ^PixelFormat) {
+draw_text :: proc(pixels: [^]u8, pitch, x, y: i32, text: string, r, g, b: u8, format: ^Pixel_Format) {
 	color := pack_rgb_fast(format, r, g, b)
 	bpp := format.BytesPerPixel
 	pos: i32 = 0
@@ -136,7 +137,7 @@ draw_text :: proc(pixels: [^]u8, pitch, x, y: i32, text: string, r, g, b: u8, fo
 	}
 }
 
-draw_number :: proc(pixels: [^]u8, pitch, x, y, number: i32, r, g, b: u8, format: ^PixelFormat) {
+draw_number :: proc(pixels: [^]u8, pitch, x, y, number: i32, r, g, b: u8, format: ^Pixel_Format) {
 	color := pack_rgb_fast(format, r, g, b)
 	buf: [32]u8
 	s := fmt.bprint(buf[:], number)

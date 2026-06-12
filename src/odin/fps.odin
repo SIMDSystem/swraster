@@ -3,19 +3,19 @@
 package main
 
 Fps_Counter :: struct {
-	frame_count:   Uint64,
-	last_fps_time: Uint64,
+	frame_count:   u64,
+	last_fps_time: u64,
 	fps:           i32,
 }
 
-fps_counter_start :: proc(self: ^Fps_Counter, now_ms: Uint64) {
+fps_counter_start :: proc(self: ^Fps_Counter, now_ms: u64) {
 	self.frame_count = 0
 	self.last_fps_time = now_ms
 	self.fps = 0
 }
 
 // Returns true if the displayed FPS value rolled over this call.
-fps_counter_tick :: proc(self: ^Fps_Counter, now_ms: Uint64) -> bool {
+fps_counter_tick :: proc(self: ^Fps_Counter, now_ms: u64) -> bool {
 	self.frame_count += 1
 	if now_ms - self.last_fps_time >= 1000 {
 		self.fps = i32(self.frame_count)

@@ -78,18 +78,15 @@ physics_flush_armed_sync :: proc(pp: ^Physics_Pipeline) {
 	armed: bool
 	{
 		mutex_lock(&pp.mtx)
+		defer mutex_unlock(&pp.mtx)
 		armed = pp.job_armed && !pp.job_pending && !pp.job_active
-		if !armed {
-			mutex_unlock(&pp.mtx)
-			return
-		}
+		if !armed do return
 		pp.job_armed = false
 		pp.job_active = true
 		delta_time = pp.job_delta
 		target_time = pp.job_target_time
 		sequence = pp.job_sequence
 		snapshot_idx = 1 - sync.atomic_load_explicit(&pp.published_snapshot, .Acquire)
-		mutex_unlock(&pp.mtx)
 	}
 
 	work_start_ts := perf_counter()
@@ -107,9 +104,9 @@ physics_flush_armed_sync :: proc(pp: ^Physics_Pipeline) {
 	sync.atomic_store_explicit(&pp.published_snapshot, snapshot_idx, .Release)
 	sync.atomic_store_explicit(&pp.published_sequence, u32(sequence), .Release)
 	mutex_lock(&pp.mtx)
+	defer mutex_unlock(&pp.mtx)
 	pp.job_active = false
 	condition_broadcast(&pp.idle_cv)
-	mutex_unlock(&pp.mtx)
 }
 
 physics_step_to_snapshot :: proc(
@@ -198,20 +195,17 @@ physics_worker_thread_impl :: proc(pp: ^Physics_Pipeline) {
 		snapshot_idx: i32
 		{
 			mutex_lock(&pp.mtx)
+			defer mutex_unlock(&pp.mtx)
 			for pp.thread_running && !pp.job_pending {
 				condition_wait(&pp.cv, &pp.mtx)
 			}
-			if !pp.thread_running && !pp.job_pending {
-				mutex_unlock(&pp.mtx)
-				break
-			}
+			if !pp.thread_running && !pp.job_pending do break
 			pp.job_pending = false
 			pp.job_active = true
 			delta_time = pp.job_delta
 			target_time = pp.job_target_time
 			sequence = pp.job_sequence
 			snapshot_idx = 1 - sync.atomic_load_explicit(&pp.published_snapshot, .Acquire)
-			mutex_unlock(&pp.mtx)
 		}
 
 		work_start_ts := perf_counter()
@@ -230,9 +224,9 @@ physics_worker_thread_impl :: proc(pp: ^Physics_Pipeline) {
 		sync.atomic_store_explicit(&pp.published_sequence, u32(sequence), .Release)
 		{
 			mutex_lock(&pp.mtx)
+			defer mutex_unlock(&pp.mtx)
 			pp.job_active = false
 			condition_broadcast(&pp.idle_cv)
-			mutex_unlock(&pp.mtx)
 		}
 	}
 }

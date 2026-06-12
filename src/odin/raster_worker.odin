@@ -2,11 +2,11 @@
 
 package main
 
-import "core:mem"
 import "core:sync"
 
 RPC :: i32(RASTER_PASS_COUNT)
 
+@(rodata)
 shadow_box_edges := [12][2]int{
 	{0, 1}, {1, 2}, {2, 3}, {3, 0}, {4, 5}, {5, 6}, {6, 7}, {7, 4},
 	{0, 4}, {1, 5}, {2, 6}, {3, 7},
@@ -25,11 +25,11 @@ raster_advance_pass_to :: proc(next: i32) {
 	wake_main := false
 	{
 		mutex_lock(&mtx_pool)
+		defer mutex_unlock(&mtx_pool)
 		if sync.atomic_load_explicit(&raster_pass, .Relaxed) < next {
 			sync.atomic_store_explicit(&raster_pass, next, .Release)
 			wake_main = next >= RPC
 		}
-		mutex_unlock(&mtx_pool)
 	}
 	condition_broadcast(&cv_pool)
 	if wake_main {
@@ -39,9 +39,10 @@ raster_advance_pass_to :: proc(next: i32) {
 	}
 }
 
-raster_cs_tile_rect :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32, x_min, x_max, y_min, y_max: ^i32) {
-	tile_span(frame.rs.screen_width, frame.X, tile_col, x_min, x_max)
-	tile_span(frame.rs.screen_height, frame.R, strip_idx, y_min, y_max)
+raster_cs_tile_rect :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32) -> (x_min, x_max, y_min, y_max: i32) {
+	x_min, x_max = tile_span(frame.rs.screen_width, frame.X, tile_col)
+	y_min, y_max = tile_span(frame.rs.screen_height, frame.R, strip_idx)
+	return
 }
 
 raster_draw_color_tri :: proc(frame: ^Raster_Frame, tri: ^Render_Triangle, depth_write: bool, x_min, x_max, y_min, y_max: i32) {
@@ -58,8 +59,7 @@ raster_draw_color_tri :: proc(frame: ^Raster_Frame, tri: ^Render_Triangle, depth
 raster_do_color_tile :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32) {
 	t0 := perf_counter()
 	c0 := thread_cpu_ns()
-	x_min, x_max, y_min, y_max: i32
-	raster_cs_tile_rect(frame, tile_col, strip_idx, &x_min, &x_max, &y_min, &y_max)
+	x_min, x_max, y_min, y_max := raster_cs_tile_rect(frame, tile_col, strip_idx)
 	rs := frame.rs
 	tile_idx := tile_col * NUM_STRIPS + strip_idx
 
@@ -136,8 +136,7 @@ raster_do_color_tile :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32) {
 raster_do_ssao_tile :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32) {
 	t0 := perf_counter()
 	c0 := thread_cpu_ns()
-	x_min, x_max, y_min, y_max: i32
-	raster_cs_tile_rect(frame, tile_col, strip_idx, &x_min, &x_max, &y_min, &y_max)
+	x_min, x_max, y_min, y_max := raster_cs_tile_rect(frame, tile_col, strip_idx)
 	rs := frame.rs
 	if ENABLE_SSAO {
 		apply_ssao_strip(rs.pixels, rs.pitch, rs.linear_z, rs.normal_buffer, rs.screen_width, rs.screen_height, rs.format, x_min, x_max, y_min, y_max, rs.frame_index, rs.projection.m[0][0], rs.projection.m[1][1])
@@ -149,10 +148,9 @@ raster_do_ssao_tile :: proc(frame: ^Raster_Frame, tile_col, strip_idx: i32) {
 raster_do_lum_tile :: proc(frame: ^Raster_Frame, tile_col, fstrip: i32) {
 	t0 := perf_counter()
 	c0 := thread_cpu_ns()
-	x_min, x_max, y_min, y_max: i32
 	rs := frame.rs
-	tile_span(rs.screen_width, frame.X, tile_col, &x_min, &x_max)
-	tile_span(rs.screen_height, frame.R * 2, fstrip, &y_min, &y_max)
+	x_min, x_max := tile_span(rs.screen_width, frame.X, tile_col)
+	y_min, y_max := tile_span(rs.screen_height, frame.R * 2, fstrip)
 	if rs.use_spotlight && rs.cone_buf_read != nil && rs.cone_buf_read.valid {
 		draw_spotlight_cone_strip(rs.pixels, rs.pitch, rs.depth_buffer, rs.screen_width, rs.screen_height, rs.format, rs.cone_buf_read, rs.light_pos, rs.spot_dir, rs.spot_outer_cos, x_min, x_max, y_min, y_max)
 	}
@@ -240,10 +238,10 @@ raster_ssao_drain :: proc(frame: ^Raster_Frame) {
 
 raster_draw_shadow_tri :: proc(frame: ^Raster_Frame, tri: ^Render_Triangle, x_min, x_max, y_min, y_max: i32) {
 	rs := frame.rs
-	sv0, sv1, sv2: Shadow_Vertex
-	if shadow_vertex_from_varying(&tri.v0, &sv0) &&
-	   shadow_vertex_from_varying(&tri.v1, &sv1) &&
-	   shadow_vertex_from_varying(&tri.v2, &sv2) {
+	sv0, ok0 := shadow_vertex_from_varying(&tri.v0)
+	sv1, ok1 := shadow_vertex_from_varying(&tri.v1)
+	sv2, ok2 := shadow_vertex_from_varying(&tri.v2)
+	if ok0 && ok1 && ok2 {
 		draw_shadow_triangle_strip(rs.shadow_depth_write, rs.shadow_size, &sv0, &sv1, &sv2, x_min, x_max, y_min, y_max, tri.shadow_screendoor_mask)
 	}
 }
@@ -254,9 +252,8 @@ raster_do_shadow_tile :: proc(frame: ^Raster_Frame, tile_col, strip_idx, cols_to
 	tile_start_ts := perf_counter()
 	tile_start_cpu_ns := thread_cpu_ns()
 
-	x_min, x_max, y_min, y_max: i32
-	tile_span(rs.shadow_size, cols_total, tile_col, &x_min, &x_max)
-	tile_span(rs.shadow_size, strips_total, strip_idx, &y_min, &y_max)
+	x_min, x_max := tile_span(rs.shadow_size, cols_total, tile_col)
+	y_min, y_max := tile_span(rs.shadow_size, strips_total, strip_idx)
 
 	sd := rs.shadow_depth_write
 	ss := rs.shadow_size
@@ -328,21 +325,25 @@ raster_worker_frame :: proc(worker_id: i32, ctx: ^Renderer_Context, shadow_only:
 
 		if job_mode == .Ssao {
 			raster_ssao_drain(&frame)
-			mutex_lock(&mtx_pool)
-			for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
-				condition_wait(&cv_pool, &mtx_pool)
+			{
+				mutex_lock(&mtx_pool)
+				defer mutex_unlock(&mtx_pool)
+				for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
+					condition_wait(&cv_pool, &mtx_pool)
+				}
 			}
-			mutex_unlock(&mtx_pool)
 			continue
 		}
 
 		if job_mode == .Luminaire {
 			raster_lum_drain(&frame)
-			mutex_lock(&mtx_pool)
-			for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
-				condition_wait(&cv_pool, &mtx_pool)
+			{
+				mutex_lock(&mtx_pool)
+				defer mutex_unlock(&mtx_pool)
+				for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
+					condition_wait(&cv_pool, &mtx_pool)
+				}
 			}
-			mutex_unlock(&mtx_pool)
 			continue
 		}
 
@@ -390,10 +391,12 @@ raster_worker_frame :: proc(worker_id: i32, ctx: ^Renderer_Context, shadow_only:
 		if job_mode == .Color && !hard_barrier do raster_ssao_drain(&frame)
 		if shadow_only do return
 
-		mutex_lock(&mtx_pool)
-		for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
-			condition_wait(&cv_pool, &mtx_pool)
+		{
+			mutex_lock(&mtx_pool)
+			defer mutex_unlock(&mtx_pool)
+			for !(sync.atomic_load_explicit(&raster_pass, .Acquire) > P || !sync.atomic_load_explicit(&pool_threads_running, .Relaxed)) {
+				condition_wait(&cv_pool, &mtx_pool)
+			}
 		}
-		mutex_unlock(&mtx_pool)
 	}
 }

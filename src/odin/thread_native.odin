@@ -1,7 +1,6 @@
 #+build darwin, linux, windows
 package main
 
-import "core:c"
 import "core:mem"
 import "core:thread"
 

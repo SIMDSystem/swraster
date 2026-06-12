@@ -73,15 +73,12 @@ NUM_TILE_BINS: i32 = 0
 
 // Divides [0, extent) into `splits` contiguous tiles. Tile `idx` covers pixels
 // [lo, hi] inclusive.
-tile_span :: proc(extent, splits, idx: i32, lo, hi: ^i32) {
-	lo^ = (idx * extent) / splits
-	hi^ = ((idx + 1) * extent) / splits - 1
-	if lo^ < 0 do lo^ = 0
-	if hi^ >= extent do hi^ = extent - 1
-}
-
-tile_column_range :: proc(width, col: i32, x_min, x_max: ^i32) {
-	tile_span(width, TILE_X_SPLITS, col, x_min, x_max)
+tile_span :: proc(extent, splits, idx: i32) -> (lo, hi: i32) {
+	lo = (idx * extent) / splits
+	hi = ((idx + 1) * extent) / splits - 1
+	if lo < 0 do lo = 0
+	if hi >= extent do hi = extent - 1
+	return
 }
 
 tile_column_for_x :: proc(width, x: i32) -> i32 {

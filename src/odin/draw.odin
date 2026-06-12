@@ -5,7 +5,6 @@ package main
 
 import "base:intrinsics"
 import "core:math"
-import "core:mem"
 import "core:simd"
 import "core:sync"
 
@@ -73,12 +72,6 @@ fast_ceil :: #force_inline proc(x: f32) -> f32 {
 	return simd.extract(simd.ceil(simd.f32x4(x)), 0)
 }
 
-// Round-half-up. Differs from @round (half-away-from-zero) only at negative
-// ties, which the rasterizer bounds-rejects anyway.
-fast_round :: #force_inline proc(x: f32) -> f32 {
-	return fast_floor(x + 0.5)
-}
-
 Triangle_Shader :: enum {
 	Lit,
 	Debug_Unlit_Red,
@@ -86,7 +79,7 @@ Triangle_Shader :: enum {
 }
 
 // Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf comparison.
-g_quad_path_enabled: b32
+quad_path_enabled: b32
 
 Raster_Triangle_Setup :: struct {
 	valid:                       bool,
@@ -171,35 +164,34 @@ draw_pixel :: proc(pixels: [^]u8, pitch, x, y: i32, color: u32, w, h: i32) {
 	row[x] = color
 }
 
-clip_line_to_rect :: #force_inline proc(x0, y0, x1, y1, xmin, ymin, xmax, ymax: f32, t_a, t_b: ^f32) -> bool {
+clip_line_to_rect :: #force_inline proc(x0, y0, x1, y1, xmin, ymin, xmax, ymax: f32) -> (t_a, t_b: f32, ok: bool) {
 	dx := x1 - x0; dy := y1 - y0
 	t0: f32 = 0.0; t1: f32 = 1.0
 	p := [4]f32{-dx, dx, -dy, dy}
 	q := [4]f32{x0 - xmin, xmax - x0, y0 - ymin, ymax - y0}
 	for i in 0 ..< 4 {
 		if p[i] == 0.0 {
-			if q[i] < 0.0 do return false
+			if q[i] < 0.0 do return 0, 0, false
 		} else {
 			r := q[i] / p[i]
 			if p[i] < 0.0 {
-				if r > t1 do return false
+				if r > t1 do return 0, 0, false
 				if r > t0 do t0 = r
 			} else {
-				if r < t0 do return false
+				if r < t0 do return 0, 0, false
 				if r < t1 do t1 = r
 			}
 		}
 	}
-	t_a^ = t0; t_b^ = t1
-	return true
+	return t0, t1, true
 }
 
 draw_line_depth :: proc(pixels: [^]u8, pitch: i32, depth_buffer: [^]f32, x0_in, y0_in: i32, z0_in: f32, x1_in, y1_in: i32, z1_in: f32, color: u32, w, h: i32) {
 	x0, y0, z0 := x0_in, y0_in, z0_in
 	x1, y1, z1 := x1_in, y1_in, z1_in
 	{
-		t_a, t_b: f32
-		if !clip_line_to_rect(f32(x0), f32(y0), f32(x1), f32(y1), 0.0, 0.0, f32(w - 1), f32(h - 1), &t_a, &t_b) do return
+		t_a, t_b, ok := clip_line_to_rect(f32(x0), f32(y0), f32(x1), f32(y1), 0.0, 0.0, f32(w - 1), f32(h - 1))
+		if !ok do return
 		dx_f := f32(x1 - x0); dy_f := f32(y1 - y0); dz_f := z1 - z0
 		ox0, oy0 := f32(x0_in), f32(y0_in)
 		x0 = i32(ox0 + t_a * dx_f + 0.5); y0 = i32(oy0 + t_a * dy_f + 0.5); z0 = z0_in + t_a * dz_f
@@ -239,8 +231,8 @@ draw_lit_shadowed_line_depth :: proc(
 	p0_eye, p1_eye := p0_eye_in, p1_eye_in
 	inv_w0, inv_w1 := inv_w0_in, inv_w1_in
 	{
-		t_a, t_b: f32
-		if !clip_line_to_rect(f32(x0), f32(y0), f32(x1), f32(y1), 0.0, 0.0, f32(w - 1), f32(h - 1), &t_a, &t_b) do return
+		t_a, t_b, ok := clip_line_to_rect(f32(x0), f32(y0), f32(x1), f32(y1), 0.0, 0.0, f32(w - 1), f32(h - 1))
+		if !ok do return
 		if t_a > 0.0 || t_b < 1.0 {
 			dx_f := f32(x1 - x0); dy_f := f32(y1 - y0); dz_f := z1 - z0
 			p0w := vec3_scale(p0_eye, inv_w0); p1w := vec3_scale(p1_eye, inv_w1)
@@ -300,12 +292,12 @@ draw_lit_shadowed_line_depth :: proc(
 }
 
 draw_spotlight_luminaire :: proc(pixels: [^]u8, pitch: i32, depth_buffer: [^]f32, screen_width, screen_height: i32, format: ^Pixel_Format, projection: ^Mat4, light_pos: Vec3) {
-	lx, ly, lz: f32
-	if !project_eye_point(projection, light_pos, screen_width, screen_height, &lx, &ly, &lz) do return
+	lx, ly, lz, light_ok := project_eye_point(projection, light_pos, screen_width, screen_height)
+	if !light_ok do return
 
 	glare_radius_3d: f32 = 0.42
-	ex, ey, ez: f32
-	if !project_eye_point(projection, vec3_add(light_pos, Vec3{glare_radius_3d, 0, 0}), screen_width, screen_height, &ex, &ey, &ez) do return
+	ex, _, _, edge_ok := project_eye_point(projection, vec3_add(light_pos, Vec3{glare_radius_3d, 0, 0}), screen_width, screen_height)
+	if !edge_ok do return
 	disk_radius := abs(ex - lx)
 	if disk_radius < 1.0 do disk_radius = 1.0
 
@@ -594,7 +586,7 @@ draw_triangle_barycentric_strip :: proc(
 	lane_idx := simd.f32x4{0, 1, 2, 3}
 	vzero := simd.f32x4(0)
 	vone := simd.f32x4(1)
-	quad_enabled := sync.atomic_load_explicit(&g_quad_path_enabled, .Relaxed)
+	quad_enabled := sync.atomic_load_explicit(&quad_path_enabled, .Relaxed)
 
 	for y in y_min ..= y_max {
 		w0, w1, w2 := w0_row, w1_row, w2_row
@@ -768,10 +760,12 @@ build_luminaire_cone_tl :: proc(out: ^Luminaire_Cone_Buffer, projection: ^Mat4, 
 		n1 := vec3_normalized(vec3_sub(vec3_scale(radial1, cone_len), vec3_scale(axis, radius)))
 		apex_n := vec3_normalized(vec3_add(n0, n1))
 
-		apex, p0, p1: Vertex_Varyings
-		if !luminaire_make_vertex(projection, light_pos, apex_n, screen_width, screen_height, &apex) do continue
-		if !luminaire_make_vertex(projection, vec3_add(base_center, vec3_scale(radial0, radius)), n0, screen_width, screen_height, &p0) do continue
-		if !luminaire_make_vertex(projection, vec3_add(base_center, vec3_scale(radial1, radius)), n1, screen_width, screen_height, &p1) do continue
+		apex, apex_ok := luminaire_make_vertex(projection, light_pos, apex_n, screen_width, screen_height)
+		if !apex_ok do continue
+		p0, p0_ok := luminaire_make_vertex(projection, vec3_add(base_center, vec3_scale(radial0, radius)), n0, screen_width, screen_height)
+		if !p0_ok do continue
+		p1, p1_ok := luminaire_make_vertex(projection, vec3_add(base_center, vec3_scale(radial1, radius)), n1, screen_width, screen_height)
+		if !p1_ok do continue
 		tri.v0 = apex; tri.v1 = p0; tri.v2 = p1
 		emitted += 1
 	}
@@ -779,14 +773,15 @@ build_luminaire_cone_tl :: proc(out: ^Luminaire_Cone_Buffer, projection: ^Mat4, 
 }
 
 @(private="file")
-luminaire_make_vertex :: proc(proj: ^Mat4, p, n: Vec3, sw, sh: i32, vv: ^Vertex_Varyings) -> bool {
-	if !project_eye_point_w(proj, p, sw, sh, &vv.x, &vv.y, &vv.z, &vv.inv_w) do return false
+luminaire_make_vertex :: proc(proj: ^Mat4, p, n: Vec3, sw, sh: i32) -> (vv: Vertex_Varyings, ok: bool) {
+	vv.x, vv.y, vv.z, vv.inv_w, ok = project_eye_point_w(proj, p, sw, sh)
+	if !ok do return
 	vv.r = 1.0; vv.g = 1.0; vv.b = 1.0; vv.a = 1.0
 	vv.u = 0.0; vv.v = 0.0
 	vv.nx = n.x; vv.ny = n.y; vv.nz = n.z
 	vv.ex = p.x; vv.ey = p.y; vv.ez = p.z
 	vv.ss = 0.0; vv.st = 0.0; vv.sr = 0.0; vv.sq = 1.0
-	return true
+	return vv, true
 }
 
 draw_spotlight_cone_strip :: proc(

@@ -4,37 +4,36 @@ package main
 
 import "core:math"
 import "core:sync"
-tl_screen_tile_range :: proc(x0, x1, x2, y0, y1, y2: f32, width, height: i32, first_col, last_col, first_strip, last_strip: ^i32) -> bool {
+tl_screen_tile_range :: proc(x0, x1, x2, y0, y1, y2: f32, width, height: i32) -> (first_col, last_col, first_strip, last_strip: i32, ok: bool) {
 	x_min := i32(fast_floor(min(x0, min(x1, x2))))
 	x_max := i32(fast_ceil(max(x0, max(x1, x2))))
 	y_min := i32(fast_floor(min(y0, min(y1, y2))))
 	y_max := i32(fast_ceil(max(y0, max(y1, y2))))
-	if x_max < 0 || x_min >= width || y_max < 0 || y_min >= height do return false
+	if x_max < 0 || x_min >= width || y_max < 0 || y_min >= height do return
 	if x_min < 0 do x_min = 0
 	if x_max >= width do x_max = width - 1
 	if y_min < 0 do y_min = 0
 	if y_max >= height do y_max = height - 1
-	first_col^ = tile_column_for_x(width, x_min)
-	last_col^ = tile_column_for_x(width, x_max)
-	first_strip^ = (y_min * NUM_STRIPS) / height
-	last_strip^ = (y_max * NUM_STRIPS) / height
-	if first_strip^ < 0 do first_strip^ = 0
-	if last_strip^ >= NUM_STRIPS do last_strip^ = NUM_STRIPS - 1
-	return first_col^ <= last_col^ && first_strip^ <= last_strip^
+	first_col = tile_column_for_x(width, x_min)
+	last_col = tile_column_for_x(width, x_max)
+	first_strip = (y_min * NUM_STRIPS) / height
+	last_strip = (y_max * NUM_STRIPS) / height
+	if first_strip < 0 do first_strip = 0
+	if last_strip >= NUM_STRIPS do last_strip = NUM_STRIPS - 1
+	ok = first_col <= last_col && first_strip <= last_strip
+	return
 }
 
-tl_rgb_tile_range :: proc(tl_shared: ^TL_Shared_Data, tri: ^Render_Triangle, fc, lc, fs, ls: ^i32) -> bool {
-	return tl_screen_tile_range(tri.v0.x, tri.v1.x, tri.v2.x, tri.v0.y, tri.v1.y, tri.v2.y, tl_shared.screen_width, tl_shared.screen_height, fc, lc, fs, ls)
+tl_rgb_tile_range :: proc(tl_shared: ^TL_Shared_Data, tri: ^Render_Triangle) -> (first_col, last_col, first_strip, last_strip: i32, ok: bool) {
+	return tl_screen_tile_range(tri.v0.x, tri.v1.x, tri.v2.x, tri.v0.y, tri.v1.y, tri.v2.y, tl_shared.screen_width, tl_shared.screen_height)
 }
 
-tl_shadow_tile_range :: proc(tri: ^Render_Triangle, fc, lc, fs, ls: ^i32) -> bool {
-	sv0, sv1, sv2: Shadow_Vertex
-	if !shadow_vertex_from_varying(&tri.v0, &sv0) ||
-	   !shadow_vertex_from_varying(&tri.v1, &sv1) ||
-	   !shadow_vertex_from_varying(&tri.v2, &sv2) {
-		return false
-	}
-	return tl_screen_tile_range(sv0.x, sv1.x, sv2.x, sv0.y, sv1.y, sv2.y, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, fc, lc, fs, ls)
+tl_shadow_tile_range :: proc(tri: ^Render_Triangle) -> (first_col, last_col, first_strip, last_strip: i32, ok: bool) {
+	sv0, ok0 := shadow_vertex_from_varying(&tri.v0)
+	sv1, ok1 := shadow_vertex_from_varying(&tri.v1)
+	sv2, ok2 := shadow_vertex_from_varying(&tri.v2)
+	if !ok0 || !ok1 || !ok2 do return
+	return tl_screen_tile_range(sv0.x, sv1.x, sv2.x, sv0.y, sv1.y, sv2.y, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE)
 }
 
 tl_compute_vertex_color :: proc(v: ^Vertex3D, tl_shared: ^TL_Shared_Data, base_color: Vec3) -> Vec3 {
@@ -66,7 +65,7 @@ tl_compute_vertex_color :: proc(v: ^Vertex3D, tl_shared: ^TL_Shared_Data, base_c
 
 tl_add_triangle :: proc(
 	tl_shared: ^TL_Shared_Data, output: ^TL_Thread_Output,
-	v0, v1, v2: Vertex_Varyings, inst_texture: ^Packed_Texture, inst_type: i32,
+	v0, v1, v2: Vertex_Varyings, inst_texture: ^Packed_Texture, inst_type: Instance_Type,
 	ground_sort_bias: f32, debug_unlit_red, shadow_backface: bool,
 ) {
 	tri := Render_Triangle{}
@@ -80,12 +79,11 @@ tl_add_triangle :: proc(
 	tri.rgb_setup = build_raster_triangle_setup(&v0l, &v1l, &v2l, tl_shared.screen_width, tl_shared.screen_height)
 	if !tri.rgb_setup.valid do return
 
-	first_col, last_col, first_strip, last_strip: i32
-	use_strip_bins := tl_rgb_tile_range(tl_shared, &tri, &first_col, &last_col, &first_strip, &last_strip) &&
-		((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4
+	first_col, last_col, first_strip, last_strip, in_range := tl_rgb_tile_range(tl_shared, &tri)
+	use_strip_bins := in_range && ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4
 
 	NS := NUM_STRIPS
-	if inst_type == 2 {
+	if inst_type == .Torus {
 		if use_strip_bins {
 			for cc in first_col ..= last_col {
 				for s in first_strip ..= last_strip {
@@ -119,18 +117,17 @@ tl_emit_shadow_triangle :: proc(tl_shared: ^TL_Shared_Data, output: ^TL_Thread_O
 	shadow_tri.v2.ss = sh2.x; shadow_tri.v2.st = sh2.y; shadow_tri.v2.sr = sh2.z; shadow_tri.v2.sq = sh2.w
 	shadow_tri.shadow_backface = true
 	shadow_tri.shadow_screendoor_mask = inst_shadow_screendoor_mask
-	sv0, sv1, sv2: Shadow_Vertex
-	if shadow_vertex_from_varying(&shadow_tri.v0, &sv0) &&
-	   shadow_vertex_from_varying(&shadow_tri.v1, &sv1) &&
-	   shadow_vertex_from_varying(&shadow_tri.v2, &sv2) {
+	sv0, ok0 := shadow_vertex_from_varying(&shadow_tri.v0)
+	sv1, ok1 := shadow_vertex_from_varying(&shadow_tri.v1)
+	sv2, ok2 := shadow_vertex_from_varying(&shadow_tri.v2)
+	if ok0 && ok1 && ok2 {
 		shadow_tri.sort_z = (sv0.z + sv1.z + sv2.z) * (1.0 / 3.0)
 	} else {
 		shadow_tri.sort_z = 1.0
 	}
-	first_col, last_col, first_strip, last_strip: i32
+	first_col, last_col, first_strip, last_strip, in_range := tl_shadow_tile_range(&shadow_tri)
 	NS := NUM_STRIPS
-	if tl_shadow_tile_range(&shadow_tri, &first_col, &last_col, &first_strip, &last_strip) &&
-	   ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4 {
+	if in_range && ((last_col - first_col + 1) * (last_strip - first_strip + 1)) <= 4 {
 		for cc in first_col ..= last_col {
 			for s in first_strip ..= last_strip {
 				append_render_triangle(&output.shadow_bins[cc * NS + s], shadow_tri)
@@ -150,7 +147,7 @@ tl_outside_spot_cone :: proc(p, L2, D2: Vec3, co2_2: f32) -> bool {
 }
 
 @(private="file")
-tl_emit_clipped :: proc(tls: ^TL_Shared_Data, out: ^TL_Thread_Output, a, b, c: Clip_Vertex, tex2: ^Packed_Texture, itype: i32, gbias: f32, dred, sbf: bool) {
+tl_emit_clipped :: proc(tls: ^TL_Shared_Data, out: ^TL_Thread_Output, a, b, c: Clip_Vertex, tex2: ^Packed_Texture, itype: Instance_Type, gbias: f32, dred, sbf: bool) {
 	al, bl, cl := a, b, c
 	if is_back_face_clip_vertices(&al, &bl, &cl) do return
 	p0 := project_clip_vertex(&al, &tls.projection, &tls.shadow_matrix, tls.screen_width, tls.screen_height)
@@ -169,7 +166,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 	clear_render_triangle_list(&output.opaque_list)
 	clear_render_triangle_list(&output.trans)
 	clear_render_triangle_list(&output.shadow)
-	for s := 0; s < int(NUM_TILE_BINS); s += 1 {
+	for s in 0 ..< int(NUM_TILE_BINS) {
 		clear_render_triangle_list(&output.opaque_bins[s])
 		clear_render_triangle_list(&output.trans_bins[s])
 		clear_render_triangle_list(&output.shadow_bins[s])
@@ -194,14 +191,13 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 		src_faces: ^Face_List
 		src_bound_radius: f32
 		switch inst.type {
-		case 0: src_vertices = ctx.cube_vertices; src_faces = ctx.cube_faces; src_bound_radius = ctx.cube_bound_radius
-		case 1: src_vertices = ctx.sphere_vertices; src_faces = ctx.sphere_faces; src_bound_radius = ctx.sphere_bound_radius
-		case 2: src_vertices = ctx.torus_vertices; src_faces = ctx.torus_faces; src_bound_radius = ctx.torus_bound_radius
-		case 3: src_vertices = ctx.teapot_vertices; src_faces = ctx.teapot_faces; src_bound_radius = ctx.teapot_bound_radius
-		case 4: src_vertices = ctx.smallball_vertices; src_faces = ctx.smallball_faces; src_bound_radius = ctx.smallball_bound_radius
-		case 5: src_vertices = ctx.ground_vertices; src_faces = ctx.ground_faces; src_bound_radius = ctx.ground_bound_radius
-		case 6: src_vertices = ctx.lamp_vertices; src_faces = ctx.lamp_faces; src_bound_radius = ctx.lamp_bound_radius
-		case: src_vertices = ctx.ground_vertices; src_faces = ctx.ground_faces; src_bound_radius = ctx.ground_bound_radius
+		case .Cube:      src_vertices = ctx.cube_vertices; src_faces = ctx.cube_faces; src_bound_radius = ctx.cube_bound_radius
+		case .Sphere:    src_vertices = ctx.sphere_vertices; src_faces = ctx.sphere_faces; src_bound_radius = ctx.sphere_bound_radius
+		case .Torus:     src_vertices = ctx.torus_vertices; src_faces = ctx.torus_faces; src_bound_radius = ctx.torus_bound_radius
+		case .Teapot:    src_vertices = ctx.teapot_vertices; src_faces = ctx.teapot_faces; src_bound_radius = ctx.teapot_bound_radius
+		case .Smallball: src_vertices = ctx.smallball_vertices; src_faces = ctx.smallball_faces; src_bound_radius = ctx.smallball_bound_radius
+		case .Ground:    src_vertices = ctx.ground_vertices; src_faces = ctx.ground_faces; src_bound_radius = ctx.ground_bound_radius
+		case .Lamp:      src_vertices = ctx.lamp_vertices; src_faces = ctx.lamp_faces; src_bound_radius = ctx.lamp_bound_radius
 		}
 
 		pose := pose_snapshot.poses[instance_idx]
@@ -216,7 +212,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 			sphere_intersects_spotlight_frustum_eye(center_eye3, src_bound_radius, tl_shared.light_pos, tl_shared.spot_dir, tl_shared.spot_outer_cos, tl_shared.shadow_near, tl_shared.shadow_far)
 
 		small_ball_camera_occluded := false
-		if inst.type == 4 && tl_shared.occluders_eye != nil && (camera_visible || shadow_visible) {
+		if inst.type == .Smallball && tl_shared.occluders_eye != nil && (camera_visible || shadow_visible) {
 			cam_occ := !camera_visible
 			shd_occ := !shadow_visible
 			for occ in tl_shared.occluders_eye {
@@ -268,7 +264,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 			v1_eye := &eye_space_vertices[face.v1]
 			v2_eye := &eye_space_vertices[face.v2]
 			base_color: Vec3
-			if inst.texture == nil && inst.type != 6 {
+			if inst.texture == nil && inst.type != .Lamp {
 				base_color = Vec3{inst.color_r, inst.color_g, inst.color_b}
 			} else {
 				base_color = Vec3{face.r, face.g, face.b}
@@ -294,7 +290,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 			shadow_backface := vec3_dot(face_normal, shadow_light_vec) < 0.0
 
 			cone_culled := false
-			if tl_shared.use_spotlight && shadow_visible && shadow_backface && inst.type != 5 {
+			if tl_shared.use_spotlight && shadow_visible && shadow_backface && inst.type != .Ground {
 				Lp := tl_shared.light_pos
 				D := tl_shared.spot_dir
 				co := tl_shared.spot_outer_cos
@@ -322,8 +318,8 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 			}
 
 			if !camera_visible do continue
-			debug_unlit_red := DEBUG_DRAW_CAMERA_OCCLUDED_RED && inst.type == 4 && small_ball_camera_occluded
-			ground_sort_bias: f32 = inst.type == 5 ? 1.0e6 : 0.0
+			debug_unlit_red := DEBUG_DRAW_CAMERA_OCCLUDED_RED && inst.type == .Smallball && small_ball_camera_occluded
+			ground_sort_bias: f32 = inst.type == .Ground ? 1.0e6 : 0.0
 
 			if !needs_near_clip {
 				if is_back_face(v0_eye, v1_eye, v2_eye) do continue
@@ -374,14 +370,14 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 	if ENABLE_RGB_TRIANGLE_SORT {
 		sort_by_key_render_triangles(&output.opaque_list, true, ks, gather)
 		sort_by_key_render_triangles(&output.trans, false, ks, gather)
-		for s := 0; s < int(NUM_TILE_BINS); s += 1 {
+		for s in 0 ..< int(NUM_TILE_BINS) {
 			sort_by_key_render_triangles(&output.opaque_bins[s], true, ks, gather)
 			sort_by_key_render_triangles(&output.trans_bins[s], false, ks, gather)
 		}
 	}
 	if ENABLE_SHADOW_TRIANGLE_SORT {
 		sort_by_key_render_triangles(&output.shadow, true, ks, gather)
-		for s := 0; s < int(NUM_TILE_BINS); s += 1 {
+		for s in 0 ..< int(NUM_TILE_BINS) {
 			sort_by_key_render_triangles(&output.shadow_bins[s], true, ks, gather)
 		}
 	}
@@ -416,7 +412,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 
 	nb := NUM_TILE_BINS
 	scatter_start := active_tl_threads > 0 ? (worker_id * nb) / active_tl_threads : 0
-	for j := 0; j < int(nb); j += 1 {
+	for j in 0 ..< int(nb) {
 		s := scatter_start + i32(j)
 		if s >= nb do s -= nb
 		// Slice the bins in place — never copy a [dynamic]T by value (Odin frees it at scope end).

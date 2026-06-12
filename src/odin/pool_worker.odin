@@ -13,17 +13,14 @@ pool_worker_main :: proc(worker_id: i32, ctx: ^Renderer_Context) {
 		plan: Frame_Pool_Plan
 		{
 			mutex_lock(&mtx_pool)
+			defer mutex_unlock(&mtx_pool)
 			for !( !sync.atomic_load_explicit(&pool_threads_running, .Relaxed) ||
 				sync.atomic_load_explicit(&frame_pool_target, .Acquire) > last_frame_processed ) {
 				condition_wait(&cv_pool, &mtx_pool)
 			}
-			if !sync.atomic_load_explicit(&pool_threads_running, .Relaxed) {
-				mutex_unlock(&mtx_pool)
-				break
-			}
+			if !sync.atomic_load_explicit(&pool_threads_running, .Relaxed) do break
 			last_frame_processed = sync.atomic_load_explicit(&frame_pool_target, .Acquire)
 			plan = active_frame_plan
-			mutex_unlock(&mtx_pool)
 		}
 
 		// Peel-off: launched capacity exceeds this frame's active pool.

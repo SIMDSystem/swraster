@@ -9,13 +9,15 @@ Shadow_Vertex :: struct {
 	x, y, z: f32,
 }
 
-shadow_vertex_from_varying :: #force_inline proc(v: ^Vertex_Varyings, out: ^Shadow_Vertex) -> bool {
-	if v.sq == 0.0 do return false
+shadow_vertex_from_varying :: #force_inline proc(v: ^Vertex_Varyings) -> (sv: Shadow_Vertex, ok: bool) {
+	if v.sq == 0.0 do return
 	inv_q := 1.0 / v.sq
-	out.x = v.ss * inv_q * f32(SHADOW_MAP_SIZE - 1)
-	out.y = v.st * inv_q * f32(SHADOW_MAP_SIZE - 1)
-	out.z = v.sr * inv_q
-	return true
+	sv = {
+		x = v.ss * inv_q * f32(SHADOW_MAP_SIZE - 1),
+		y = v.st * inv_q * f32(SHADOW_MAP_SIZE - 1),
+		z = v.sr * inv_q,
+	}
+	return sv, true
 }
 
 @(private="file")
@@ -215,8 +217,8 @@ draw_shadow_line_strip :: proc(shadow_depth: []Shadow_Depth, shadow_size: i32, v
 	clip_xmax := f32(min(x_tile_max, shadow_size - 1))
 	clip_ymax := f32(min(y_strip_max, shadow_size - 1))
 	if clip_xmin > clip_xmax || clip_ymin > clip_ymax do return
-	t_a, t_b: f32
-	if !clip_line_to_rect(v0.x, v0.y, v1.x, v1.y, clip_xmin, clip_ymin, clip_xmax, clip_ymax, &t_a, &t_b) do return
+	t_a, t_b, ok := clip_line_to_rect(v0.x, v0.y, v1.x, v1.y, clip_xmin, clip_ymin, clip_xmax, clip_ymax)
+	if !ok do return
 	dx_f := v1.x - v0.x; dy_f := v1.y - v0.y; dz_f := v1.z - v0.z
 	x0 := i32(v0.x + t_a * dx_f + 0.5); y0 := i32(v0.y + t_a * dy_f + 0.5)
 	z0 := v0.z + t_a * dz_f

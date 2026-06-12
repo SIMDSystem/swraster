@@ -3,14 +3,25 @@
 package main
 
 import "core:math"
-import "core:math/rand"
+
+// Mesh/material kind for a scene instance. enum i32 keeps the field layout
+// byte-identical to the C++ `int type` (and the other three ports).
+Instance_Type :: enum i32 {
+	Cube      = 0,
+	Sphere    = 1,
+	Torus     = 2,
+	Teapot    = 3,
+	Smallball = 4,
+	Ground    = 5,
+	Lamp      = 6,
+}
 
 Cube_Instance :: struct {
 	tx, ty, tz:             f32,
 	rot_speed_x, rot_speed_y, rot_speed_z: f32,
 	qx, qy, qz, qw:         f32,
 	texture:                ^Packed_Texture,
-	type:                   i32,
+	type:                   Instance_Type,
 	color_r, color_g, color_b: f32,
 	shadow_screendoor_mask: i32,
 	body_id:                Body_ID,
@@ -193,28 +204,24 @@ populate_scene_instances :: proc(
 
 	create_main_object :: proc(
 		bi2: ^Body_Interface,
-		ty: i32,
+		ty: Instance_Type,
 		px, py, pz: f32,
 		shape: ^Shape,
 		t: ^Packed_Texture,
 		mask_counter: ^i32,
 		insts: ^[dynamic]Cube_Instance,
 	) {
-		inst: Cube_Instance
-		inst.tx = px
-		inst.ty = py
-		inst.tz = pz
-		inst.qw = 1.0
-		inst.texture = t
-		inst.type = ty
-		inst.color_r = 1.0
-		inst.color_g = 1.0
-		inst.color_b = 1.0
-		if ty == 2 {
+		inst := Cube_Instance{
+			tx = px, ty = py, tz = pz,
+			qw = 1.0,
+			texture = t,
+			type = ty,
+			color_r = 1.0, color_g = 1.0, color_b = 1.0,
+			shadow_screendoor_mask = -1,
+		}
+		if ty == .Torus {
 			inst.shadow_screendoor_mask = mask_counter^ & 7
 			mask_counter^ += 1
-		} else {
-			inst.shadow_screendoor_mask = -1
 		}
 
 		rx := rand_unit() * 2.0 * math.PI
@@ -231,36 +238,37 @@ populate_scene_instances :: proc(
 		px := rand_unit() * 10.0 - 5.0
 		py := rand_unit() * 10.0 - 5.0
 		pz := rand_unit() * 10.0 - 5.0
-		create_main_object(bi, 0, px, py, pz, jph_box_shape_create(1.0, 1.0, 1.0), tex_main_cube, &transparent_shadow_mask_counter, instances)
+		create_main_object(bi, .Cube, px, py, pz, jph_box_shape_create(1.0, 1.0, 1.0), tex_main_cube, &transparent_shadow_mask_counter, instances)
 	}
 	for _ in 0 ..< 10 {
 		px := rand_unit() * 10.0 - 5.0
 		py := rand_unit() * 10.0 - 5.0
 		pz := rand_unit() * 10.0 - 5.0
-		create_main_object(bi, 1, px, py, pz, jph_sphere_shape_create(1.3), tex_main_sphere, &transparent_shadow_mask_counter, instances)
+		create_main_object(bi, .Sphere, px, py, pz, jph_sphere_shape_create(1.3), tex_main_sphere, &transparent_shadow_mask_counter, instances)
 	}
 	for _ in 0 ..< 10 {
 		px := rand_unit() * 10.0 - 5.0
 		py := rand_unit() * 10.0 - 5.0
 		pz := rand_unit() * 10.0 - 5.0
-		create_main_object(bi, 2, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances)
+		create_main_object(bi, .Torus, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances)
 	}
 	for _ in 0 ..< 10 {
 		px := rand_unit() * 10.0 - 5.0
 		py := rand_unit() * 10.0 - 5.0
 		pz := rand_unit() * 10.0 - 5.0
-		create_main_object(bi, 3, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances)
+		create_main_object(bi, .Teapot, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances)
 	}
 
 	for _ in 0 ..< 400 {
-		inst: Cube_Instance
-		inst.tx = rand_unit() * 10.0 - 5.0
-		inst.ty = rand_unit() * 10.0 - 5.0
-		inst.tz = rand_unit() * 10.0 - 5.0
-		inst.qw = 1.0
-		inst.texture = nil
-		inst.type = 4
-		inst.shadow_screendoor_mask = -1
+		inst := Cube_Instance{
+			tx = rand_unit() * 10.0 - 5.0,
+			ty = rand_unit() * 10.0 - 5.0,
+			tz = rand_unit() * 10.0 - 5.0,
+			qw = 1.0,
+			texture = nil,
+			type = .Smallball,
+			shadow_screendoor_mask = -1,
+		}
 		inst.color_r = 0.3 + rand_unit() * 0.7
 		inst.color_g = 0.3 + rand_unit() * 0.7
 		inst.color_b = 0.3 + rand_unit() * 0.7
@@ -276,16 +284,15 @@ populate_scene_instances :: proc(
 		append(instances, inst)
 	}
 
-	ground := Cube_Instance{}
-	ground.ty = ground_y
-	ground.qw = 1.0
-	ground.texture = tex_ground
-	ground.type = 5
-	ground.color_r = 0.68
-	ground.color_g = 0.68
-	ground.color_b = 0.68
-	ground.shadow_screendoor_mask = -1
-	ground.body_id = BODY_ID_NONE
+	ground := Cube_Instance{
+		ty = ground_y,
+		qw = 1.0,
+		texture = tex_ground,
+		type = .Ground,
+		color_r = 0.68, color_g = 0.68, color_b = 0.68,
+		shadow_screendoor_mask = -1,
+		body_id = BODY_ID_NONE,
+	}
 	append(instances, ground)
 }
 

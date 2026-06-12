@@ -21,26 +21,22 @@ Clip_Vertex :: struct {
 	u, v: f32,
 }
 
-@(private="file")
-project_eye_point_impl :: proc(projection: ^Mat4, p: Vec3, screen_width, screen_height: i32, sx, sy, sz: ^f32, inv_w_out: ^f32 = nil) -> bool {
+project_eye_point_w :: #force_inline proc(projection: ^Mat4, p: Vec3, screen_width, screen_height: i32) -> (sx, sy, sz, inv_w: f32, ok: bool) {
 	clip := mat4_mul_vec4(projection, vec4_init(p.x, p.y, p.z, 1.0))
-	if clip.w <= 0.1 do return false
-	inv_w := 1.0 / clip.w
-	if inv_w_out != nil do inv_w_out^ = inv_w
+	if clip.w <= 0.1 do return
+	inv_w = 1.0 / clip.w
 	nx := clip.x * inv_w
 	ny := clip.y * inv_w
-	sz^ = clip.z * inv_w
-	sx^ = (nx + 1.0) * 0.5 * f32(screen_width)
-	sy^ = (1.0 - ny) * 0.5 * f32(screen_height)
-	return true
+	sz = clip.z * inv_w
+	sx = (nx + 1.0) * 0.5 * f32(screen_width)
+	sy = (1.0 - ny) * 0.5 * f32(screen_height)
+	ok = true
+	return
 }
 
-project_eye_point :: #force_inline proc(projection: ^Mat4, p: Vec3, screen_width, screen_height: i32, sx, sy, sz: ^f32) -> bool {
-	return project_eye_point_impl(projection, p, screen_width, screen_height, sx, sy, sz)
-}
-
-project_eye_point_w :: #force_inline proc(projection: ^Mat4, p: Vec3, screen_width, screen_height: i32, sx, sy, sz, inv_w_out: ^f32) -> bool {
-	return project_eye_point_impl(projection, p, screen_width, screen_height, sx, sy, sz, inv_w_out)
+project_eye_point :: #force_inline proc(projection: ^Mat4, p: Vec3, screen_width, screen_height: i32) -> (sx, sy, sz: f32, ok: bool) {
+	sx, sy, sz, _, ok = project_eye_point_w(projection, p, screen_width, screen_height)
+	return
 }
 
 build_projection_matrix :: proc(fov_degrees, aspect, near_plane, far_plane: f32) -> Mat4 {

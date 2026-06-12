@@ -5,7 +5,6 @@ package main
 import "core:c"
 import "core:fmt"
 import "core:math"
-import "core:mem"
 import "core:strings"
 import "core:sync"
 
@@ -89,7 +88,7 @@ physics_worker_thread_entry :: proc(p: rawptr) {
 
 main :: proc() {
 	init_thread_counts()
-	sync.atomic_store_explicit(&g_quad_path_enabled, true, .Relaxed)
+	sync.atomic_store_explicit(&quad_path_enabled, true, .Relaxed)
 	args := get_program_args()
 	defer delete_program_args(args)
 	thread_perf := make_thread_perf_search(args)
@@ -180,22 +179,24 @@ main :: proc() {
 	jph_physics_system_optimize_broadphase(physics_system)
 	lamp_instance_index: i32 = -1
 	if USE_SPOTLIGHT {
-		lamp := Cube_Instance{qw = 1.0, type = 6, color_r = 0.85, color_g = 0.85, color_b = 0.90, shadow_screendoor_mask = -1, body_id = BODY_ID_NONE}
+		lamp := Cube_Instance{qw = 1.0, type = .Lamp, color_r = 0.85, color_g = 0.85, color_b = 0.90, shadow_screendoor_mask = -1, body_id = BODY_ID_NONE}
 		lamp_instance_index = i32(len(instances))
 		append(&instances, lamp)
 	}
 
 	initial_instance_states := capture_initial_instance_states(&instances, body_interface)
-	physics := Physics_Pipeline{thread_running = true}
+	physics := Physics_Pipeline{
+		thread_running = true,
+		system         = physics_system,
+		body_interface = body_interface,
+		temp_allocator = temp_allocator,
+		job_system     = job_system,
+		instances      = &instances,
+		walls          = &walls,
+	}
 	mutex_init(&physics.mtx)
 	condition_init(&physics.cv)
 	condition_init(&physics.idle_cv)
-	physics.system = physics_system
-	physics.body_interface = body_interface
-	physics.temp_allocator = temp_allocator
-	physics.job_system = job_system
-	physics.instances = &instances
-	physics.walls = &walls
 	instance_count := len(instances)
 	for &snapshot in &physics.pose_snapshots {
 		snapshot.poses = make([dynamic]Instance_Pose)
@@ -227,7 +228,7 @@ main :: proc() {
 		opaque_strip_buffers[b].bins = make([]Render_Triangle_List, nb)
 		trans_strip_buffers[b].bins = make([]Render_Triangle_List, nb)
 		shadow_strip_buffers[b].bins = make([]Render_Triangle_List, nb)
-		for s := 0; s < int(nb); s += 1 {
+		for s in 0 ..< int(nb) {
 			opaque_strip_buffers[b].bins[s] = make([dynamic]Render_Triangle)
 			trans_strip_buffers[b].bins[s] = make([dynamic]Render_Triangle)
 			shadow_strip_buffers[b].bins[s] = make([dynamic]Render_Triangle)
@@ -275,7 +276,7 @@ main :: proc() {
 		ensure_render_triangle_capacity(&out.merge_scratch, TL_WORKER_MERGE_SCRATCH_CAP)
 		ensure_render_triangle_capacity(&out.sort_gather, TL_WORKER_SORT_KEYS_CAP)
 		ensure_key_index_capacity(&out.sort_keys, TL_WORKER_SORT_KEYS_CAP)
-		for s := 0; s < int(nb); s += 1 {
+		for s in 0 ..< int(nb) {
 			out.opaque_bins[s] = make([dynamic]Render_Triangle)
 			out.trans_bins[s] = make([dynamic]Render_Triangle)
 			out.shadow_bins[s] = make([dynamic]Render_Triangle)
@@ -302,44 +303,63 @@ main :: proc() {
 
 	fps_counter: Fps_Counter
 
-	ctx := Renderer_Context{}
-	ctx.fb = fb
-	ctx.screen_width = screen_width
-	ctx.screen_height = screen_height
-	ctx.cube_vertices = &cube_vertices; ctx.cube_faces = &cube_faces
-	ctx.sphere_vertices = &sphere_vertices; ctx.sphere_faces = &sphere_faces
-	ctx.torus_vertices = &torus_vertices; ctx.torus_faces = &torus_faces
-	ctx.teapot_vertices = &teapot_vertices; ctx.teapot_faces = &teapot_faces
-	ctx.smallball_vertices = &smallball_vertices; ctx.smallball_faces = &smallball_faces
-	ctx.ground_vertices = &ground_vertices; ctx.ground_faces = &ground_faces
-	ctx.lamp_vertices = &lamp_vertices; ctx.lamp_faces = &lamp_faces
-	ctx.cube_bound_radius = cube_bound_radius
-	ctx.sphere_bound_radius = sphere_bound_radius
-	ctx.torus_bound_radius = torus_bound_radius
-	ctx.teapot_bound_radius = teapot_bound_radius
-	ctx.smallball_bound_radius = smallball_bound_radius
-	ctx.ground_bound_radius = ground_bound_radius
-	ctx.lamp_bound_radius = lamp_bound_radius
-	ctx.lamp_instance_index = lamp_instance_index
-	ctx.instances = &instances
-	ctx.initial_instance_states = &initial_instance_states
-	ctx.walls = &walls
-	ctx.box_half = box_half; ctx.wall_thick = wall_thick
-	ctx.ground_y = ground_y; ctx.ground_half = ground_half
-	ctx.opaque_buffers = &opaque_buffers; ctx.trans_buffers = &trans_buffers; ctx.shadow_buffers = &shadow_buffers
-	ctx.opaque_strip_buffers = &opaque_strip_buffers; ctx.trans_strip_buffers = &trans_strip_buffers; ctx.shadow_strip_buffers = &shadow_strip_buffers
-	ctx.cone_buffers = &cone_buffers
-	ctx.shadow_box_buffers = &shadow_box_buffers
-	ctx.light_dir_buffers = &light_dir_buffers; ctx.light_pos_buffers = &light_pos_buffers; ctx.spot_dir_buffers = &spot_dir_buffers
-	ctx.view_matrix_buffers = &view_matrix_buffers; ctx.projection_buffers = &projection_buffers; ctx.shadow_matrix_buffers = &shadow_matrix_buffers
-	ctx.time_buffers = &time_buffers
-	ctx.shadow_depth_buffers = &shadow_depth_buffers
-	ctx.depth_buffer = &depth_buffer; ctx.normal_buffer = &normal_buffer; ctx.linear_z_buffer = &linear_z_buffer
-	ctx.tl_shared = &tl_shared; ctx.tl_thread_outputs = &tl_thread_outputs
-	ctx.launched_tl_threads = launched_tl_threads; ctx.raster_shared = &raster_shared
-	ctx.launched_raster_threads = launched_raster_threads
-	ctx.instance_depths = &instance_depths; ctx.occluders_eye = &occluders_eye
-	ctx.physics = &physics; ctx.thread_perf = &thread_perf; ctx.fps_counter = &fps_counter; ctx.profiler = &profiler
+	ctx := Renderer_Context{
+		fb                      = fb,
+		screen_width            = screen_width,
+		screen_height           = screen_height,
+		cube_vertices           = &cube_vertices,      cube_faces      = &cube_faces,
+		sphere_vertices         = &sphere_vertices,    sphere_faces    = &sphere_faces,
+		torus_vertices          = &torus_vertices,     torus_faces     = &torus_faces,
+		teapot_vertices         = &teapot_vertices,    teapot_faces    = &teapot_faces,
+		smallball_vertices      = &smallball_vertices, smallball_faces = &smallball_faces,
+		ground_vertices         = &ground_vertices,    ground_faces    = &ground_faces,
+		lamp_vertices           = &lamp_vertices,      lamp_faces      = &lamp_faces,
+		cube_bound_radius       = cube_bound_radius,
+		sphere_bound_radius     = sphere_bound_radius,
+		torus_bound_radius      = torus_bound_radius,
+		teapot_bound_radius     = teapot_bound_radius,
+		smallball_bound_radius  = smallball_bound_radius,
+		ground_bound_radius     = ground_bound_radius,
+		lamp_bound_radius       = lamp_bound_radius,
+		lamp_instance_index     = lamp_instance_index,
+		instances               = &instances,
+		initial_instance_states = &initial_instance_states,
+		walls                   = &walls,
+		box_half                = box_half,
+		wall_thick              = wall_thick,
+		ground_y                = ground_y,
+		ground_half             = ground_half,
+		opaque_buffers          = &opaque_buffers,
+		trans_buffers           = &trans_buffers,
+		shadow_buffers          = &shadow_buffers,
+		opaque_strip_buffers    = &opaque_strip_buffers,
+		trans_strip_buffers     = &trans_strip_buffers,
+		shadow_strip_buffers    = &shadow_strip_buffers,
+		cone_buffers            = &cone_buffers,
+		shadow_box_buffers      = &shadow_box_buffers,
+		light_dir_buffers       = &light_dir_buffers,
+		light_pos_buffers       = &light_pos_buffers,
+		spot_dir_buffers        = &spot_dir_buffers,
+		view_matrix_buffers     = &view_matrix_buffers,
+		projection_buffers      = &projection_buffers,
+		shadow_matrix_buffers   = &shadow_matrix_buffers,
+		time_buffers            = &time_buffers,
+		shadow_depth_buffers    = &shadow_depth_buffers,
+		depth_buffer            = &depth_buffer,
+		normal_buffer           = &normal_buffer,
+		linear_z_buffer         = &linear_z_buffer,
+		tl_shared               = &tl_shared,
+		tl_thread_outputs       = &tl_thread_outputs,
+		launched_tl_threads     = launched_tl_threads,
+		raster_shared           = &raster_shared,
+		launched_raster_threads = launched_raster_threads,
+		instance_depths         = &instance_depths,
+		occluders_eye           = &occluders_eye,
+		physics                 = &physics,
+		thread_perf             = &thread_perf,
+		fps_counter             = &fps_counter,
+		profiler                = &profiler,
+	}
 
 	thread_profiler_init(&profiler, launched_tl_threads, launched_raster_threads)
 	init_global_merge_scratch()

@@ -2,7 +2,7 @@
 //
 // Mirrors platform.h + platform.cpp. The public API dispatches at compile time to
 // the macOS Cocoa backend (platform_mac.odin) or the emscripten web backend
-// (below). The shared helpers — the BMP loader, FreeSurface, and the per-thread
+// (below). The shared helpers — the BMP loader, free_surface, and the per-thread
 // CPU clock — are defined once here, exactly as in platform.cpp.
 
 package main
@@ -12,13 +12,10 @@ import "core:mem"
 import "core:sync"
 import "core:sys/posix"
 import "core:time"
-import "base:runtime"
 
-Uint8  :: u8
-Uint32 :: u32
-Uint64 :: u64
-
-PixelFormat :: struct #align (4) {
+// SDL-style field names kept deliberately: the struct mirrors SDL_PixelFormat
+// byte-for-byte across all four ports (the Zig port keeps them too).
+Pixel_Format :: struct #align (4) {
 	BytesPerPixel: c.int,
 	Rloss:         u8,
 	Gloss:         u8,
@@ -32,14 +29,12 @@ PixelFormat :: struct #align (4) {
 	Amask:         u32,
 }
 
-Pixel_Format :: PixelFormat
-
 Surface :: struct #align (8) {
 	w:           c.int,
 	h:           c.int,
 	pitch:       c.int,
 	pixels:      rawptr,
-	format:      ^PixelFormat,
+	format:      ^Pixel_Format,
 	owns_pixels: bool,
 }
 
@@ -67,7 +62,7 @@ Event :: struct {
 // ===========================================================================
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
-ThreadCpuNs :: proc() -> Uint64 {
+thread_cpu_ns :: proc() -> u64 {
 	when IS_WEB_TARGET {
 		// Per-thread CPU clock through emscripten's libc, exactly like the Zig
 		// build. (web_perf_counter() here was wrong twice over: wall time, and
@@ -75,34 +70,37 @@ ThreadCpuNs :: proc() -> Uint64 {
 		// so busy bars drew 1000x too short and the overlay showed gaps.)
 		ts: timespec
 		if clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0 do return 0
-		return Uint64(ts.tv_sec) * 1_000_000_000 + Uint64(ts.tv_nsec)
+		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
 	} else {
 		ts: posix.timespec
 		if posix.clock_gettime(.THREAD_CPUTIME_ID, &ts) != .OK do return 0
-		return Uint64(ts.tv_sec) * 1_000_000_000 + Uint64(ts.tv_nsec)
+		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
 	}
 }
-
-thread_cpu_ns :: proc() -> Uint64 { return ThreadCpuNs() }
 
 // ===========================================================================
 //  Shared: portable BMP loader (24/32 bpp uncompressed -> RGBA8)
 // ===========================================================================
-g_bmp_rgba_format: PixelFormat
-g_bmp_format_inited: bool
+@(private="file")
+bmp_rgba_format: Pixel_Format
 
+@(private="file")
+bmp_format_inited: bool
+
+@(private="file")
 ensure_bmp_format :: proc() {
-	if g_bmp_format_inited do return
-	g_bmp_rgba_format = {}
-	g_bmp_rgba_format.BytesPerPixel = 4
-	g_bmp_rgba_format.Rshift = 0
-	g_bmp_rgba_format.Gshift = 8
-	g_bmp_rgba_format.Bshift = 16
-	g_bmp_rgba_format.Rmask = 0x000000ff
-	g_bmp_rgba_format.Gmask = 0x0000ff00
-	g_bmp_rgba_format.Bmask = 0x00ff0000
-	g_bmp_rgba_format.Amask = 0xff000000
-	g_bmp_format_inited = true
+	if bmp_format_inited do return
+	bmp_rgba_format = {
+		BytesPerPixel = 4,
+		Rshift = 0,
+		Gshift = 8,
+		Bshift = 16,
+		Rmask = 0x000000ff,
+		Gmask = 0x0000ff00,
+		Bmask = 0x00ff0000,
+		Amask = 0xff000000,
+	}
+	bmp_format_inited = true
 }
 
 rd16 :: proc(p: [^]u8) -> u16 {
@@ -113,7 +111,7 @@ rd32 :: proc(p: [^]u8) -> u32 {
 	return u32(p[0]) | (u32(p[1]) << 8) | (u32(p[2]) << 16) | (u32(p[3]) << 24)
 }
 
-LoadBMP :: proc(path: cstring) -> ^Surface {
+load_bmp :: proc(path: cstring) -> ^Surface {
 	ensure_bmp_format()
 	file := swr_fopen(path, "rb")
 	if file == nil do return nil
@@ -164,12 +162,13 @@ LoadBMP :: proc(path: cstring) -> ^Surface {
 
 	surf := cast(^Surface)swr_malloc(size_of(Surface))
 	if surf == nil do return nil
-	surf^ = {}
-	surf.w = width
-	surf.h = height
-	surf.pitch = width * 4
-	surf.format = &g_bmp_rgba_format
-	surf.owns_pixels = true
+	surf^ = {
+		w           = width,
+		h           = height,
+		pitch       = width * 4,
+		format      = &bmp_rgba_format,
+		owns_pixels = true,
+	}
 	pix := swr_malloc(uint(px_len))
 	if pix == nil {
 		swr_free(rawptr(surf))
@@ -180,17 +179,13 @@ LoadBMP :: proc(path: cstring) -> ^Surface {
 	return surf
 }
 
-load_bmp :: proc(path: cstring) -> ^Surface { return LoadBMP(path) }
-
-FreeSurface :: proc(s: ^Surface) {
+free_surface :: proc(s: ^Surface) {
 	if s == nil do return
 	if s.owns_pixels && s.pixels != nil {
 		swr_free(s.pixels)
 	}
 	swr_free(rawptr(s))
 }
-
-free_surface :: proc(s: ^Surface) { FreeSurface(s) }
 
 // ===========================================================================
 //  Web backend (emscripten): in-memory framebuffer + <canvas> blit + JS input
@@ -204,98 +199,100 @@ when IS_WEB_TARGET {
 		usleep :: proc(usec: c.uint) -> c.int ---
 	}
 
-	g_visible: bool = true
-	g_fb_format: PixelFormat
-	g_fb: Surface
-	g_fb_pixels: []u32
-	g_fb_pixel_count: int
+	web_visible: bool = true
+	web_fb_format: Pixel_Format
+	web_fb: Surface
+	web_fb_pixels: []u32
+	web_fb_pixel_count: int
 
-	QUEUE_LEN :: 256
-	g_event_mtx: sync.Mutex
-	g_queue: [QUEUE_LEN]Event
-	g_q_head: int
-	g_q_tail: int
+	WEB_EVENT_QUEUE_LEN :: 256
+	web_event_mtx: sync.Mutex
+	web_event_queue: [WEB_EVENT_QUEUE_LEN]Event
+	web_event_head: int
+	web_event_tail: int
 
 	web_push_event :: proc(ev: Event) {
-		sync.mutex_lock(&g_event_mtx)
-		defer sync.mutex_unlock(&g_event_mtx)
-		next := (g_q_tail + 1) % QUEUE_LEN
-		if next == g_q_head do return // drop on overflow
-		g_queue[g_q_tail] = ev
-		g_q_tail = next
+		sync.mutex_lock(&web_event_mtx)
+		defer sync.mutex_unlock(&web_event_mtx)
+		next := (web_event_tail + 1) % WEB_EVENT_QUEUE_LEN
+		if next == web_event_head do return // drop on overflow
+		web_event_queue[web_event_tail] = ev
+		web_event_tail = next
 	}
 
 	web_init :: proc(w, h: c.int, title: cstring) -> bool {
 		_ = title
-		g_fb_format = {}
-		g_fb_format.BytesPerPixel = 4
-		g_fb_format.Rshift = 0
-		g_fb_format.Gshift = 8
-		g_fb_format.Bshift = 16
-		g_fb_format.Rmask = 0x000000ff
-		g_fb_format.Gmask = 0x0000ff00
-		g_fb_format.Bmask = 0x00ff0000
-		g_fb_format.Amask = 0xff000000
-		g_fb = {}
-		g_fb.w = w
-		g_fb.h = h
-		g_fb.pitch = w * 4
+		web_fb_format = {
+			BytesPerPixel = 4,
+			Rshift = 0,
+			Gshift = 8,
+			Bshift = 16,
+			Rmask = 0x000000ff,
+			Gmask = 0x0000ff00,
+			Bmask = 0x00ff0000,
+			Amask = 0xff000000,
+		}
+		web_fb = {
+			w     = w,
+			h     = h,
+			pitch = w * 4,
+		}
 		count := int(w) * int(h)
 		pixels := cast([^]u32)swr_malloc(uint(count * size_of(u32)))
 		if pixels == nil do return false
 		mem.set(rawptr(pixels), 0, count * size_of(u32))
-		g_fb_pixels = pixels[:count]
-		g_fb_pixel_count = count
-		g_fb.pixels = rawptr(pixels)
-		g_fb.format = &g_fb_format
+		web_fb_pixels = pixels[:count]
+		web_fb_pixel_count = count
+		web_fb.pixels = rawptr(pixels)
+		web_fb.format = &web_fb_format
 		swr_js_setup_canvas(w, h)
 		return true
 	}
 
 	web_shutdown :: proc() {
-		if g_fb_pixel_count > 0 {
-			swr_free(raw_data(g_fb_pixels))
-			g_fb_pixels = nil
-			g_fb_pixel_count = 0
+		if web_fb_pixel_count > 0 {
+			swr_free(raw_data(web_fb_pixels))
+			web_fb_pixels = nil
+			web_fb_pixel_count = 0
 		}
-		g_fb = {}
+		web_fb = {}
 	}
 
 	web_get_framebuffer :: proc() -> ^Surface {
-		return &g_fb
+		return &web_fb
 	}
 
 	web_present :: proc() {
-		swr_js_present(cast([^]u8)g_fb.pixels, g_fb.w, g_fb.h)
+		swr_js_present(cast([^]u8)web_fb.pixels, web_fb.w, web_fb.h)
 	}
 
 	web_is_renderable :: proc() -> bool {
-		return g_visible
+		return web_visible
 	}
 
 	web_poll_event :: proc(out: ^Event) -> bool {
 		out^ = {}
-		sync.mutex_lock(&g_event_mtx)
-		defer sync.mutex_unlock(&g_event_mtx)
-		if g_q_head == g_q_tail do return false
-		out^ = g_queue[g_q_head]
-		g_q_head = (g_q_head + 1) % QUEUE_LEN
+		sync.mutex_lock(&web_event_mtx)
+		defer sync.mutex_unlock(&web_event_mtx)
+		if web_event_head == web_event_tail do return false
+		out^ = web_event_queue[web_event_head]
+		web_event_head = (web_event_head + 1) % WEB_EVENT_QUEUE_LEN
 		return true
 	}
 
-	web_ticks_ms :: proc() -> Uint64 {
-		return Uint64(emscripten_get_now())
+	web_ticks_ms :: proc() -> u64 {
+		return u64(emscripten_get_now())
 	}
 
-	web_perf_counter :: proc() -> Uint64 {
-		return Uint64(emscripten_get_now() * 1000.0)
+	web_perf_counter :: proc() -> u64 {
+		return u64(emscripten_get_now() * 1000.0)
 	}
 
-	web_perf_frequency :: proc() -> Uint64 {
+	web_perf_frequency :: proc() -> u64 {
 		return 1_000_000
 	}
 
-	web_delay :: proc(ms: Uint32) {
+	web_delay :: proc(ms: u32) {
 		_ = usleep(c.uint(ms * 1000))
 	}
 
@@ -321,7 +318,7 @@ when IS_WEB_TARGET {
 
 	platform_push_visibility :: proc "c" (visible: c.int) {
 		context = swr_default_context()
-		g_visible = visible != 0
+		web_visible = visible != 0
 		web_push_event({type = .VisibilityChanged, visible = visible != 0})
 	}
 }
@@ -329,81 +326,69 @@ when IS_WEB_TARGET {
 // ===========================================================================
 //  Backend dispatch
 // ===========================================================================
-Init :: proc(w, h: i32, title: cstring) -> bool {
+platform_init :: proc(w, h: i32, title: cstring) -> bool {
 	when ODIN_OS == .Darwin {
-		return mac_Init(w, h, title)
+		return mac_init(w, h, title)
 	} else when IS_WEB_TARGET {
 		return web_init(c.int(w), c.int(h), title)
 	}
 	return false
 }
 
-platform_init :: proc(w, h: i32, title: cstring) -> bool { return Init(w, h, title) }
-
-Shutdown :: proc() {
+platform_shutdown :: proc() {
 	when ODIN_OS == .Darwin {
-		mac_Shutdown()
+		mac_shutdown()
 	} else when IS_WEB_TARGET {
 		web_shutdown()
 	}
 }
 
-platform_shutdown :: proc() { Shutdown() }
-
-GetFramebuffer :: proc() -> ^Surface {
+platform_get_framebuffer :: proc() -> ^Surface {
 	when ODIN_OS == .Darwin {
-		return mac_GetFramebuffer()
+		return mac_get_framebuffer()
 	} else when IS_WEB_TARGET {
 		return web_get_framebuffer()
 	}
 	return nil
 }
 
-platform_get_framebuffer :: proc() -> ^Surface { return GetFramebuffer() }
-
-Present :: proc() {
+platform_present :: proc() {
 	when ODIN_OS == .Darwin {
-		mac_Present()
+		mac_present()
 	} else when IS_WEB_TARGET {
 		web_present()
 	}
 }
 
-platform_present :: proc() { Present() }
-
-IsRenderable :: proc() -> bool {
+platform_is_renderable :: proc() -> bool {
 	when ODIN_OS == .Darwin {
-		return mac_IsRenderable()
+		return mac_is_renderable()
 	} else when IS_WEB_TARGET {
 		return web_is_renderable()
 	}
 	return true
 }
 
-platform_is_renderable :: proc() -> bool { return IsRenderable() }
-
-PollEvent :: proc(out: ^Event) -> bool {
+platform_poll_event :: proc(out: ^Event) -> bool {
 	when ODIN_OS == .Darwin {
-		return mac_PollEvent(out)
+		return mac_poll_event(out)
 	} else when IS_WEB_TARGET {
 		return web_poll_event(out)
 	}
 	return false
 }
 
-platform_poll_event :: proc(out: ^Event) -> bool { return PollEvent(out) }
-
 when !IS_WEB_TARGET {
-	fallback_mono_ns :: proc() -> Uint64 {
+	fallback_mono_ns :: proc() -> u64 {
 		ts: posix.timespec
 		if posix.clock_gettime(.MONOTONIC, &ts) != .OK do return 0
-		return Uint64(ts.tv_sec) * 1_000_000_000 + Uint64(ts.tv_nsec)
+		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
 	}
 }
 
-TicksMs :: proc() -> Uint64 {
+ticks_ms :: proc() -> u64 {
 	when ODIN_OS == .Darwin {
-		return mac_TicksMs()
+		return mac_ticks_ms()
 	} else when IS_WEB_TARGET {
 		return web_ticks_ms()
 	} else when !IS_WEB_TARGET {
@@ -412,9 +397,9 @@ TicksMs :: proc() -> Uint64 {
 	return 0
 }
 
-PerfCounter :: proc() -> Uint64 {
+perf_counter :: proc() -> u64 {
 	when ODIN_OS == .Darwin {
-		return mac_PerfCounter()
+		return mac_perf_counter()
 	} else when IS_WEB_TARGET {
 		return web_perf_counter()
 	} else when !IS_WEB_TARGET {
@@ -423,9 +408,9 @@ PerfCounter :: proc() -> Uint64 {
 	return 0
 }
 
-PerfFrequency :: proc() -> Uint64 {
+perf_frequency :: proc() -> u64 {
 	when ODIN_OS == .Darwin {
-		return mac_PerfFrequency()
+		return mac_perf_frequency()
 	} else when IS_WEB_TARGET {
 		return web_perf_frequency()
 	} else when !IS_WEB_TARGET {
@@ -434,18 +419,12 @@ PerfFrequency :: proc() -> Uint64 {
 	return 1_000_000_000
 }
 
-Delay :: proc(ms: Uint32) {
+platform_delay :: proc(ms: u32) {
 	when ODIN_OS == .Darwin {
-		mac_Delay(ms)
+		mac_delay(ms)
 	} else when IS_WEB_TARGET {
 		web_delay(ms)
 	} else when !IS_WEB_TARGET {
 		time.sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
-
-platform_delay :: proc(ms: Uint32) { Delay(ms) }
-
-perf_counter :: proc() -> Uint64 { return PerfCounter() }
-ticks_ms :: proc() -> Uint64 { return TicksMs() }
-perf_frequency :: proc() -> Uint64 { return PerfFrequency() }
