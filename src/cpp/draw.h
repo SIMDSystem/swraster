@@ -4,6 +4,8 @@
 // in draw.cpp; this header just exposes the entry points and the precomputed
 // per-triangle setup used by the rasterizer.
 
+#include <atomic>
+
 #include <Eigen/Dense>
 #include "render_config.h"
 #include "platform.h"
@@ -11,6 +13,10 @@
 #include "clip.h"
 
 struct LuminaireConeBuffer; // defined in render_buffers.h, used by pointer here
+
+// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
+// comparison against the 4-wide quad path.
+extern std::atomic<bool> g_quad_path_enabled;
 
 enum class TriangleShader {
     Lit,

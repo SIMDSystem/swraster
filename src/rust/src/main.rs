@@ -216,7 +216,6 @@ fn main() {
 mod web {
     use super::*;
     use std::collections::VecDeque;
-    use std::ffi::c_void;
     use std::sync::{Mutex, OnceLock};
 
     enum Event {
@@ -239,12 +238,6 @@ mod web {
     static EVENTS: OnceLock<Mutex<VecDeque<Event>>> = OnceLock::new();
 
     extern "C" {
-        fn emscripten_set_main_loop_arg(
-            func: extern "C" fn(*mut c_void),
-            arg: *mut c_void,
-            fps: i32,
-            simulate_infinite_loop: i32,
-        );
         fn swr_js_setup_canvas(w: i32, h: i32);
         fn swr_js_present(ptr: *const u32, w: i32, h: i32);
     }
@@ -282,8 +275,7 @@ mod web {
         push_event(Event::Visible(visible != 0));
     }
 
-    extern "C" fn frame(arg: *mut c_void) {
-        let app = unsafe { &mut *(arg as *mut WebApp) };
+    fn pump_events(app: &mut WebApp) {
         while let Some(ev) = events().lock().unwrap().pop_front() {
             match ev {
                 Event::Key(32) => app.state.toggle_pause(),
@@ -318,17 +310,6 @@ mod web {
                 _ => {}
             }
         }
-        if !app.visible {
-            return;
-        }
-        let now_ms = app.start.elapsed().as_millis() as u64;
-        app.state.frame(&mut app.framebuffer, INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
-        let blit_start = app.state.prof_now();
-        unsafe {
-            swr_js_present(app.framebuffer.as_ptr(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
-        }
-        let blit_end = app.state.prof_now();
-        app.state.prof_set_present(blit_start, blit_end);
     }
 
     pub fn main() -> i32 {
@@ -336,17 +317,42 @@ mod web {
         unsafe {
             swr_js_setup_canvas(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
         }
-        let app = Box::new(WebApp {
-            state: RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32),
-            framebuffer: vec![0; (INITIAL_WIDTH * INITIAL_HEIGHT) as usize],
-            start: Instant::now(),
-            last_physics_ms: 0,
-            visible: true,
-            mouse_down: false,
-        });
-        unsafe {
-            emscripten_set_main_loop_arg(frame, Box::into_raw(app).cast::<c_void>(), 0, 1);
-        }
+        // Run the render loop on a dedicated pthread, matching the other
+        // ports' PROXY_TO_PTHREAD shape. The old emscripten_set_main_loop
+        // driver ran every frame on the browser main thread under
+        // requestAnimationFrame: capped at display refresh and contending
+        // with DOM/compositor work. swr_js_present is __proxy:'sync', so the
+        // blit still executes on the main thread; this worker just blocks on
+        // it like the C++/Zig/Odin render threads do.
+        std::thread::Builder::new()
+            .name("render-loop".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let mut app = WebApp {
+                    state: RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32),
+                    framebuffer: vec![0; (INITIAL_WIDTH * INITIAL_HEIGHT) as usize],
+                    start: Instant::now(),
+                    last_physics_ms: 0,
+                    visible: true,
+                    mouse_down: false,
+                };
+                loop {
+                    pump_events(&mut app);
+                    if !app.visible {
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                        continue;
+                    }
+                    let now_ms = app.start.elapsed().as_millis() as u64;
+                    app.state.frame(&mut app.framebuffer, INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
+                    let blit_start = app.state.prof_now();
+                    unsafe {
+                        swr_js_present(app.framebuffer.as_ptr(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
+                    }
+                    let blit_end = app.state.prof_now();
+                    app.state.prof_set_present(blit_start, blit_end);
+                }
+            })
+            .expect("spawn render-loop thread");
         0
     }
 }

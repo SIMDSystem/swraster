@@ -7,13 +7,18 @@ EMCMAKE ?= emcmake
 SRC_DIR   = src/cpp
 ASSET_DIR = assets
 BUILD_DIR = build
-# Per-toolchain output folders so the C++, Zig, and web builds never clobber
+# Per-toolchain output folders so the C++, Zig, Odin, and web builds never clobber
 # each other inside build/. Each native toolchain mirrors the same shape:
 #   build/<tool>/bin/raster   — raw executable
 #   build/<tool>/Raster.app   — signed app bundle (icon, no console)
 CPP_BUILD_DIR = $(BUILD_DIR)/cpp
 ZIG_BUILD_DIR = $(BUILD_DIR)/zig
+ODIN_BUILD_DIR = $(BUILD_DIR)/odin
 JOLT_DIR  = third_party/JoltPhysics
+# Header-only SIMD (google/highway). No build step — just -I$(HIGHWAY_DIR).
+# Native: -march=native picks NEON / SSE / AVX. Web: -msimd128 picks wasm SIMD.
+HIGHWAY_DIR = third_party/highway
+HIGHWAY_HEADER = $(HIGHWAY_DIR)/hwy/highway.h
 
 JOLT_BUILD_DIR = $(JOLT_DIR)/Build/build_release
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
@@ -22,7 +27,7 @@ JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release \
 # NOTE: keep the JPH_* defines in sync with how $(JOLT_LIB) is built below
 # (plain Release, no USE_ASSERTS). Defining JPH_ENABLE_ASSERTS here without
 # building Jolt with asserts leaves JPH::AssertFailed undefined at link time.
-CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -Ithird_party/highway -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
+CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -march=native -mtune=native -flto=thin -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -I$(HIGHWAY_DIR) -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
 LDFLAGS = -flto=thin
 TARGET = $(CPP_BUILD_DIR)/bin/raster
 APP_NAME = $(CPP_BUILD_DIR)/Raster.app
@@ -63,13 +68,16 @@ WEB_MEMORY ?= 268435456
 # The Platform layer talks straight to the <canvas> + emscripten input/timing
 # APIs on the web target.
 WEB_WASM_FEATURES = -msimd128 -msse4.2 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
-WEB_CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O2 -g2 -fno-omit-frame-pointer -fstrict-aliasing \
+# -O3 + omitted frame pointers to match the Zig/Odin web objects (this var also
+# compiles their joltc glue). The link below carries -O3 too — that's the stage
+# where Binaryen's wasm-opt runs; without it emcc links at -O0 and skips it.
+WEB_CXXFLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -fomit-frame-pointer -fstrict-aliasing \
   $(WEB_WASM_FEATURES) \
-  -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -Ithird_party/highway \
+  -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -I$(HIGHWAY_DIR) \
   -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -DJPH_CROSS_PLATFORM_DETERMINISTIC -DJPH_ENABLE_ASSERTS \
   -DDEFAULT_TL_THREADS=$(WEB_TL_THREADS) -DDEFAULT_RASTER_THREADS=$(WEB_RASTER_THREADS) -DDEFAULT_JOLT_WORKER_THREADS=$(WEB_JOLT_WORKER_THREADS) \
   -pthread
-WEB_LDFLAGS = -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
+WEB_LDFLAGS = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
   -sPTHREAD_POOL_SIZE=$(WEB_PTHREAD_POOL_SIZE) \
   -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
   -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
@@ -151,6 +159,79 @@ ZIG_NATIVE_BC = $(ZIG_BUILD_DIR)/swraster_native.bc
 ZIG_NATIVE_OBJ = $(ZIG_BUILD_DIR)/swraster_native.o
 ZIG_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc
 
+# --- Odin native build ------------------------------------------------------
+# Odin 2026-06 (homebrew or tools/odin). Native link mirrors Zig: Odin emits an
+# optimized object, then clang++ links joltc + Jolt + Cocoa frameworks.
+ODIN ?= odin
+ODIN_SRC_DIR = src/odin
+# -no-bounds-check matches Zig's ReleaseFast (which disables all safety
+# checks); without it every slice index in the pixel loops pays a branch.
+ODIN_OPT ?= -o:speed -no-bounds-check
+ODIN_MICROARCH ?= -microarch:native
+ODIN_BIN = $(ODIN_BUILD_DIR)/bin/raster
+ODIN_APP = $(ODIN_BUILD_DIR)/Raster.app
+ODIN_SOURCES = $(wildcard $(ODIN_SRC_DIR)/*.odin)
+ODIN_JOLTC_DIR = $(ODIN_BUILD_DIR)/joltc
+ODIN_JOLTC_LIB = $(ODIN_JOLTC_DIR)/libjoltc.a
+ODIN_NATIVE_OBJ = $(ODIN_BUILD_DIR)/swraster_native.o
+ODIN_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc -lc++ -pthread
+# Web: freestanding_wasm32 LLVM IR -> emcc codegen -> link with shared Jolt WASM.
+ODIN_WEB_DIR = $(WEB_BUILD_DIR)/odin
+# NOTE: -build-mode:llvm-ir always writes <out basename>.ll into the CWD (the
+# -out directory part is ignored for this build mode), so the IR rule moves the
+# file into place after the compile.
+ODIN_WEB_BC = $(ODIN_WEB_DIR)/swraster_web.ll
+ODIN_WEB_OPT ?= -o:speed -no-bounds-check
+ODIN_WEB_OBJ = $(ODIN_WEB_DIR)/swraster_web.o
+ODIN_JOLTC_WEB_DIR = $(ODIN_BUILD_DIR)/joltc_web
+ODIN_JOLTC_WEB_OBJS = $(ODIN_JOLTC_WEB_DIR)/joltc.o $(ODIN_JOLTC_WEB_DIR)/physics_setup.o
+ODIN_WEB_TARGET = $(ODIN_WEB_DIR)/raster.html
+ODIN_WEB_FEATURES = -msimd128 -mnontrapping-fptoint -msign-ext -mbulk-memory -mmutable-globals -mmultivalue -mextended-const
+ODIN_WEB_LLVM_FEATURES = $(WEB_WASM_FEATURES)
+WEB_LDFLAGS_ODIN = -O3 -pthread -sUSE_PTHREADS=1 -sPROXY_TO_PTHREAD=1 \
+  -sPTHREAD_POOL_SIZE=32 \
+  -sINITIAL_MEMORY=$(WEB_MEMORY) -sALLOW_MEMORY_GROWTH=1 -sMAXIMUM_MEMORY=4294967296 \
+  -sSTACK_SIZE=2097152 -sDEFAULT_PTHREAD_STACK_SIZE=2097152 \
+  -sASSERTIONS=1 -sEXIT_RUNTIME=0 \
+  -sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAP32 \
+  -sEXPORTED_FUNCTIONS=_main,_swr_push_key,_swr_push_mouse_button,_swr_push_mouse_motion,_swr_push_wheel,_swr_push_visibility \
+  -g2
+
+# --- C++ native via LLVM 23 (experiment) -------------------------------------
+# Same sources compiled with emsdk's clang-23 instead of Apple clang 17, to
+# isolate compiler-backend vintage in the native ladder. Entirely parallel to
+# the default build: separate objects + bin/raster-llvm23; `make all`/`app`
+# still use Apple clang with the original CXXFLAGS. Full LLVM 23 pipeline:
+# clang-23 frontend, ThinLTO, and ld64.lld (Apple's ld64 cannot ingest
+# LLVM 23 LTO bitcode, so lld does the Mach-O link). -fno-stack-check: clang's
+# Darwin stack-probe attribute (emitted for dynamic allocas, e.g. Eigen
+# temporaries) is rejected by lld 23's Mach-O LTO backend ("Unsupported stack
+# probing method"); the probe is a hardening feature, safe to drop for this
+# experimental binary.
+CPP_LLVM23_OBJ_DIR = $(CPP_BUILD_DIR)/obj-llvm23
+CPP_LLVM23_BIN = $(CPP_BUILD_DIR)/bin/raster-llvm23
+CPP_LLVM23_FLAGS = -std=c++17 -Wall -Wextra -DNDEBUG -O3 -mcpu=apple-m4 \
+  -fomit-frame-pointer -fstrict-aliasing -funroll-loops -fvectorize -fslp-vectorize -finline-functions \
+  -target arm64-apple-macos -isysroot $(MACOS_SDK) \
+  -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -I$(HIGHWAY_DIR) \
+  -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM
+
+$(CPP_LLVM23_BIN): $(NATIVE_SOURCES) $(JOLT_LIB) Makefile
+	@[ -x $(LLVM23_CLANG) ] || { echo "Error: LLVM 23 clang not found at $(LLVM23_CLANG). Activate/install emsdk first."; exit 1; }
+	@mkdir -p $(CPP_LLVM23_OBJ_DIR) $(CPP_BUILD_DIR)/bin
+	@echo "Whole-program unity TU with clang-23 (-O3 -mcpu=apple-m4)..."
+	@for n in $(filter-out physics_pipeline.cpp,$(SRC_NAMES)); do echo "#include \"$$n\""; done > $(CPP_LLVM23_OBJ_DIR)/unity.cpp
+	$(LLVM23_CLANG)++ $(CPP_LLVM23_FLAGS) -I$(SRC_DIR) -c $(CPP_LLVM23_OBJ_DIR)/unity.cpp -o $(CPP_LLVM23_OBJ_DIR)/unity.o
+	$(LLVM23_CLANG)++ $(CPP_LLVM23_FLAGS) -c $(SRC_DIR)/physics_pipeline.cpp -o $(CPP_LLVM23_OBJ_DIR)/physics_pipeline_23.o
+	$(LLVM23_CLANG)++ $(CPP_LLVM23_FLAGS) -c $(SRC_DIR)/platform_mac.mm -o $(CPP_LLVM23_OBJ_DIR)/platform_mac_23.o
+	@echo "Linking with system ld64..."
+	$(CXX) -o $(CPP_LLVM23_BIN) $(CPP_LLVM23_OBJ_DIR)/unity.o $(CPP_LLVM23_OBJ_DIR)/physics_pipeline_23.o $(CPP_LLVM23_OBJ_DIR)/platform_mac_23.o $(JOLT_LIB) $(NATIVE_FRAMEWORKS)
+	@echo "Full LLVM 23 C++ native -> $(CPP_LLVM23_BIN)"
+
+cpp-llvm23: $(CPP_LLVM23_BIN)
+
+cpp-apple: $(TARGET)
+
 # --- Rust native build ------------------------------------------------------
 # The Rust port lives in src/rust and uses cargo (+ build.rs, which compiles the
 # joltc C wrapper and links the prebuilt $(JOLT_LIB)). Cargo's own output dir
@@ -174,7 +255,18 @@ RUST_WEB_TARGET = $(RUST_WEB_DIR)/raster.html
 RUST_WEB_RUSTFLAGS = -C target-cpu=generic -C target-feature=+atomics,+bulk-memory,+bulk-memory-opt,+mutable-globals,+simd128,+relaxed-simd,+sign-ext,+nontrapping-fptoint,+multivalue,+extended-const
 
 # Default target: build both executable and app bundle
-all: $(APP_NAME)
+all: deps $(APP_NAME)
+
+# Fetch third_party git submodules (JoltPhysics, Highway). Fresh clones:
+#   git clone --recurse-submodules <repo>
+# Existing clones:
+#   make deps
+.PHONY: deps
+deps: $(HIGHWAY_HEADER)
+
+$(HIGHWAY_HEADER):
+	@echo "Initializing third_party submodules..."
+	@git submodule update --init --depth 1 third_party/highway
 
 
 # iconutil requires the source folder to literally end in ".iconset", so we
@@ -205,7 +297,7 @@ $(JOLT_LIB):
 	@mkdir -p $(JOLT_BUILD_DIR)
 	@cd $(JOLT_BUILD_DIR) && cmake $(JOLT_CMAKE_FLAGS) .. && cmake --build . --target Jolt
 
-$(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB)
+$(TARGET): $(NATIVE_SOURCES) $(JOLT_LIB) $(HIGHWAY_HEADER)
 	@mkdir -p $(CPP_BUILD_DIR)/bin
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(NATIVE_SOURCES) $(JOLT_LIB) $(LDFLAGS) -pthread $(NATIVE_FRAMEWORKS)
 
@@ -217,7 +309,7 @@ $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
 	$(EMCMAKE) cmake -S $(JOLT_DIR)/Build -B $(JOLT_WEB_BUILD_DIR) $(WEB_JOLT_CMAKE_FLAGS)
 	cmake --build $(JOLT_WEB_BUILD_DIR) --target Jolt --parallel $(WEB_JOBS)
 
-$(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile
+$(WEB_TARGET): $(SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html Makefile $(HIGHWAY_HEADER)
 	@command -v $(EMCXX) >/dev/null 2>&1 || { echo "Error: Emscripten em++ not found. Activate/install emsdk first."; exit 1; }
 	@mkdir -p $(CPP_WEB_DIR)
 	$(EMCXX) $(WEB_CXXFLAGS) -o $(WEB_TARGET) $(SOURCES) $(JOLT_WEB_LIB) $(WEB_LDFLAGS) $(WEB_PRELOADS) --shell-file web_shell.html
@@ -273,6 +365,39 @@ web-cpp: $(WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 web-zig: $(ZIG_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 	@echo "Zig web build written to $(ZIG_WEB_DIR)/"
 
+# Odin wasm (two-step, mirrors Zig web). Step 1: Odin emits freestanding wasm32 IR
+# with atomics+simd128. Step 2: emcc lowers IR. Step 3: emcc link + joltc + Jolt.
+$(ODIN_WEB_BC): $(ODIN_SOURCES)
+	@command -v $(EMCC) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
+	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
+	@mkdir -p $(ODIN_WEB_DIR)
+	@echo "Emitting Odin wasm LLVM IR ($(ODIN_OPT))..."
+	$(ODIN) build $(ODIN_SRC_DIR) -target:freestanding_wasm32 -build-mode:llvm-ir \
+		-out:$(ODIN_WEB_BC) $(ODIN_WEB_OPT) -strict-target-features \
+		-target-features:+atomics,+bulk-memory,+simd128,+nontrapping-fptoint,+sign-ext,+mutable-globals,+multivalue,+extended-const
+	@mv -f swraster_web.ll $(ODIN_WEB_BC)
+
+$(ODIN_WEB_OBJ): $(ODIN_WEB_BC) Makefile
+	@echo "Lowering Odin wasm IR with emcc -O3..."
+	$(EMCC) -c $(ODIN_WEB_BC) -o $(ODIN_WEB_OBJ) -O3 -pthread $(ODIN_WEB_LLVM_FEATURES)
+
+$(ODIN_JOLTC_WEB_DIR)/joltc.o: $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h Makefile
+	@mkdir -p $(ODIN_JOLTC_WEB_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/joltc.cpp -o $@
+$(ODIN_JOLTC_WEB_DIR)/physics_setup.o: $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
+	@mkdir -p $(ODIN_JOLTC_WEB_DIR)
+	$(EMCXX) $(WEB_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/physics_setup.cpp -o $@
+
+$(ODIN_WEB_TARGET): $(ODIN_WEB_OBJ) $(ODIN_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) $(ASSET_FILES) web_shell.html web_zig_lib.js Makefile
+	@mkdir -p $(ODIN_WEB_DIR)
+	$(EMCXX) -o $(ODIN_WEB_TARGET) \
+		$(ODIN_WEB_OBJ) $(ODIN_JOLTC_WEB_OBJS) $(JOLT_WEB_LIB) \
+		$(WEB_LDFLAGS_ODIN) --js-library web_zig_lib.js \
+		$(WEB_PRELOADS) --shell-file web_shell.html
+
+web-odin: $(ODIN_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
+	@echo "Odin web build written to $(ODIN_WEB_DIR)/"
+
 $(RUST_WEB_DEPS_DIR)/raster.js $(RUST_WEB_DEPS_DIR)/raster.wasm $(RUST_WEB_DEPS_DIR)/raster.data: $(RUST_SOURCES) $(JOLT_WEB_LIB) $(ASSET_FILES) web_zig_lib.js web_shell.html Makefile
 	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
 	@command -v $(EMCC) >/dev/null 2>&1 || { echo "Error: Emscripten not found. Activate/install emsdk first."; exit 1; }
@@ -300,7 +425,7 @@ web-rust: $(RUST_WEB_TARGET) $(WEB_BUILD_DIR)/index.html
 # `web-cpp`/`web-rust` for one page or `web-all` for all.
 web: web-zig
 
-web-all: web-cpp web-zig web-rust
+web-all: web-cpp web-zig web-odin web-rust
 
 # Assemble + sign a macOS .app bundle. Used by both the C++ and Zig builds so
 # each toolchain produces a first-class, icon-decorated, console-free app.
@@ -325,8 +450,14 @@ define make_app_bundle
 	@echo "  -> $(2)/Contents/MacOS/raster"
 endef
 
-$(APP_NAME): $(TARGET) Info.plist $(ICON_ICNS) $(ASSET_FILES)
-	$(call make_app_bundle,$(TARGET),$(APP_NAME))
+# The C++ app bundles the full-LLVM-23 build by default so all four ports
+# share the same code-generator family in comparative runs (Zig native is
+# lowered by this same clang-23; measured delta vs Apple clang is ~noise).
+# Apple-clang build stays available: `make cpp-apple` (bin/raster), or bundle
+# it with `make app CPP_APP_BIN=$(TARGET)`.
+CPP_APP_BIN ?= $(CPP_LLVM23_BIN)
+$(APP_NAME): $(CPP_APP_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(CPP_APP_BIN),$(APP_NAME))
 
 app: $(APP_NAME)
 
@@ -373,6 +504,78 @@ zig-bin: $(ZIG_BIN)
 
 zig: $(ZIG_APP)
 
+# --- Odin native build ------------------------------------------------------
+$(ODIN_JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h
+	@echo "Building joltc wrapper for Odin..."
+	@mkdir -p $(ODIN_JOLTC_DIR)
+	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/joltc.cpp -o $(ODIN_JOLTC_DIR)/joltc.o
+	$(CXX) $(JOLTC_FLAGS) -c $(SRC_DIR)/physics_setup.cpp -o $(ODIN_JOLTC_DIR)/physics_setup.o
+	ar rcs $@ $(ODIN_JOLTC_DIR)/joltc.o $(ODIN_JOLTC_DIR)/physics_setup.o
+
+$(ODIN_NATIVE_OBJ): $(ODIN_SOURCES)
+	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
+	@mkdir -p $(ODIN_BUILD_DIR)
+	@echo "Emitting Odin native object ($(ODIN_OPT) $(ODIN_MICROARCH))..."
+	$(ODIN) build $(ODIN_SRC_DIR) -build-mode:obj -out:$(ODIN_NATIVE_OBJ) $(ODIN_OPT) $(ODIN_MICROARCH)
+
+$(ODIN_BIN): $(ODIN_NATIVE_OBJ) $(JOLT_LIB) $(ODIN_JOLTC_LIB)
+	@mkdir -p $(ODIN_BUILD_DIR)/bin
+	@echo "Linking Odin native..."
+	$(CXX) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 -mcpu=native \
+		-o $(ODIN_BIN) $(ODIN_NATIVE_OBJ) $(ODIN_JOLTC_LIB) $(JOLT_LIB) \
+		$(ODIN_NATIVE_FRAMEWORKS)
+
+# --- Odin native via LLVM 23 (split IR interchange, mirrors the Zig and C++
+# rules): Odin's frontend + LLVM 22 mid-end emit -o:speed IR, clang-23 does
+# the final NEON codegen. Measured a consistent ~1% win over Odin's own
+# LLVM 22 backend (the same swap was a wash for C++ vs Apple clang 17 — the
+# 22->23 step matters, the 17->23 step did not). NOTE: -build-mode:llvm-ir
+# writes <basename>.ll into the CWD (the -out directory is ignored), hence
+# the mv.
+ODIN_LLVM23_DIR = $(ODIN_BUILD_DIR)/obj-llvm23
+ODIN_LLVM23_BIN = $(ODIN_BUILD_DIR)/bin/raster-llvm23
+ODIN_NATIVE_LL = $(ODIN_LLVM23_DIR)/swraster_native.ll
+
+$(ODIN_NATIVE_LL): $(ODIN_SOURCES) Makefile
+	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
+	@[ -x $(LLVM23_CLANG) ] || { echo "Error: LLVM 23 clang not found at $(LLVM23_CLANG). Activate/install emsdk first."; exit 1; }
+	@mkdir -p $(ODIN_LLVM23_DIR)
+	@echo "Emitting Odin native LLVM IR ($(ODIN_OPT) $(ODIN_MICROARCH))..."
+	$(ODIN) build $(ODIN_SRC_DIR) -build-mode:llvm-ir -out:$(ODIN_NATIVE_LL) $(ODIN_OPT) $(ODIN_MICROARCH)
+	@mv -f swraster_native.ll $(ODIN_NATIVE_LL)
+
+$(ODIN_LLVM23_DIR)/swraster_native.o: $(ODIN_NATIVE_LL)
+	@echo "Lowering Odin native IR with LLVM 23 (clang-23 -O3 -mcpu=apple-m4)..."
+	$(LLVM23_CLANG) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 -mcpu=apple-m4 \
+		-Wno-override-module -c $(ODIN_NATIVE_LL) -o $@
+
+$(ODIN_LLVM23_BIN): $(ODIN_LLVM23_DIR)/swraster_native.o $(JOLT_LIB) $(ODIN_JOLTC_LIB)
+	@mkdir -p $(ODIN_BUILD_DIR)/bin
+	@echo "Linking Odin native (LLVM 23)..."
+	$(CXX) -target arm64-apple-macos -isysroot $(MACOS_SDK) -O3 \
+		-o $(ODIN_LLVM23_BIN) $(ODIN_LLVM23_DIR)/swraster_native.o $(ODIN_JOLTC_LIB) $(JOLT_LIB) \
+		$(ODIN_NATIVE_FRAMEWORKS)
+
+odin-llvm23: $(ODIN_LLVM23_BIN)
+
+# The Odin app bundles the clang-23 split build (comparative fairness with
+# the Zig/C++ lanes + measured ~1% faster). The exit abort once blamed on this
+# build was actually a double free of os.args in os_args_native.odin (fixed
+# there) — layout-dependent, so it only tripped libc's detector in some
+# environments; the backend was never at fault. Stock Odin backend:
+# `make odin-bin`, or `make odin ODIN_APP_BIN=$(ODIN_BIN)`.
+ODIN_APP_BIN ?= $(ODIN_LLVM23_BIN)
+$(ODIN_APP): $(ODIN_APP_BIN) Info.plist $(ICON_ICNS) $(ASSET_FILES)
+	$(call make_app_bundle,$(ODIN_APP_BIN),$(ODIN_APP))
+
+odin-bin: $(ODIN_BIN)
+
+odin: $(ODIN_APP)
+
+# All four native app bundles in one shot — use this before comparative runs
+# so no port is benchmarked from a stale bundle.
+apps: app zig odin rust
+
 # --- Rust native build ------------------------------------------------------
 $(RUST_CARGO_BIN): $(RUST_SOURCES) $(JOLT_LIB)
 	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
@@ -412,6 +615,9 @@ clean-cpp:
 clean-zig:
 	rm -rf $(ZIG_BUILD_DIR)
 
+clean-odin:
+	rm -rf $(ODIN_BUILD_DIR)
+
 clean-web:
 	rm -rf $(WEB_BUILD_DIR) $(RUST_WEB_CARGO_DIR)
 
@@ -426,8 +632,12 @@ rebuild-zig:
 	$(MAKE) clean-zig
 	$(MAKE) zig
 
+rebuild-odin:
+	$(MAKE) clean-odin
+	$(MAKE) odin
+
 rebuild-rust:
 	$(MAKE) clean-rust
 	$(MAKE) rust
 
-.PHONY: clean clean-cpp clean-zig clean-web clean-rust rebuild-cpp rebuild-zig rebuild-rust app all web web-cpp web-zig web-rust web-all zig zig-bin rust rust-bin
+.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin

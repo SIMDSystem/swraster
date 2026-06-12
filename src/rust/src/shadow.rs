@@ -112,7 +112,9 @@ pub unsafe fn sample_shadow_compare_bilinear_2x2(
         for gx in 0..3 {
             let fetched = *shadow_depth.add(base + gx) as u32;
             let biased = (fetched + bias).min(0xffff);
-            grid[gy][gx] = if r16 <= biased { 1.0 } else { 0.0 };
+            // Branchless compare (cset + ucvtf); a data-dependent branch here
+            // mispredicts at every shadow edge.
+            grid[gy][gx] = (r16 <= biased) as u32 as f32;
         }
     }
 
@@ -123,9 +125,9 @@ pub unsafe fn sample_shadow_compare_bilinear_2x2(
             let c10 = grid[oy][ox + 1];
             let c01 = grid[oy + 1][ox];
             let c11 = grid[oy + 1][ox + 1];
-            let cx0 = c00 + (c10 - c00) * wx;
-            let cx1 = c01 + (c11 - c01) * wx;
-            sum += cx0 + (cx1 - cx0) * wy;
+            let cx0 = crate::draw::fma1(c10 - c00, wx, c00);
+            let cx1 = crate::draw::fma1(c11 - c01, wx, c01);
+            sum += crate::draw::fma1(cx1 - cx0, wy, cx0);
         }
     }
     sum * 0.25

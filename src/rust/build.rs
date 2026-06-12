@@ -72,6 +72,9 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=CoreGraphics");
         println!("cargo:rustc-link-lib=framework=IOSurface");
     } else if is_emscripten {
+        // -O3 at the emcc link is where Binaryen's wasm-opt runs; without it
+        // emcc links at -O0 and skips that pass entirely.
+        println!("cargo:rustc-link-arg=-O3");
         println!("cargo:rustc-link-arg=--js-library");
         println!("cargo:rustc-link-arg={}", repo_root.join("web_zig_lib.js").display());
         println!("cargo:rustc-link-arg=--no-entry");

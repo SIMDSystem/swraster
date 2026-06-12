@@ -426,6 +426,10 @@ void run_render_loop(RendererContext& ctx) {
                     if (event.key == 'f' || event.key == 'F') {
                         profiler_unfreeze = !profiler_unfreeze;
                     }
+                    if (event.key == 'q' || event.key == 'Q') {
+                        bool was = g_quad_path_enabled.load(std::memory_order_relaxed);
+                        g_quad_path_enabled.store(!was, std::memory_order_relaxed);
+                    }
                     if (event.key == 'b' || event.key == 'B') {
                         // Toggle the hard raster pass-barrier. Off (default) =
                         // opportunistic SSAO/Luminaire overlap; on = each pass

@@ -3,6 +3,7 @@
 // for the optimizer, exactly as in the C++.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const config = @import("render_config.zig");
 const platform = @import("platform.zig");
 const tex = @import("texture.zig");
@@ -26,6 +27,24 @@ const LuminaireConeBuffer = buffers.LuminaireConeBuffer;
 const M_PI: f32 = 3.14159265358979323846;
 
 pub const TriangleShader = enum { Lit, DebugUnlitRed, LuminaireCone };
+
+// On wasm, @min/@max lower to f32x4.min/max — NaN-propagating forms that
+// expand to ~10 instructions on x86 hosts. The select form lowers to
+// pmin/pmax (single op). Our lanes are never NaN. Native is untouched
+// (@min/@max -> NEON fmin/fmax). Same policy as the Odin/Rust/C++ ports.
+inline fn min4(a: @Vector(4, f32), b: @Vector(4, f32)) @Vector(4, f32) {
+    if (comptime builtin.target.os.tag == .emscripten) {
+        return @select(f32, a < b, a, b);
+    }
+    return @min(a, b);
+}
+
+inline fn max4(a: @Vector(4, f32), b: @Vector(4, f32)) @Vector(4, f32) {
+    if (comptime builtin.target.os.tag == .emscripten) {
+        return @select(f32, a > b, a, b);
+    }
+    return @max(a, b);
+}
 
 // Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
 // comparison against the 4-wide quad path. Both paths still use SIMD linalg,
@@ -778,8 +797,8 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
                 const w0v = @as(@Vector(4, f32), @splat(w0)) + @as(@Vector(4, f32), @splat(A0)) * lane_idx;
                 const w1v = @as(@Vector(4, f32), @splat(w1)) + @as(@Vector(4, f32), @splat(A1)) * lane_idx;
                 const w2v = @as(@Vector(4, f32), @splat(w2)) + @as(@Vector(4, f32), @splat(A2)) * lane_idx;
-                const mn = @min(w0v, @min(w1v, w2v));
-                const mx = @max(w0v, @max(w1v, w2v));
+                const mn = min4(w0v, min4(w1v, w2v));
+                const mx = max4(w0v, max4(w1v, w2v));
                 const mixed = @select(f32, mn < vzero, vone, vzero) * @select(f32, mx > vzero, vone, vzero);
                 if (@reduce(.Add, mixed) == 0.0) {
                     const qaw0 = @abs(w0v);
@@ -1143,34 +1162,73 @@ pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]
             const max_world = @as(f32, @floatFromInt(ssao_max_radius_px)) * eye_depth / focal_px;
             if (radius > max_world) radius = max_world;
 
+            // 4-wide masked tap loop: two groups of four independent probes.
+            // All arithmetic runs branchless under lane masks; the only scalar
+            // step is the depth gather (four indexed loads). Lowers to NEON
+            // natively and simd128 on wasm — wasm in particular pays heavily
+            // for the scalar per-tap branches this replaces.
             var occlusion: f32 = 0.0;
-            var i: usize = 0;
-            while (i < kernel_size) : (i += 1) {
-                const kx = ssao_kernel.x[i];
-                const ky = ssao_kernel.y[i];
-                const kz = ssao_kernel.z[i];
-                const ox = tx * kx + bx * ky + nx * kz;
-                const oy = ty * kx + by * ky + ny * kz;
-                const oz = tz * kx + bz * ky + nz * kz;
-                const spx = cx + ox * radius;
-                const spy = cy + oy * radius;
-                const spz = cz + oz * radius;
-                if (spz >= -0.0001) continue;
-
-                const clip_w = -spz;
-                const s_ndc_x = (proj00 * spx) / clip_w;
-                const s_ndc_y = (proj11 * spy) / clip_w;
-                const sx: i32 = @intFromFloat(@round((s_ndc_x + 1.0) * 0.5 * @as(f32, @floatFromInt(screen_width)) - 0.5));
-                const sy: i32 = @intFromFloat(@round((1.0 - s_ndc_y) * 0.5 * @as(f32, @floatFromInt(screen_height)) - 0.5));
-                if (sx < 0 or sx >= screen_width or sy < 0 or sy >= screen_height) continue;
-
-                const geom_z = -linear_z[@intCast(sy * screen_width + sx)];
-
-                if (geom_z >= spz + depth_bias) {
-                    var range_check = world_radius / @abs(cz - geom_z);
-                    if (range_check > 1.0) range_check = 1.0;
-                    range_check = range_check * range_check * (3.0 - 2.0 * range_check);
-                    occlusion += range_check;
+            const F4 = @Vector(4, f32);
+            const vzero4: F4 = @splat(0.0);
+            const vone4: F4 = @splat(1.0);
+            const txv: F4 = @splat(tx);
+            const tyv: F4 = @splat(ty);
+            const tzv: F4 = @splat(tz);
+            const bxv: F4 = @splat(bx);
+            const byv: F4 = @splat(by);
+            const bzv: F4 = @splat(bz);
+            const nxv: F4 = @splat(nx);
+            const nyv: F4 = @splat(ny);
+            const nzv: F4 = @splat(nz);
+            const czv: F4 = @splat(cz);
+            const rv: F4 = @splat(radius);
+            inline for (0..2) |g| {
+                const kxv: F4 = ssao_kernel.x[g * 4 ..][0..4].*;
+                const kyv: F4 = ssao_kernel.y[g * 4 ..][0..4].*;
+                const kzv: F4 = ssao_kernel.z[g * 4 ..][0..4].*;
+                const ox = txv * kxv + bxv * kyv + nxv * kzv;
+                const oy = tyv * kxv + byv * kyv + nyv * kzv;
+                const oz = tzv * kxv + bzv * kyv + nzv * kzv;
+                const spx = @as(F4, @splat(cx)) + ox * rv;
+                const spy = @as(F4, @splat(cy)) + oy * rv;
+                const spz = czv + oz * rv;
+                const valid = spz < @as(F4, @splat(-0.0001));
+                if (@reduce(.Or, valid)) {
+                    const inv_cw = @as(F4, @splat(-1.0)) / spz; // masked lanes may be garbage; never selected
+                    const s_ndc_x = (@as(F4, @splat(proj00)) * spx) * inv_cw;
+                    const s_ndc_y = (@as(F4, @splat(proj11)) * spy) * inv_cw;
+                    // round(((s+1)*0.5*extent) - 0.5 + 0.5) == floor((s+1)*half_extent)
+                    const sxf = @floor((s_ndc_x + vone4) * @as(F4, @splat(0.5 * @as(f32, @floatFromInt(screen_width)))));
+                    const syf = @floor((vone4 - s_ndc_y) * @as(F4, @splat(0.5 * @as(f32, @floatFromInt(screen_height)))));
+                    const wv: F4 = @splat(@as(f32, @floatFromInt(screen_width)));
+                    const hv: F4 = @splat(@as(f32, @floatFromInt(screen_height)));
+                    const vfalse: @Vector(4, bool) = @splat(false);
+                    const x_ok = @select(bool, sxf >= vzero4, sxf < wv, vfalse);
+                    const y_ok = @select(bool, syf >= vzero4, syf < hv, vfalse);
+                    const in_bounds = @select(bool, x_ok, y_ok, vfalse);
+                    const mask = @select(bool, valid, in_bounds, vfalse);
+                    if (@reduce(.Or, mask)) {
+                        const ma: [4]bool = mask;
+                        const sxa: [4]f32 = sxf;
+                        const sya: [4]f32 = syf;
+                        const spza: [4]f32 = spz;
+                        var gz: [4]f32 = undefined;
+                        inline for (0..4) |l| {
+                            // Off-screen/behind lanes get geom_z == spz, which
+                            // the biased compare below always rejects.
+                            gz[l] = if (ma[l])
+                                -linear_z[@intCast(@as(i32, @intFromFloat(sya[l])) * screen_width + @as(i32, @intFromFloat(sxa[l])))]
+                            else
+                                spza[l];
+                        }
+                        const gzv: F4 = gz;
+                        const hit = @select(bool, gzv >= spz + @as(F4, @splat(depth_bias)), mask, vfalse);
+                        if (@reduce(.Or, hit)) {
+                            var rc = min4(@as(F4, @splat(world_radius)) / @abs(czv - gzv), vone4);
+                            rc = rc * rc * (@as(F4, @splat(3.0)) - @as(F4, @splat(2.0)) * rc);
+                            occlusion += @reduce(.Add, @select(f32, hit, rc, vzero4));
+                        }
+                    }
                 }
             }
 

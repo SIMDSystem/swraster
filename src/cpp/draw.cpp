@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <atomic>
 #include <vector>
 
 #include "pixel.h"
@@ -243,6 +244,10 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     }
 }
 
+// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
+// comparison against the 4-wide quad path.
+std::atomic<bool> g_quad_path_enabled{true};
+
 // Strip-clipped barycentric rasterizer with optional Phong shading and PCF shadows.
 // This is the renderer's main pixel shader; it's kept in one flat function
 // so the inner loop stays predictable to the optimizer.
@@ -381,12 +386,223 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         const PackedTextureLevel& level = texture->levels[mip_level];
         tex_level = &level;
     }
+    // ---- Shared Lit back-end: texture + Phong + alpha + buffer writes for
+    // one pixel. Called per pixel from the scalar path and per lane from the
+    // quad path so both produce identical output (mirrors shade_lit_fragment
+    // in the Zig/Rust/Odin ports).
+    auto shade_lit = [&](Pixel32* row_pixels, float* row_depth, int x, int y,
+                         float z, float inv_w, float uu, float vv,
+                         float r_attr, float g_attr, float b_attr, float alpha,
+                         float fnx, float fny, float fnz,
+                         float fex, float fey, float fez,
+                         float fss, float fst, float fsr, float fsq) {
+        float u = uu - floorf(uu);
+        float v = vv - floorf(vv);
+
+        float final_r, final_g, final_b;
+        if (has_texture) {
+            uint32_t tc = sample_texture_anisotropic(*tex_level, u, v,
+                                                     aniso_axis_u, aniso_axis_v, aniso_taps);
+            uint8_t tr = (uint8_t)(tc >> 16);
+            uint8_t tg = (uint8_t)(tc >> 8);
+            uint8_t tb = (uint8_t)tc;
+            final_r = tr * r_attr;
+            final_g = tg * g_attr;
+            final_b = tb * b_attr;
+        } else {
+            final_r = 255.0f * r_attr;
+            final_g = 255.0f * g_attr;
+            final_b = 255.0f * b_attr;
+        }
+
+        if (ENABLE_PHONG_SHADING) {
+            float light_visibility = 1.0f;
+            if (shadow_depth && shadow_size > 0) {
+                float inv_sq = 1.0f / fsq;
+                light_visibility = sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size,
+                                                                      fss * inv_sq, fst * inv_sq, fsr * inv_sq);
+            }
+
+            float diffuse = 0.35f;
+            float spec    = 0.0f;
+            if (light_visibility > 0.0f) {
+                float nx = fnx, ny = fny, nz = fnz;
+                float n_len2 = nx * nx + ny * ny + nz * nz;
+                if (n_len2 > 0.000001f) {
+                    float inv_n_len = 1.0f / sqrtf(n_len2);
+                    nx *= inv_n_len; ny *= inv_n_len; nz *= inv_n_len;
+                }
+
+                float ex = fex, ey = fey, ez = fez;
+                float lx = light_dir.x(), ly = light_dir.y(), lz = light_dir.z();
+                float light_scale = 1.0f;
+                if (use_spotlight) {
+                    lx = light_pos.x() - ex;
+                    ly = light_pos.y() - ey;
+                    lz = light_pos.z() - ez;
+                    float l_len2 = lx * lx + ly * ly + lz * lz;
+                    if (l_len2 > 0.000001f) {
+                        float inv_l_len = 1.0f / sqrtf(l_len2);
+                        lx *= inv_l_len; ly *= inv_l_len; lz *= inv_l_len;
+                        float cone_cos = -(lx * spot_dir.x() + ly * spot_dir.y() + lz * spot_dir.z());
+                        light_scale = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) / (spot_inner_cos - spot_outer_cos)));
+                        light_scale *= 3.5f / (1.0f + 0.004f * l_len2);
+                    } else {
+                        light_scale = 0.0f;
+                    }
+                }
+
+                float ndotl = fmaxf(0.0f, nx * lx + ny * ly + nz * lz);
+                diffuse += 0.8f * ndotl * light_visibility * light_scale;
+
+                if (ndotl > 0.0f && light_scale > 0.0f) {
+                    float v_len2 = ex * ex + ey * ey + ez * ez;
+                    if (v_len2 > 0.000001f) {
+                        float inv_v_len = -1.0f / sqrtf(v_len2); // eye-space point -> eye at origin
+                        ex *= inv_v_len; ey *= inv_v_len; ez *= inv_v_len;
+                    }
+
+                    float hx = lx + ex;
+                    float hy = ly + ey;
+                    float hz = lz + ez;
+                    float h_len2 = hx * hx + hy * hy + hz * hz;
+                    if (h_len2 > 0.000001f) {
+                        float inv_h_len = 1.0f / sqrtf(h_len2);
+                        hx *= inv_h_len; hy *= inv_h_len; hz *= inv_h_len;
+                        // x^48 by squaring (x^48 = x^32 * x^16): 6 muls instead
+                        // of the powf libcall this used to be (double-precision
+                        // musl pow on the wasm build).
+                        float sd   = fmaxf(0.0f, nx * hx + ny * hy + nz * hz);
+                        float sd2  = sd * sd;
+                        float sd4  = sd2 * sd2;
+                        float sd8  = sd4 * sd4;
+                        float sd16 = sd8 * sd8;
+                        float sd32 = sd16 * sd16;
+                        spec = sd32 * sd16 * 150.0f * light_visibility * light_scale;
+                    }
+                }
+            }
+
+            final_r = final_r * diffuse + spec;
+            final_g = final_g * diffuse + spec;
+            final_b = final_b * diffuse + spec;
+        }
+
+        if (final_r > 255.0f) final_r = 255.0f;
+        if (final_g > 255.0f) final_g = 255.0f;
+        if (final_b > 255.0f) final_b = 255.0f;
+
+        if (alpha < 0.995f && alpha > 0.005f) {
+            uint8_t dst_r, dst_g, dst_b;
+            unpack_rgb_fast(row_pixels[x], format, dst_r, dst_g, dst_b);
+            float inv_alpha = 1.0f - alpha;
+            final_r = final_r * alpha + dst_r * inv_alpha;
+            final_g = final_g * alpha + dst_g * inv_alpha;
+            final_b = final_b * alpha + dst_b * inv_alpha;
+        }
+
+        row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
+        if (depth_write) {
+            row_depth[x] = z;
+            // Final linear eye-space depth for SSAO: eye_depth = 1/inv_w.
+            if (linear_z) linear_z[(size_t)y * screen_width + x] = 1.0f / inv_w;
+            // Smooth eye-space shading normal for SSAO (no faceting).
+            if (normal_buffer) {
+                float nnx = fnx, nny = fny, nnz = fnz;
+                float nl2 = nnx * nnx + nny * nny + nnz * nnz;
+                if (nl2 > 1e-12f) {
+                    float invn = 1.0f / sqrtf(nl2);
+                    nnx *= invn; nny *= invn; nnz *= invn;
+                }
+                float* nb = normal_buffer + ((size_t)y * screen_width + x) * 3;
+                nb[0] = nnx; nb[1] = nny; nb[2] = nnz;
+            }
+        }
+    };
+
+    // ---- 4-wide maskless quad path setup (google/highway: lowers to NEON
+    // natively and wasm simd128 on the web build). A quad is taken only when
+    // all four lanes are covered (consistent edge sign) and all four pass the
+    // depth test, so no write mask is needed; anything else falls through to
+    // the scalar pixel below.
+    namespace hs = hwy_static;
+    const hs::FixedTag<float, 4> df;
+    const auto vzero4 = hs::Zero(df);
+    const auto vone4  = hs::Set(df, 1.0f);
+    const auto lane_iota = hs::Iota(df, 0.0f);
+    auto interp3v = [&df](float a0, auto q0, float a1, auto q1, float a2, auto q2) {
+        return hs::MulAdd(hs::Set(df, a2), q2, hs::MulAdd(hs::Set(df, a1), q1, hs::Mul(hs::Set(df, a0), q0)));
+    };
+    const bool quad_on = (shader == TriangleShader::Lit) &&
+                         g_quad_path_enabled.load(std::memory_order_relaxed);
+
     for (int y = y_min; y <= y_max; y++) {
         float w0 = w0_row, w1 = w1_row, w2 = w2_row;
         Pixel32* row_pixels = (Pixel32*)(pixels + y * pitch);
         float*   row_depth  = depth_buffer + (size_t)y * screen_width;
 
         for (int x = x_min; x <= x_max; x++) {
+            if (quad_on && x + 3 <= x_max) {
+                auto w0v = hs::MulAdd(hs::Set(df, A0), lane_iota, hs::Set(df, w0));
+                auto w1v = hs::MulAdd(hs::Set(df, A1), lane_iota, hs::Set(df, w1));
+                auto w2v = hs::MulAdd(hs::Set(df, A2), lane_iota, hs::Set(df, w2));
+                auto mn = hs::Min(w0v, hs::Min(w1v, w2v));
+                auto mx = hs::Max(w0v, hs::Max(w1v, w2v));
+                if (hs::AllFalse(df, hs::And(hs::Lt(mn, vzero4), hs::Gt(mx, vzero4)))) {
+                    auto qaw0 = hs::Abs(w0v);
+                    auto qaw1 = hs::Abs(w1v);
+                    auto qaw2 = hs::Abs(w2v);
+                    auto qwsum = hs::Add(qaw0, hs::Add(qaw1, qaw2));
+                    auto zv = hs::Div(interp3v(v0.z, qaw0, v1.z, qaw1, v2.z, qaw2), qwsum);
+                    auto dbuf = hs::LoadU(df, row_depth + x);
+                    if (hs::AllFalse(df, hs::Ge(zv, dbuf))) {
+                        auto inv_qwsum = hs::Div(vone4, qwsum);
+                        auto b0v = hs::Mul(qaw0, inv_qwsum);
+                        auto b1v = hs::Mul(qaw1, inv_qwsum);
+                        auto b2v = hs::Mul(qaw2, inv_qwsum);
+                        auto inv_wv = interp3v(v0.inv_w, b0v, v1.inv_w, b1v, v2.inv_w, b2v);
+                        auto persp = hs::Div(vone4, inv_wv);
+
+                        float zz[4], iw[4], pu[4], pv[4], pr[4], pg[4], pb[4], pa[4];
+                        float pnx[4], pny[4], pnz[4], pex[4], pey[4], pez[4];
+                        float pss[4], pst[4], psr[4], psq[4];
+                        hs::StoreU(zv, df, zz);
+                        hs::StoreU(inv_wv, df, iw);
+                        hs::StoreU(hs::Mul(interp3v(u0_w, b0v, u1_w, b1v, u2_w, b2v), persp), df, pu);
+                        hs::StoreU(hs::Mul(interp3v(v0_w, b0v, v1_w, b1v, v2_w, b2v), persp), df, pv);
+                        hs::StoreU(interp3v(v0.r, b0v, v1.r, b1v, v2.r, b2v), df, pr);
+                        hs::StoreU(interp3v(v0.g, b0v, v1.g, b1v, v2.g, b2v), df, pg);
+                        hs::StoreU(interp3v(v0.b, b0v, v1.b, b1v, v2.b, b2v), df, pb);
+                        hs::StoreU(interp3v(v0.a, b0v, v1.a, b1v, v2.a, b2v), df, pa);
+                        if (perspective_correct_normals) {
+                            hs::StoreU(hs::Mul(interp3v(nx0_w, b0v, nx1_w, b1v, nx2_w, b2v), persp), df, pnx);
+                            hs::StoreU(hs::Mul(interp3v(ny0_w, b0v, ny1_w, b1v, ny2_w, b2v), persp), df, pny);
+                            hs::StoreU(hs::Mul(interp3v(nz0_w, b0v, nz1_w, b1v, nz2_w, b2v), persp), df, pnz);
+                        } else {
+                            hs::StoreU(interp3v(v0.nx, b0v, v1.nx, b1v, v2.nx, b2v), df, pnx);
+                            hs::StoreU(interp3v(v0.ny, b0v, v1.ny, b1v, v2.ny, b2v), df, pny);
+                            hs::StoreU(interp3v(v0.nz, b0v, v1.nz, b1v, v2.nz, b2v), df, pnz);
+                        }
+                        hs::StoreU(hs::Mul(interp3v(ex0_w, b0v, ex1_w, b1v, ex2_w, b2v), persp), df, pex);
+                        hs::StoreU(hs::Mul(interp3v(ey0_w, b0v, ey1_w, b1v, ey2_w, b2v), persp), df, pey);
+                        hs::StoreU(hs::Mul(interp3v(ez0_w, b0v, ez1_w, b1v, ez2_w, b2v), persp), df, pez);
+                        hs::StoreU(hs::Mul(interp3v(ss0_w, b0v, ss1_w, b1v, ss2_w, b2v), persp), df, pss);
+                        hs::StoreU(hs::Mul(interp3v(st0_w, b0v, st1_w, b1v, st2_w, b2v), persp), df, pst);
+                        hs::StoreU(hs::Mul(interp3v(sr0_w, b0v, sr1_w, b1v, sr2_w, b2v), persp), df, psr);
+                        hs::StoreU(hs::Mul(interp3v(sq0_w, b0v, sq1_w, b1v, sq2_w, b2v), persp), df, psq);
+
+                        for (int k = 0; k < 4; k++) {
+                            shade_lit(row_pixels, row_depth, x + k, y, zz[k], iw[k], pu[k], pv[k],
+                                      pr[k], pg[k], pb[k], pa[k], pnx[k], pny[k], pnz[k],
+                                      pex[k], pey[k], pez[k], pss[k], pst[k], psr[k], psq[k]);
+                        }
+                        x += 3;
+                        w0 += A0 * 4.0f; w1 += A1 * 4.0f; w2 += A2 * 4.0f;
+                        continue;
+                    }
+                }
+            }
+
             // Inside test (handles both CW and CCW winding).
             if (__builtin_expect((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0), 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
@@ -413,13 +629,17 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 w0 += A0; w1 += A1; w2 += A2;
                 continue;
             }
+            // One reciprocal instead of a divide per varying (the rewrite
+            // fast-math performs in the Zig build; clang won't do it for
+            // strict IEEE).
+            float persp = 1.0f / inv_w;
             if (shader == TriangleShader::LuminaireCone) {
-                float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
-                float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
-                float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
-                float nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                float ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                float nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
+                float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) * persp;
+                float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) * persp;
+                float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) * persp;
+                float nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) * persp;
+                float ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) * persp;
+                float nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) * persp;
 
                 float px = ex - light_pos.x();
                 float py = ey - light_pos.y();
@@ -448,160 +668,23 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 continue;
             }
 
-            float u = (u0_w * b0 + u1_w * b1 + u2_w * b2) / inv_w;
-            float v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w;
-
-            float r_attr = v0.r * b0 + v1.r * b1 + v2.r * b2;
-            float g_attr = v0.g * b0 + v1.g * b1 + v2.g * b2;
-            float b_attr = v0.b * b0 + v1.b * b1 + v2.b * b2;
-            float alpha  = v0.a * b0 + v1.a * b1 + v2.a * b2;
-
-            u = u - floorf(u);
-            v = v - floorf(v);
-
-            float final_r, final_g, final_b;
-            if (has_texture) {
-                uint32_t tc = sample_texture_anisotropic(*tex_level, u, v,
-                                                         aniso_axis_u, aniso_axis_v, aniso_taps);
-                uint8_t tr = (uint8_t)(tc >> 16);
-                uint8_t tg = (uint8_t)(tc >> 8);
-                uint8_t tb = (uint8_t)tc;
-                final_r = tr * r_attr;
-                final_g = tg * g_attr;
-                final_b = tb * b_attr;
-            } else {
-                final_r = 255.0f * r_attr;
-                final_g = 255.0f * g_attr;
-                final_b = 255.0f * b_attr;
-            }
-
-            if (ENABLE_PHONG_SHADING) {
-                float light_visibility = 1.0f;
-                if (shadow_depth && shadow_size > 0) {
-                    float ss = (ss0_w * b0 + ss1_w * b1 + ss2_w * b2) / inv_w;
-                    float st = (st0_w * b0 + st1_w * b1 + st2_w * b2) / inv_w;
-                    float sr = (sr0_w * b0 + sr1_w * b1 + sr2_w * b2) / inv_w;
-                    float sq = (sq0_w * b0 + sq1_w * b1 + sq2_w * b2) / inv_w;
-                    float inv_sq   = 1.0f / sq;
-                    float shadow_s = ss * inv_sq;
-                    float shadow_t = st * inv_sq;
-                    float shadow_r = sr * inv_sq;
-                    light_visibility = sample_shadow_compare_bilinear_2x2(shadow_depth, shadow_size,
-                                                                          shadow_s, shadow_t, shadow_r);
-                }
-
-                float diffuse = 0.35f;
-                float spec    = 0.0f;
-                if (light_visibility > 0.0f) {
-                    float nx, ny, nz;
-                    if (perspective_correct_normals) {
-                        nx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                        ny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                        nz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
-                    } else {
-                        nx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
-                        ny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
-                        nz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
-                    }
-                    float n_len2 = nx * nx + ny * ny + nz * nz;
-                    if (n_len2 > 0.000001f) {
-                        float inv_n_len = 1.0f / sqrtf(n_len2);
-                        nx *= inv_n_len; ny *= inv_n_len; nz *= inv_n_len;
-                    }
-
-                    float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) / inv_w;
-                    float ey = (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) / inv_w;
-                    float ez = (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) / inv_w;
-
-                    float lx = light_dir.x(), ly = light_dir.y(), lz = light_dir.z();
-                    float light_scale = 1.0f;
-                    if (use_spotlight) {
-                        lx = light_pos.x() - ex;
-                        ly = light_pos.y() - ey;
-                        lz = light_pos.z() - ez;
-                        float l_len2 = lx * lx + ly * ly + lz * lz;
-                        if (l_len2 > 0.000001f) {
-                            float inv_l_len = 1.0f / sqrtf(l_len2);
-                            lx *= inv_l_len; ly *= inv_l_len; lz *= inv_l_len;
-                            float cone_cos = -(lx * spot_dir.x() + ly * spot_dir.y() + lz * spot_dir.z());
-                            light_scale = fminf(1.0f, fmaxf(0.0f, (cone_cos - spot_outer_cos) / (spot_inner_cos - spot_outer_cos)));
-                            light_scale *= 3.5f / (1.0f + 0.004f * l_len2);
-                        } else {
-                            light_scale = 0.0f;
-                        }
-                    }
-
-                    float ndotl = fmaxf(0.0f, nx * lx + ny * ly + nz * lz);
-                    diffuse += 0.8f * ndotl * light_visibility * light_scale;
-
-                    if (ndotl > 0.0f && light_scale > 0.0f) {
-                        float v_len2 = ex * ex + ey * ey + ez * ez;
-                        if (v_len2 > 0.000001f) {
-                            float inv_v_len = -1.0f / sqrtf(v_len2); // eye-space point -> eye at origin
-                            ex *= inv_v_len; ey *= inv_v_len; ez *= inv_v_len;
-                        }
-
-                        float hx = lx + ex;
-                        float hy = ly + ey;
-                        float hz = lz + ez;
-                        float h_len2 = hx * hx + hy * hy + hz * hz;
-                        if (h_len2 > 0.000001f) {
-                            float inv_h_len = 1.0f / sqrtf(h_len2);
-                            hx *= inv_h_len; hy *= inv_h_len; hz *= inv_h_len;
-                            spec = powf(fmaxf(0.0f, nx * hx + ny * hy + nz * hz), 48.0f) * 150.0f * light_visibility * light_scale;
-                        }
-                    }
-                }
-
-                final_r = final_r * diffuse + spec;
-                final_g = final_g * diffuse + spec;
-                final_b = final_b * diffuse + spec;
-            }
-
-            if (final_r > 255.0f) final_r = 255.0f;
-            if (final_g > 255.0f) final_g = 255.0f;
-            if (final_b > 255.0f) final_b = 255.0f;
-
-            if (alpha < 0.995f && alpha > 0.005f) {
-                uint8_t dst_r, dst_g, dst_b;
-                unpack_rgb_fast(row_pixels[x], format, dst_r, dst_g, dst_b);
-                float inv_alpha = 1.0f - alpha;
-                final_r = final_r * alpha + dst_r * inv_alpha;
-                final_g = final_g * alpha + dst_g * inv_alpha;
-                final_b = final_b * alpha + dst_b * inv_alpha;
-            }
-
-            row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
-            if (depth_write) {
-                row_depth[x] = z;
-                // Final linear eye-space depth for SSAO: eye_depth = 1/inv_w.
-                // inv_w is the screen-affine interpolated 1/w already formed for
-                // perspective-correct attributes, so this is just one reciprocal
-                // + store on the winning fragment — no NDC->eye work in SSAO.
-                if (linear_z) linear_z[(size_t)y * screen_width + x] = 1.0f / inv_w;
-                // Stash the smooth eye-space shading normal for SSAO so it
-                // orients its hemisphere off the interpolated vertex normal
-                // (no faceting) rather than a depth-derivative normal.
-                if (normal_buffer) {
-                    float nnx, nny, nnz;
-                    if (perspective_correct_normals) {
-                        nnx = (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) / inv_w;
-                        nny = (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) / inv_w;
-                        nnz = (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) / inv_w;
-                    } else {
-                        nnx = v0.nx * b0 + v1.nx * b1 + v2.nx * b2;
-                        nny = v0.ny * b0 + v1.ny * b1 + v2.ny * b2;
-                        nnz = v0.nz * b0 + v1.nz * b1 + v2.nz * b2;
-                    }
-                    float nl2 = nnx * nnx + nny * nny + nnz * nnz;
-                    if (nl2 > 1e-12f) {
-                        float invn = 1.0f / sqrtf(nl2);
-                        nnx *= invn; nny *= invn; nnz *= invn;
-                    }
-                    float* nb = normal_buffer + ((size_t)y * screen_width + x) * 3;
-                    nb[0] = nnx; nb[1] = nny; nb[2] = nnz;
-                }
-            }
+            shade_lit(row_pixels, row_depth, x, y, z, inv_w,
+                      (u0_w * b0 + u1_w * b1 + u2_w * b2) * persp,
+                      (v0_w * b0 + v1_w * b1 + v2_w * b2) * persp,
+                      v0.r * b0 + v1.r * b1 + v2.r * b2,
+                      v0.g * b0 + v1.g * b1 + v2.g * b2,
+                      v0.b * b0 + v1.b * b1 + v2.b * b2,
+                      v0.a * b0 + v1.a * b1 + v2.a * b2,
+                      perspective_correct_normals ? (nx0_w * b0 + nx1_w * b1 + nx2_w * b2) * persp : v0.nx * b0 + v1.nx * b1 + v2.nx * b2,
+                      perspective_correct_normals ? (ny0_w * b0 + ny1_w * b1 + ny2_w * b2) * persp : v0.ny * b0 + v1.ny * b1 + v2.ny * b2,
+                      perspective_correct_normals ? (nz0_w * b0 + nz1_w * b1 + nz2_w * b2) * persp : v0.nz * b0 + v1.nz * b1 + v2.nz * b2,
+                      (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) * persp,
+                      (ey0_w * b0 + ey1_w * b1 + ey2_w * b2) * persp,
+                      (ez0_w * b0 + ez1_w * b1 + ez2_w * b2) * persp,
+                      (ss0_w * b0 + ss1_w * b1 + ss2_w * b2) * persp,
+                      (st0_w * b0 + st1_w * b1 + st2_w * b2) * persp,
+                      (sr0_w * b0 + sr1_w * b1 + sr2_w * b2) * persp,
+                      (sq0_w * b0 + sq1_w * b1 + sq2_w * b2) * persp);
 
             w0 += A0; w1 += A1; w2 += A2;
         }
@@ -812,39 +895,71 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
             float max_world = (float)ssao_max_radius_px * eye_depth / focal_px;
             if (radius > max_world) radius = max_world;
 
+            // 4-wide masked tap loop: two groups of four independent probes
+            // (google/highway; the same code lowers to NEON natively and to
+            // wasm simd128 on the web build). All arithmetic runs branchless
+            // under lane masks; the only scalar step is the depth gather.
+            namespace hs = hwy_static;
+            const hs::FixedTag<float, 4> df;
+            const auto vzero = hs::Zero(df);
+            const auto vone  = hs::Set(df, 1.0f);
+            const auto txv = hs::Set(df, tx), tyv = hs::Set(df, ty), tzv = hs::Set(df, tz);
+            const auto bxv = hs::Set(df, bx), byv = hs::Set(df, by), bzv = hs::Set(df, bz);
+            const auto nxv = hs::Set(df, nx), nyv = hs::Set(df, ny), nzv = hs::Set(df, nz);
+            const auto czv = hs::Set(df, cz);
+            const auto rv  = hs::Set(df, radius);
             float occlusion = 0.0f;
-            for (int i = 0; i < kernel_size; i++) {
-                float kx = kern.x[i], ky = kern.y[i], kz = kern.z[i];
-                // Tangent-space kernel sample -> eye space, offset from P.
-                float ox = tx * kx + bx * ky + nx * kz;
-                float oy = ty * kx + by * ky + ny * kz;
-                float oz = tz * kx + bz * ky + nz * kz;
-                float spx = cx + ox * radius;
-                float spy = cy + oy * radius;
-                float spz = cz + oz * radius;
-                if (spz >= -0.0001f) continue;          // behind / at the eye
+            for (int g = 0; g < 2; g++) {
+                // Tangent-space kernel samples -> eye space, offset from P.
+                const auto kxv = hs::LoadU(df, kern.x + g * 4);
+                const auto kyv = hs::LoadU(df, kern.y + g * 4);
+                const auto kzv = hs::LoadU(df, kern.z + g * 4);
+                const auto ox = hs::MulAdd(nxv, kzv, hs::MulAdd(bxv, kyv, hs::Mul(txv, kxv)));
+                const auto oy = hs::MulAdd(nyv, kzv, hs::MulAdd(byv, kyv, hs::Mul(tyv, kxv)));
+                const auto oz = hs::MulAdd(nzv, kzv, hs::MulAdd(bzv, kyv, hs::Mul(tzv, kxv)));
+                const auto spx = hs::MulAdd(ox, rv, hs::Set(df, cx));
+                const auto spy = hs::MulAdd(oy, rv, hs::Set(df, cy));
+                const auto spz = hs::MulAdd(oz, rv, czv);
+                const auto valid = hs::Lt(spz, hs::Set(df, -0.0001f)); // behind / at the eye
+                if (hs::AllFalse(df, valid)) continue;
 
-                // Project the eye-space sample to a pixel (perspective divide).
-                float clip_w = -spz;                    // proj(3,2) = -1
-                float s_ndc_x = (proj00 * spx) / clip_w;
-                float s_ndc_y = (proj11 * spy) / clip_w;
-                int sx = (int)lrintf((s_ndc_x + 1.0f) * 0.5f * (float)screen_width  - 0.5f);
-                int sy = (int)lrintf((1.0f - s_ndc_y) * 0.5f * (float)screen_height - 0.5f);
-                if (sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height) continue;
+                // Project the eye-space samples to pixels (perspective divide;
+                // proj(3,2) = -1). Masked-out lanes may divide by ~0 -> garbage,
+                // but they are never selected below.
+                const auto inv_cw = hs::Div(hs::Set(df, -1.0f), spz);
+                const auto s_ndc_x = hs::Mul(hs::Mul(hs::Set(df, proj00), spx), inv_cw);
+                const auto s_ndc_y = hs::Mul(hs::Mul(hs::Set(df, proj11), spy), inv_cw);
+                // lrintf(((s+1)*0.5*extent) - 0.5) == floor((s+1)*half_extent)
+                const auto sxf = hs::Floor(hs::Mul(hs::Add(s_ndc_x, vone), hs::Set(df, 0.5f * (float)screen_width)));
+                const auto syf = hs::Floor(hs::Mul(hs::Sub(vone, s_ndc_y), hs::Set(df, 0.5f * (float)screen_height)));
+                const auto mask = hs::And(valid,
+                    hs::And(hs::And(hs::Ge(sxf, vzero), hs::Lt(sxf, hs::Set(df, (float)screen_width))),
+                            hs::And(hs::Ge(syf, vzero), hs::Lt(syf, hs::Set(df, (float)screen_height)))));
+                if (hs::AllFalse(df, mask)) continue;
 
-                // Real surface eye z at the sample pixel, read directly from the
-                // linear-Z G-buffer. Background reads LINEAR_Z_SKY -> geom_z very
-                // negative -> never counts as an occluder in front of the sample.
-                float geom_z = -linear_z[(size_t)sy * screen_width + sx];
+                // Real surface eye z at each sample pixel, read from the
+                // linear-Z G-buffer (scalar gather). Off-screen/behind lanes
+                // get geom_z == spz, which the biased compare always rejects.
+                uint8_t mbits[1];
+                hs::StoreMaskBits(df, mask, mbits);
+                float sxa[4], sya[4], spza[4], gz[4];
+                hs::StoreU(sxf, df, sxa);
+                hs::StoreU(syf, df, sya);
+                hs::StoreU(spz, df, spza);
+                for (int l = 0; l < 4; l++) {
+                    gz[l] = ((mbits[0] >> l) & 1)
+                        ? -linear_z[(size_t)(int)sya[l] * screen_width + (int)sxa[l]]
+                        : spza[l];
+                }
+                const auto gzv = hs::LoadU(df, gz);
 
                 // Occluded when the real surface sits in front of the sample
                 // point (closer to the eye => larger, less-negative z).
-                if (geom_z >= spz + depth_bias) {
-                    float range_check = world_radius / fabsf(cz - geom_z);
-                    if (range_check > 1.0f) range_check = 1.0f;
-                    range_check = range_check * range_check * (3.0f - 2.0f * range_check); // smoothstep
-                    occlusion += range_check;
-                }
+                const auto hit = hs::And(hs::Ge(gzv, hs::Add(spz, hs::Set(df, depth_bias))), mask);
+                if (hs::AllFalse(df, hit)) continue;
+                auto rc = hs::Min(hs::Div(hs::Set(df, world_radius), hs::Abs(hs::Sub(czv, gzv))), vone);
+                rc = hs::Mul(hs::Mul(rc, rc), hs::Sub(hs::Set(df, 3.0f), hs::Mul(hs::Set(df, 2.0f), rc))); // smoothstep
+                occlusion += hs::GetLane(hs::SumOfLanes(df, hs::IfThenElseZero(hit, rc)));
             }
 
             float ao = 1.0f - (occlusion / (float)kernel_size) * ao_intensity;

@@ -14,7 +14,6 @@ use crate::shadow;
 use crate::texture::{self as tex, PackedTexture, PackedTextureLevel};
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
@@ -83,6 +82,53 @@ impl F32x4 {
     unsafe fn any_depth_reject(z: Self, depth: Self) -> bool {
         vmaxvq_u32(vcgeq_f32(z.0, depth.0)) != 0
     }
+    /// self + a*b, fused.
+    #[inline(always)]
+    unsafe fn fma(self, a: Self, b: Self) -> Self {
+        Self(vfmaq_f32(self.0, a.0, b.0))
+    }
+    #[inline(always)]
+    unsafe fn floor(self) -> Self {
+        Self(vrndmq_f32(self.0))
+    }
+    #[inline(always)]
+    unsafe fn lt(self, rhs: Self) -> Mask4 {
+        Mask4(vcltq_f32(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn ge(self, rhs: Self) -> Mask4 {
+        Mask4(vcgeq_f32(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn reduce_add(self) -> f32 {
+        vaddvq_f32(self.0)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Clone, Copy)]
+struct Mask4(uint32x4_t);
+
+#[cfg(target_arch = "aarch64")]
+impl Mask4 {
+    #[inline(always)]
+    unsafe fn and(self, rhs: Self) -> Self {
+        Self(vandq_u32(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn any(self) -> bool {
+        vmaxvq_u32(self.0) != 0
+    }
+    #[inline(always)]
+    unsafe fn select(self, t: F32x4, f: F32x4) -> F32x4 {
+        F32x4(vbslq_f32(self.0, t.0, f.0))
+    }
+    #[inline(always)]
+    unsafe fn to_array(self) -> [u32; 4] {
+        let mut out = [0u32; 4];
+        vst1q_u32(out.as_mut_ptr(), self.0);
+        out
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -114,13 +160,16 @@ impl F32x4 {
     unsafe fn abs(self) -> Self {
         Self(f32x4_abs(self.0))
     }
+    // pmin/pmax (compare+select semantics) instead of f32x4.min/max: the
+    // NaN-correct forms expand to ~10 instructions on x86 hosts, while pmin
+    // is a single minps (and a 2-op select on ARM). Our lanes are never NaN.
     #[inline(always)]
     unsafe fn min(self, rhs: Self) -> Self {
-        Self(f32x4_min(self.0, rhs.0))
+        Self(f32x4_pmin(self.0, rhs.0))
     }
     #[inline(always)]
     unsafe fn max(self, rhs: Self) -> Self {
-        Self(f32x4_max(self.0, rhs.0))
+        Self(f32x4_pmax(self.0, rhs.0))
     }
     #[inline(always)]
     unsafe fn any_mixed_sign(w0: Self, w1: Self, w2: Self) -> bool {
@@ -133,15 +182,94 @@ impl F32x4 {
     unsafe fn any_depth_reject(z: Self, depth: Self) -> bool {
         i32x4_bitmask(f32x4_ge(z.0, depth.0)) != 0
     }
+    /// self + a*b. No FMA instruction in baseline wasm SIMD; plain mul+add.
+    #[inline(always)]
+    unsafe fn fma(self, a: Self, b: Self) -> Self {
+        Self(f32x4_add(self.0, f32x4_mul(a.0, b.0)))
+    }
+    #[inline(always)]
+    unsafe fn floor(self) -> Self {
+        Self(f32x4_floor(self.0))
+    }
+    #[inline(always)]
+    unsafe fn lt(self, rhs: Self) -> Mask4 {
+        Mask4(f32x4_lt(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn ge(self, rhs: Self) -> Mask4 {
+        Mask4(f32x4_ge(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn reduce_add(self) -> f32 {
+        f32x4_extract_lane::<0>(self.0)
+            + f32x4_extract_lane::<1>(self.0)
+            + f32x4_extract_lane::<2>(self.0)
+            + f32x4_extract_lane::<3>(self.0)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, Copy)]
+struct Mask4(v128);
+
+#[cfg(target_arch = "wasm32")]
+impl Mask4 {
+    #[inline(always)]
+    unsafe fn and(self, rhs: Self) -> Self {
+        Self(v128_and(self.0, rhs.0))
+    }
+    #[inline(always)]
+    unsafe fn any(self) -> bool {
+        v128_any_true(self.0)
+    }
+    #[inline(always)]
+    unsafe fn select(self, t: F32x4, f: F32x4) -> F32x4 {
+        F32x4(v128_bitselect(t.0, f.0, self.0))
+    }
+    #[inline(always)]
+    unsafe fn to_array(self) -> [u32; 4] {
+        let mut out = [0u32; 4];
+        v128_store(out.as_mut_ptr().cast::<v128>(), self.0);
+        out
+    }
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
 #[inline(always)]
 unsafe fn interp3_attrs4(b0: f32, b1: f32, b2: f32, a0: [f32; 4], a1: [f32; 4], a2: [f32; 4]) -> [f32; 4] {
-    (F32x4::from_array(a0) * F32x4::splat(b0)
-        + F32x4::from_array(a1) * F32x4::splat(b1)
-        + F32x4::from_array(a2) * F32x4::splat(b2))
-    .to_array()
+    (F32x4::from_array(a0) * F32x4::splat(b0))
+        .fma(F32x4::from_array(a1), F32x4::splat(b1))
+        .fma(F32x4::from_array(a2), F32x4::splat(b2))
+        .to_array()
+}
+
+/// a0*w0 + a1*w1 + a2*w2 as mul + 2 fused ops (the contraction Zig's
+/// fast-math float mode performs implicitly; Rust is strict-IEEE).
+#[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
+#[inline(always)]
+unsafe fn interp3v(a0: f32, w0: F32x4, a1: f32, w1: F32x4, a2: f32, w2: F32x4) -> F32x4 {
+    (F32x4::splat(a0) * w0)
+        .fma(F32x4::splat(a1), w1)
+        .fma(F32x4::splat(a2), w2)
+}
+
+/// a*b + c, fused where the target has an FMA instruction. On wasm32
+/// f32::mul_add lowers to an fma libcall, so use plain mul+add there.
+#[inline(always)]
+pub(crate) fn fma1(a: f32, b: f32, c: f32) -> f32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        a * b + c
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        a.mul_add(b, c)
+    }
+}
+
+#[inline(always)]
+fn interp3s(a0: f32, w0: f32, a1: f32, w1: f32, a2: f32, w2: f32) -> f32 {
+    fma1(a2, w2, fma1(a1, w1, a0 * w0))
 }
 
 #[inline(always)]
@@ -186,6 +314,24 @@ impl std::ops::Add for F32x4 {
     #[inline(always)]
     fn add(self, rhs: Self) -> Self {
         Self(f32x4_add(self.0, rhs.0))
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+impl std::ops::Sub for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        unsafe { Self(vsubq_f32(self.0, rhs.0)) }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl std::ops::Sub for F32x4 {
+    type Output = Self;
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Self(f32x4_sub(self.0, rhs.0))
     }
 }
 
@@ -825,7 +971,7 @@ unsafe fn shade_lit_fragment(
                 lz *= inv_l_len;
                 let cone_cos = -dot3(lx, ly, lz, ctx.spot_dir.x, ctx.spot_dir.y, ctx.spot_dir.z);
                 light_scale = (((cone_cos - ctx.spot_outer_cos) / (ctx.spot_inner_cos - ctx.spot_outer_cos)).max(0.0)).min(1.0);
-                light_scale *= 3.5 / (1.0 + 0.004 * l_len2);
+                light_scale *= 3.5 / fma1(0.004, l_len2, 1.0);
             } else {
                 light_scale = 0.0;
             }
@@ -846,7 +992,7 @@ unsafe fn shade_lit_fragment(
 
             if light_visibility > 0.0 {
                 let ndotl = dot3(nx, ny, nz, lx, ly, lz).max(0.0);
-                diffuse += 0.8 * ndotl * light_visibility * light_scale;
+                diffuse = fma1(0.8 * ndotl, light_visibility * light_scale, diffuse);
 
                 if ndotl > 0.0 {
                     let v_len2 = len2_3(ex, ey, ez);
@@ -877,9 +1023,9 @@ unsafe fn shade_lit_fragment(
             }
         }
 
-        final_r = final_r * diffuse + spec;
-        final_g = final_g * diffuse + spec;
-        final_b = final_b * diffuse + spec;
+        final_r = fma1(final_r, diffuse, spec);
+        final_g = fma1(final_g, diffuse, spec);
+        final_b = fma1(final_b, diffuse, spec);
     }
 
     if final_r > 255.0 {
@@ -895,9 +1041,9 @@ unsafe fn shade_lit_fragment(
     if f.a < 0.995 && f.a > 0.005 {
         let dst = pixel::unpack_rgb_fast(*row_pixels.add(x as usize), ctx.format);
         let inv_alpha = 1.0 - f.a;
-        final_r = final_r * f.a + dst.r as f32 * inv_alpha;
-        final_g = final_g * f.a + dst.g as f32 * inv_alpha;
-        final_b = final_b * f.a + dst.b as f32 * inv_alpha;
+        final_r = fma1(final_r, f.a, dst.r as f32 * inv_alpha);
+        final_g = fma1(final_g, f.a, dst.g as f32 * inv_alpha);
+        final_b = fma1(final_b, f.a, dst.b as f32 * inv_alpha);
     }
 
     *row_pixels.add(x as usize) =
@@ -1003,9 +1149,9 @@ pub unsafe fn draw_triangle_barycentric_strip(
 
     let fx0 = x_min as f32;
     let fy0 = y_min as f32;
-    let mut w0_row = a0 * fx0 + b0 * fy0 + setup.k0;
-    let mut w1_row = a1 * fx0 + b1 * fy0 + setup.k1;
-    let mut w2_row = a2 * fx0 + b2 * fy0 + setup.k2;
+    let mut w0_row = fma1(b0, fy0, fma1(a0, fx0, setup.k0));
+    let mut w1_row = fma1(b1, fy0, fma1(a1, fx0, setup.k1));
+    let mut w2_row = fma1(b2, fy0, fma1(a2, fx0, setup.k2));
 
     let (uw0, uw1, uw2) = (setup.uw0, setup.uw1, setup.uw2);
     let (v0_w, v1_w, v2_w) = (setup.v0_w, setup.v1_w, setup.v2_w);
@@ -1144,16 +1290,16 @@ pub unsafe fn draw_triangle_barycentric_strip(
                 #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
                 {
                     let lanes = F32x4::lanes();
-                    let w0v = F32x4::splat(w0) + F32x4::splat(a0) * lanes;
-                    let w1v = F32x4::splat(w1) + F32x4::splat(a1) * lanes;
-                    let w2v = F32x4::splat(w2) + F32x4::splat(a2) * lanes;
+                    let w0v = F32x4::splat(w0).fma(F32x4::splat(a0), lanes);
+                    let w1v = F32x4::splat(w1).fma(F32x4::splat(a1), lanes);
+                    let w2v = F32x4::splat(w2).fma(F32x4::splat(a2), lanes);
 
                     if !F32x4::any_mixed_sign(w0v, w1v, w2v) {
                         let qaw0 = w0v.abs();
                         let qaw1 = w1v.abs();
                         let qaw2 = w2v.abs();
                         let qwsum = qaw0 + qaw1 + qaw2;
-                        let zv = (F32x4::splat(v0.z) * qaw0 + F32x4::splat(v1.z) * qaw1 + F32x4::splat(v2.z) * qaw2) / qwsum;
+                        let zv = interp3v(v0.z, qaw0, v1.z, qaw1, v2.z, qaw2) / qwsum;
                         let xu = x as usize;
                         let dbuf = F32x4::load(row_depth.add(xu));
 
@@ -1162,37 +1308,37 @@ pub unsafe fn draw_triangle_barycentric_strip(
                             let b0v = qaw0 * inv_qwsum;
                             let b1v = qaw1 * inv_qwsum;
                             let b2v = qaw2 * inv_qwsum;
-                            let inv_w_vec = F32x4::splat(v0.inv_w) * b0v + F32x4::splat(v1.inv_w) * b1v + F32x4::splat(v2.inv_w) * b2v;
+                            let inv_w_vec = interp3v(v0.inv_w, b0v, v1.inv_w, b1v, v2.inv_w, b2v);
                             let persp = F32x4::splat(1.0) / inv_w_vec;
 
-                            let uv = (F32x4::splat(uw0) * b0v + F32x4::splat(uw1) * b1v + F32x4::splat(uw2) * b2v) * persp;
-                            let vv = (F32x4::splat(v0_w) * b0v + F32x4::splat(v1_w) * b1v + F32x4::splat(v2_w) * b2v) * persp;
-                            let rv = F32x4::splat(v0.r) * b0v + F32x4::splat(v1.r) * b1v + F32x4::splat(v2.r) * b2v;
-                            let gv = F32x4::splat(v0.g) * b0v + F32x4::splat(v1.g) * b1v + F32x4::splat(v2.g) * b2v;
-                            let bv = F32x4::splat(v0.b) * b0v + F32x4::splat(v1.b) * b1v + F32x4::splat(v2.b) * b2v;
-                            let av = F32x4::splat(v0.a) * b0v + F32x4::splat(v1.a) * b1v + F32x4::splat(v2.a) * b2v;
+                            let uv = interp3v(uw0, b0v, uw1, b1v, uw2, b2v) * persp;
+                            let vv = interp3v(v0_w, b0v, v1_w, b1v, v2_w, b2v) * persp;
+                            let rv = interp3v(v0.r, b0v, v1.r, b1v, v2.r, b2v);
+                            let gv = interp3v(v0.g, b0v, v1.g, b1v, v2.g, b2v);
+                            let bv = interp3v(v0.b, b0v, v1.b, b1v, v2.b, b2v);
+                            let av = interp3v(v0.a, b0v, v1.a, b1v, v2.a, b2v);
 
                             let (nxv, nyv, nzv) = if perspective_correct_normals {
                                 (
-                                    (F32x4::splat(nx0_w) * b0v + F32x4::splat(nx1_w) * b1v + F32x4::splat(nx2_w) * b2v) * persp,
-                                    (F32x4::splat(ny0_w) * b0v + F32x4::splat(ny1_w) * b1v + F32x4::splat(ny2_w) * b2v) * persp,
-                                    (F32x4::splat(nz0_w) * b0v + F32x4::splat(nz1_w) * b1v + F32x4::splat(nz2_w) * b2v) * persp,
+                                    interp3v(nx0_w, b0v, nx1_w, b1v, nx2_w, b2v) * persp,
+                                    interp3v(ny0_w, b0v, ny1_w, b1v, ny2_w, b2v) * persp,
+                                    interp3v(nz0_w, b0v, nz1_w, b1v, nz2_w, b2v) * persp,
                                 )
                             } else {
                                 (
-                                    F32x4::splat(v0.nx) * b0v + F32x4::splat(v1.nx) * b1v + F32x4::splat(v2.nx) * b2v,
-                                    F32x4::splat(v0.ny) * b0v + F32x4::splat(v1.ny) * b1v + F32x4::splat(v2.ny) * b2v,
-                                    F32x4::splat(v0.nz) * b0v + F32x4::splat(v1.nz) * b1v + F32x4::splat(v2.nz) * b2v,
+                                    interp3v(v0.nx, b0v, v1.nx, b1v, v2.nx, b2v),
+                                    interp3v(v0.ny, b0v, v1.ny, b1v, v2.ny, b2v),
+                                    interp3v(v0.nz, b0v, v1.nz, b1v, v2.nz, b2v),
                                 )
                             };
 
-                            let exv = (F32x4::splat(ex0_w) * b0v + F32x4::splat(ex1_w) * b1v + F32x4::splat(ex2_w) * b2v) * persp;
-                            let eyv = (F32x4::splat(ey0_w) * b0v + F32x4::splat(ey1_w) * b1v + F32x4::splat(ey2_w) * b2v) * persp;
-                            let ezv = (F32x4::splat(ez0_w) * b0v + F32x4::splat(ez1_w) * b1v + F32x4::splat(ez2_w) * b2v) * persp;
-                            let ssv = (F32x4::splat(ss0_w) * b0v + F32x4::splat(ss1_w) * b1v + F32x4::splat(ss2_w) * b2v) * persp;
-                            let stv = (F32x4::splat(st0_w) * b0v + F32x4::splat(st1_w) * b1v + F32x4::splat(st2_w) * b2v) * persp;
-                            let srv = (F32x4::splat(sr0_w) * b0v + F32x4::splat(sr1_w) * b1v + F32x4::splat(sr2_w) * b2v) * persp;
-                            let sqv = (F32x4::splat(sq0_w) * b0v + F32x4::splat(sq1_w) * b1v + F32x4::splat(sq2_w) * b2v) * persp;
+                            let exv = interp3v(ex0_w, b0v, ex1_w, b1v, ex2_w, b2v) * persp;
+                            let eyv = interp3v(ey0_w, b0v, ey1_w, b1v, ey2_w, b2v) * persp;
+                            let ezv = interp3v(ez0_w, b0v, ez1_w, b1v, ez2_w, b2v) * persp;
+                            let ssv = interp3v(ss0_w, b0v, ss1_w, b1v, ss2_w, b2v) * persp;
+                            let stv = interp3v(st0_w, b0v, st1_w, b1v, st2_w, b2v) * persp;
+                            let srv = interp3v(sr0_w, b0v, sr1_w, b1v, sr2_w, b2v) * persp;
+                            let sqv = interp3v(sq0_w, b0v, sq1_w, b1v, sq2_w, b2v) * persp;
 
                             let z = zv.to_array();
                             let inv_w = inv_w_vec.to_array();
@@ -1261,7 +1407,7 @@ pub unsafe fn draw_triangle_barycentric_strip(
                 let aw1 = w1.abs();
                 let aw2 = w2.abs();
                 let w_sum = aw0 + aw1 + aw2;
-                let z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
+                let z = interp3s(v0.z, aw0, v1.z, aw1, v2.z, aw2) / w_sum;
                 if z >= *row_depth.add(x as usize) {
                     break 'scalar;
                 }
@@ -1269,7 +1415,7 @@ pub unsafe fn draw_triangle_barycentric_strip(
                 let b0b = aw0 * inv_w_sum;
                 let b1b = aw1 * inv_w_sum;
                 let b2b = aw2 * inv_w_sum;
-                let inv_w = v0.inv_w * b0b + v1.inv_w * b1b + v2.inv_w * b2b;
+                let inv_w = interp3s(v0.inv_w, b0b, v1.inv_w, b1b, v2.inv_w, b2b);
 
                 if shader == TriangleShader::DebugUnlitRed {
                     *row_pixels.add(x as usize) = pixel::pack_rgb_fast(format, 255, 0, 0);
@@ -1279,12 +1425,14 @@ pub unsafe fn draw_triangle_barycentric_strip(
                     break 'scalar;
                 }
                 if shader == TriangleShader::LuminaireCone {
-                    let ex = (ex0_w * b0b + ex1_w * b1b + ex2_w * b2b) / inv_w;
-                    let ey = (ey0_w * b0b + ey1_w * b1b + ey2_w * b2b) / inv_w;
-                    let ez = (ez0_w * b0b + ez1_w * b1b + ez2_w * b2b) / inv_w;
-                    let mut nx = (nx0_w * b0b + nx1_w * b1b + nx2_w * b2b) / inv_w;
-                    let mut ny = (ny0_w * b0b + ny1_w * b1b + ny2_w * b2b) / inv_w;
-                    let mut nz = (nz0_w * b0b + nz1_w * b1b + nz2_w * b2b) / inv_w;
+                    // One reciprocal instead of a divide per varying.
+                    let persp = 1.0 / inv_w;
+                    let ex = interp3s(ex0_w, b0b, ex1_w, b1b, ex2_w, b2b) * persp;
+                    let ey = interp3s(ey0_w, b0b, ey1_w, b1b, ey2_w, b2b) * persp;
+                    let ez = interp3s(ez0_w, b0b, ez1_w, b1b, ez2_w, b2b) * persp;
+                    let mut nx = interp3s(nx0_w, b0b, nx1_w, b1b, nx2_w, b2b) * persp;
+                    let mut ny = interp3s(ny0_w, b0b, ny1_w, b1b, ny2_w, b2b) * persp;
+                    let mut nz = interp3s(nz0_w, b0b, nz1_w, b1b, nz2_w, b2b) * persp;
 
                     let px = ex - light_pos.x;
                     let py = ey - light_pos.y;
@@ -1527,46 +1675,22 @@ pub unsafe fn draw_spotlight_cone_strip(
 
 const KERNEL_SIZE: usize = 8;
 
-struct SsaoKernel {
-    x: [f32; KERNEL_SIZE],
-    y: [f32; KERNEL_SIZE],
-    z: [f32; KERNEL_SIZE],
-}
-
-fn ssao_kernel() -> &'static SsaoKernel {
-    static KERNEL: OnceLock<SsaoKernel> = OnceLock::new();
-    KERNEL.get_or_init(|| {
-        let mut t = SsaoKernel { x: [0.0; KERNEL_SIZE], y: [0.0; KERNEL_SIZE], z: [0.0; KERNEL_SIZE] };
-        let mut s: u32 = 0x9e37_79b9;
-        let mut rnd = |state: &mut u32| -> f32 {
-            *state ^= *state << 13;
-            *state ^= *state >> 17;
-            *state ^= *state << 5;
-            (*state & 0xffffff) as f32 / 16_777_216.0
-        };
-        for i in 0..KERNEL_SIZE {
-            let mut vx = rnd(&mut s) * 2.0 - 1.0;
-            let mut vy = rnd(&mut s) * 2.0 - 1.0;
-            let mut vz = rnd(&mut s);
-            let mut l = (vx * vx + vy * vy + vz * vz).sqrt();
-            if l < 1e-4 {
-                vx = 0.0;
-                vy = 0.0;
-                vz = 1.0;
-                l = 1.0;
-            }
-            vx /= l;
-            vy /= l;
-            vz /= l;
-            let f = i as f32 / KERNEL_SIZE as f32;
-            let scale = 0.1 + 0.9 * f * f;
-            t.x[i] = vx * scale;
-            t.y[i] = vy * scale;
-            t.z[i] = vz * scale;
-        }
-        t
-    })
-}
+// The 8-tap probe kernel: the exact f32 output of the original runtime
+// xorshift(0x9e3779b9) builder, baked as constants so LLVM can fold them and
+// no OnceLock acquire sits in front of every access. Laid out as two 4-lane
+// groups for the 4-wide tap loop.
+const SSAO_KERNEL_X: [f32; KERNEL_SIZE] = [
+    -0.0683465824, 0.00404883549, -0.0776575431, -0.210358173,
+    0.210788339, 0.4452205, 0.272752583, -0.395155162,
+];
+const SSAO_KERNEL_Y: [f32; KERNEL_SIZE] = [
+    -0.0482316241, -0.0847317502, 0.105948374, 0.0483768173,
+    -0.244583279, -0.0324222147, 0.377577662, 0.257806689,
+];
+const SSAO_KERNEL_Z: [f32; KERNEL_SIZE] = [
+    0.0547946692, 0.0762521625, 0.0846067965, 0.0688453987,
+    0.0370444469, 0.0680896118, 0.388046622, 0.632461667,
+];
 
 pub unsafe fn apply_ssao_strip(
     pixels: *mut u32,
@@ -1584,7 +1708,6 @@ pub unsafe fn apply_ssao_strip(
     proj00: f32,
     proj11: f32,
 ) {
-    let kernel = ssao_kernel();
     let world_radius = 0.7f32;
     let depth_bias = 0.03f32;
     let ao_intensity = 1.25f32;
@@ -1632,7 +1755,7 @@ pub unsafe fn apply_ssao_strip(
             }
 
             let fphase = 5.588238 * (frame_index & 63) as f32;
-            let mut na = 0.06711056 * x as f32 + 0.00583715 * y as f32 + fphase;
+            let mut na = fma1(0.06711056, x as f32, fma1(0.00583715, y as f32, fphase));
             na = 52.9829189 * (na - na.floor());
             let ang = (na - na.floor()) * 6.28318531;
             let rcos = ang.cos();
@@ -1667,11 +1790,82 @@ pub unsafe fn apply_ssao_strip(
                 radius = max_world;
             }
 
+            // 4-wide masked tap loop: two groups of four independent probes.
+            // All arithmetic runs branchless under lane masks; the only scalar
+            // step is the depth gather (four indexed loads).
             let mut occlusion = 0.0f32;
+            #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
+            {
+                let vzero = F32x4::splat(0.0);
+                let vone = F32x4::splat(1.0);
+                let txv = F32x4::splat(tx);
+                let tyv = F32x4::splat(ty);
+                let tzv = F32x4::splat(tz);
+                let bxv = F32x4::splat(bx);
+                let byv = F32x4::splat(by);
+                let bzv = F32x4::splat(bz);
+                let nxv = F32x4::splat(nx);
+                let nyv = F32x4::splat(ny);
+                let nzv = F32x4::splat(nz);
+                let czv = F32x4::splat(cz);
+                let rv = F32x4::splat(radius);
+                for g in 0..2 {
+                    let kxv = F32x4::load(SSAO_KERNEL_X.as_ptr().add(g * 4));
+                    let kyv = F32x4::load(SSAO_KERNEL_Y.as_ptr().add(g * 4));
+                    let kzv = F32x4::load(SSAO_KERNEL_Z.as_ptr().add(g * 4));
+                    let ox = (txv * kxv).fma(bxv, kyv).fma(nxv, kzv);
+                    let oy = (tyv * kxv).fma(byv, kyv).fma(nyv, kzv);
+                    let oz = (tzv * kxv).fma(bzv, kyv).fma(nzv, kzv);
+                    let spx = F32x4::splat(cx).fma(ox, rv);
+                    let spy = F32x4::splat(cy).fma(oy, rv);
+                    let spz = czv.fma(oz, rv);
+                    let valid = spz.lt(F32x4::splat(-0.0001));
+                    if !valid.any() {
+                        continue;
+                    }
+                    let inv_cw = F32x4::splat(-1.0) / spz; // masked lanes may be garbage; never selected
+                    let s_ndc_x = (F32x4::splat(proj00) * spx) * inv_cw;
+                    let s_ndc_y = (F32x4::splat(proj11) * spy) * inv_cw;
+                    // round(((s+1)*0.5*extent) - 0.5 + 0.5) == floor((s+1)*half_extent)
+                    let sxf = ((s_ndc_x + vone) * F32x4::splat(0.5 * screen_width as f32)).floor();
+                    let syf = ((vone - s_ndc_y) * F32x4::splat(0.5 * screen_height as f32)).floor();
+                    let mask = valid
+                        .and(sxf.ge(vzero))
+                        .and(sxf.lt(F32x4::splat(screen_width as f32)))
+                        .and(syf.ge(vzero))
+                        .and(syf.lt(F32x4::splat(screen_height as f32)));
+                    if !mask.any() {
+                        continue;
+                    }
+                    let lane_mask = mask.to_array();
+                    let sxa = sxf.to_array();
+                    let sya = syf.to_array();
+                    let spza = spz.to_array();
+                    let mut gz = [0.0f32; 4];
+                    for l in 0..4 {
+                        // Off-screen/behind lanes get geom_z == spz, which the
+                        // biased compare below always rejects.
+                        gz[l] = if lane_mask[l] != 0 {
+                            -*linear_z.add((sya[l] as i32 * screen_width + sxa[l] as i32) as usize)
+                        } else {
+                            spza[l]
+                        };
+                    }
+                    let gzv = F32x4::from_array(gz);
+                    let hit = gzv.ge(spz + F32x4::splat(depth_bias)).and(mask);
+                    if !hit.any() {
+                        continue;
+                    }
+                    let rc = (F32x4::splat(world_radius) / (czv - gzv).abs()).min(vone);
+                    let rc = rc * rc * F32x4::splat(3.0).fma(rc, F32x4::splat(-2.0));
+                    occlusion += hit.select(rc, vzero).reduce_add();
+                }
+            }
+            #[cfg(not(any(target_arch = "aarch64", target_arch = "wasm32")))]
             for i in 0..KERNEL_SIZE {
-                let kx = kernel.x[i];
-                let ky = kernel.y[i];
-                let kz = kernel.z[i];
+                let kx = SSAO_KERNEL_X[i];
+                let ky = SSAO_KERNEL_Y[i];
+                let kz = SSAO_KERNEL_Z[i];
                 let ox = tx * kx + bx * ky + nx * kz;
                 let oy = ty * kx + by * ky + ny * kz;
                 let oz = tz * kx + bz * ky + nz * kz;
@@ -1681,9 +1875,9 @@ pub unsafe fn apply_ssao_strip(
                 if spz >= -0.0001 {
                     continue;
                 }
-                let clip_w = -spz;
-                let s_ndc_x = (proj00 * spx) / clip_w;
-                let s_ndc_y = (proj11 * spy) / clip_w;
+                let inv_cw = -1.0 / spz;
+                let s_ndc_x = (proj00 * spx) * inv_cw;
+                let s_ndc_y = (proj11 * spy) * inv_cw;
                 let sx = ((s_ndc_x + 1.0) * 0.5 * screen_width as f32 - 0.5).round() as i32;
                 let sy = ((1.0 - s_ndc_y) * 0.5 * screen_height as f32 - 0.5).round() as i32;
                 if sx < 0 || sx >= screen_width || sy < 0 || sy >= screen_height {

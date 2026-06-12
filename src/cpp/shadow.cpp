@@ -67,68 +67,54 @@ float sample_shadow_compare_bilinear(const ShadowDepth* shadow_depth, int shadow
 float sample_shadow_compare_bilinear_2x2(const ShadowDepth* shadow_depth, int shadow_size,
                                          float s, float t, float r) {
     if (!shadow_depth || shadow_size <= 0) return 1.0f;
-    float texel = 1.0f / (float)(shadow_size - 1);
-#if defined(__ARM_NEON)
-    if (s >= texel && s <= 1.0f - 2.0f * texel &&
-        t >= texel && t <= 1.0f - 2.0f * texel &&
-        r >= 0.0f && r <= 1.0f) {
-        ShadowDepth r16 = shadow_depth_to_u16(r);
-        float visibility[16];
-        int idx = 0;
-        for (int oy = 0; oy <= 1; oy++) {
-            for (int ox = 0; ox <= 1; ox++) {
-                float ps = s + (ox - 0.5f) * texel;
-                float pt = t + (oy - 0.5f) * texel;
-                float fx = ps * (shadow_size - 1);
-                float fy = pt * (shadow_size - 1);
-                int x0 = (int)floorf(fx);
-                int y0 = (int)floorf(fy);
-                uint16_t d[4] = {
-                    shadow_depth[(size_t)y0 * shadow_size + x0],
-                    shadow_depth[(size_t)y0 * shadow_size + x0 + 1],
-                    shadow_depth[(size_t)(y0 + 1) * shadow_size + x0],
-                    shadow_depth[(size_t)(y0 + 1) * shadow_size + x0 + 1]
-                };
-                uint16x4_t depths  = vld1_u16(d);
-                uint16x4_t biased  = vqadd_u16(depths, vdup_n_u16(SHADOW_DEPTH_BIAS_U16));
-                uint16x4_t visible = vcge_u16(biased, vdup_n_u16(r16));
-                uint16_t mask[4];
-                vst1_u16(mask, visible);
-                visibility[idx++] = mask[0] ? 1.0f : 0.0f;
-                visibility[idx++] = mask[1] ? 1.0f : 0.0f;
-                visibility[idx++] = mask[2] ? 1.0f : 0.0f;
-                visibility[idx++] = mask[3] ? 1.0f : 0.0f;
-            }
-        }
+    if (r < 0.0f || r > 1.0f) return 1.0f;
 
-        idx = 0;
-        float sum = 0.0f;
-        for (int oy = 0; oy <= 1; oy++) {
-            for (int ox = 0; ox <= 1; ox++) {
-                float ps = s + (ox - 0.5f) * texel;
-                float pt = t + (oy - 0.5f) * texel;
-                float fx = ps * (shadow_size - 1);
-                float fy = pt * (shadow_size - 1);
-                float tx = fx - floorf(fx);
-                float ty = fy - floorf(fy);
-                float c00 = visibility[idx++];
-                float c10 = visibility[idx++];
-                float c01 = visibility[idx++];
-                float c11 = visibility[idx++];
-                float cx0 = c00 + (c10 - c00) * tx;
-                float cx1 = c01 + (c11 - c01) * tx;
-                sum += cx0 + (cx1 - cx0) * ty;
-            }
+    // The four bilinear taps sit at +/-0.5 texel around (fx,fy); together they
+    // touch one 3x3 texel block. Resolve each of the 9 compares once instead of
+    // refetching the 16 overlapping texels the naive 2x2 did (ported from the
+    // Zig/Rust/Odin builds; the old NEON-gated fast path also left the wasm
+    // build on the worst-case scalar fallback). Compares are branchless.
+    float sizef = (float)(shadow_size - 1);
+    uint32_t r16 = (uint32_t)shadow_depth_to_u16(r);
+
+    float fx = s * sizef;
+    float fy = t * sizef;
+    int   nx = (int)floorf(fx);
+    int   ny = (int)floorf(fy);
+    float fxr = fx - (float)nx;
+    float fyr = fy - (float)ny;
+
+    // The two taps along each axis share the same fractional weight and select
+    // adjacent 2x2 windows {0,1} and {1,2} of the block.
+    float wx = fxr < 0.5f ? fxr + 0.5f : fxr - 0.5f;
+    float wy = fyr < 0.5f ? fyr + 0.5f : fyr - 0.5f;
+
+    // Callers gate this sampler on the spotlight cone, so lit pixels land on
+    // the map; the clamp is a branch-free safety backstop.
+    int max_base = shadow_size - 3;
+    int col_base = std::min(std::max(fxr < 0.5f ? nx - 1 : nx, 0), max_base);
+    int row_base = std::min(std::max(fyr < 0.5f ? ny - 1 : ny, 0), max_base);
+
+    const uint32_t bias = SHADOW_DEPTH_BIAS_U16;
+    float grid[3][3];
+    for (int gy = 0; gy < 3; gy++) {
+        size_t base = (size_t)(row_base + gy) * shadow_size + col_base;
+        for (int gx = 0; gx < 3; gx++) {
+            uint32_t biased = std::min(0xffffu, (uint32_t)shadow_depth[base + gx] + bias);
+            grid[gy][gx] = (float)(r16 <= biased);
         }
-        return sum * 0.25f;
     }
-#endif
+
     float sum = 0.0f;
-    for (int oy = 0; oy <= 1; oy++) {
-        for (int ox = 0; ox <= 1; ox++) {
-            sum += sample_shadow_compare_bilinear(shadow_depth, shadow_size,
-                                                  s + (ox - 0.5f) * texel,
-                                                  t + (oy - 0.5f) * texel, r);
+    for (int oy = 0; oy < 2; oy++) {
+        for (int ox = 0; ox < 2; ox++) {
+            float c00 = grid[oy][ox];
+            float c10 = grid[oy][ox + 1];
+            float c01 = grid[oy + 1][ox];
+            float c11 = grid[oy + 1][ox + 1];
+            float cx0 = c00 + (c10 - c00) * wx;
+            float cx1 = c01 + (c11 - c01) * wx;
+            sum += cx0 + (cx1 - cx0) * wy;
         }
     }
     return sum * 0.25f;
