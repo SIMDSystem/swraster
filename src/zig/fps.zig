@@ -30,6 +30,6 @@ pub const FpsCounter = struct {
     pub fn draw(self: *const FpsCounter, pixels: [*]u8, pitch: i32, surface_w: i32, format: *const PixelFormat) void {
         const fps_x = surface_w - 50;
         const fps_y: i32 = 20;
-        pixel.draw_number(pixels, pitch, fps_x, fps_y, self.fps, 255, 255, 255, format);
+        pixel.drawNumber(pixels, pitch, fps_x, fps_y, self.fps, 255, 255, 255, format);
     }
 };

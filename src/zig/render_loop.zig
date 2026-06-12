@@ -37,14 +37,14 @@ fn greaterZ(_: void, a: RenderTriangle, b: RenderTriangle) bool {
     return a.sort_z > b.sort_z;
 }
 
-fn reset_animation(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_physics_time: *u64) void {
+fn resetAnimation(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_physics_time: *u64) void {
     const pp = ctx.physics;
 
-    physics_pipeline.physics_wait_for_idle(pp);
+    physics_pipeline.physicsWaitForIdle(pp);
     sim_time.* = 0.0;
     frame_num.* = 1;
-    ctx.fps_counter.start(platform.TicksMs());
-    last_physics_time.* = platform.TicksMs();
+    ctx.fps_counter.start(platform.ticksMs());
+    last_physics_time.* = platform.ticksMs();
 
     for (ctx.walls.items) |wall| {
         jolt.jph_body_set_position_and_rotation(pp.body_interface.?, wall.id, wall.local_pos, jolt.Quat.identity(), .activate);
@@ -70,9 +70,9 @@ fn reset_animation(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_
     jolt.jph_physics_system_optimize_broadphase(pp.system.?);
 
     for (&pp.pose_snapshots) |*snapshot| {
-        scene.write_instance_pose_snapshot(snapshot, instances, 0.0, 0);
+        scene.writeInstancePoseSnapshot(snapshot, instances, 0.0, 0);
     }
-    physics_pipeline.physics_reset_pipeline_state(pp);
+    physics_pipeline.physicsResetPipelineState(pp);
 
     const nb: usize = @intCast(config.NUM_TILE_BINS);
     for (0..2) |b| {
@@ -105,11 +105,11 @@ fn reset_animation(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_
 }
 
 var merge_warned = false;
-// merge_tl_globals runs single-threaded (the render loop), so one reusable
+// mergeTlGlobals runs single-threaded (the render loop), so one reusable
 // scratch for the O(n) two-run merges is enough and avoids per-frame allocs.
-var g_merge_scratch: ?RenderTriangleList = null;
+var g_merge_scratch: RenderTriangleList = .empty;
 
-fn append_limited(dst: *RenderTriangleList, dst_count: *usize, src: []const RenderTriangle, dropped: *usize, keep_sorted: bool, scratch: *RenderTriangleList, comptime less: fn (void, RenderTriangle, RenderTriangle) bool) void {
+fn appendLimited(dst: *RenderTriangleList, dst_count: *usize, src: []const RenderTriangle, dropped: *usize, keep_sorted: bool, scratch: *RenderTriangleList, comptime less: fn (void, RenderTriangle, RenderTriangle) bool) void {
     const room = if (dst_count.* < dst.items.len) dst.items.len - dst_count.* else 0;
     const write_count = @min(room, src.len);
     const mid = dst_count.*;
@@ -125,7 +125,7 @@ fn append_limited(dst: *RenderTriangleList, dst_count: *usize, src: []const Rend
     dropped.* += src.len - write_count;
 }
 
-fn merge_tl_globals(ctx: *RendererContext, tl_buf_idx: usize) void {
+fn mergeTlGlobals(ctx: *RendererContext, tl_buf_idx: usize) void {
     var count_opaque: usize = 0;
     var count_trans: usize = 0;
     var count_shadow: usize = 0;
@@ -133,18 +133,15 @@ fn merge_tl_globals(ctx: *RendererContext, tl_buf_idx: usize) void {
     var dropped_trans: usize = 0;
     var dropped_shadow: usize = 0;
 
-    if (g_merge_scratch == null) {
-        g_merge_scratch = RenderTriangleList.init(ctx.opaque_buffers[tl_buf_idx].triangles.allocator);
-    }
-    const scratch = &g_merge_scratch.?;
+    const scratch = &g_merge_scratch;
 
     const k_eff = threading.active_tl_job_thread_count;
     var tid: i32 = 0;
     while (tid < k_eff) : (tid += 1) {
         const out = &ctx.tl_thread_outputs.items[@intCast(tid)];
-        append_limited(&ctx.opaque_buffers[tl_buf_idx].triangles, &count_opaque, out.opaque_list.items, &dropped_opaque, config.ENABLE_RGB_TRIANGLE_SORT, scratch, lessZ);
-        append_limited(&ctx.trans_buffers[tl_buf_idx].triangles, &count_trans, out.trans.items, &dropped_trans, config.ENABLE_RGB_TRIANGLE_SORT, scratch, greaterZ);
-        append_limited(&ctx.shadow_buffers[tl_buf_idx].triangles, &count_shadow, out.shadow.items, &dropped_shadow, config.ENABLE_SHADOW_TRIANGLE_SORT, scratch, lessZ);
+        appendLimited(&ctx.opaque_buffers[tl_buf_idx].triangles, &count_opaque, out.opaque_list.items, &dropped_opaque, config.ENABLE_RGB_TRIANGLE_SORT, scratch, lessZ);
+        appendLimited(&ctx.trans_buffers[tl_buf_idx].triangles, &count_trans, out.trans.items, &dropped_trans, config.ENABLE_RGB_TRIANGLE_SORT, scratch, greaterZ);
+        appendLimited(&ctx.shadow_buffers[tl_buf_idx].triangles, &count_shadow, out.shadow.items, &dropped_shadow, config.ENABLE_SHADOW_TRIANGLE_SORT, scratch, lessZ);
     }
 
     if (dropped_opaque != 0 or dropped_trans != 0 or dropped_shadow != 0) {
@@ -159,34 +156,34 @@ fn merge_tl_globals(ctx: *RendererContext, tl_buf_idx: usize) void {
     ctx.shadow_buffers[tl_buf_idx].count = count_shadow;
 }
 
-fn shrink_if_bloated(v: *RenderTriangleList) void {
+fn shrinkIfBloated(v: *RenderTriangleList) void {
     if (v.capacity > v.items.len * 4 + 32) {
-        v.shrinkAndFree(v.items.len);
+        v.shrinkAndFree(std.heap.c_allocator, v.items.len);
     }
 }
 
-fn periodic_capacity_shrink(ctx: *RendererContext) void {
+fn periodicCapacityShrink(ctx: *RendererContext) void {
     const nb: usize = @intCast(config.NUM_TILE_BINS);
     for (0..2) |b| {
         for (0..nb) |s| {
-            shrink_if_bloated(&ctx.opaque_strip_buffers[b].bins[s]);
-            shrink_if_bloated(&ctx.trans_strip_buffers[b].bins[s]);
-            shrink_if_bloated(&ctx.shadow_strip_buffers[b].bins[s]);
+            shrinkIfBloated(&ctx.opaque_strip_buffers[b].bins[s]);
+            shrinkIfBloated(&ctx.trans_strip_buffers[b].bins[s]);
+            shrinkIfBloated(&ctx.shadow_strip_buffers[b].bins[s]);
         }
     }
     for (ctx.tl_thread_outputs.items) |*out| {
-        shrink_if_bloated(&out.opaque_list);
-        shrink_if_bloated(&out.trans);
-        shrink_if_bloated(&out.shadow);
+        shrinkIfBloated(&out.opaque_list);
+        shrinkIfBloated(&out.trans);
+        shrinkIfBloated(&out.shadow);
         for (0..nb) |s| {
-            shrink_if_bloated(&out.opaque_bins[s]);
-            shrink_if_bloated(&out.trans_bins[s]);
-            shrink_if_bloated(&out.shadow_bins[s]);
+            shrinkIfBloated(&out.opaque_bins[s]);
+            shrinkIfBloated(&out.trans_bins[s]);
+            shrinkIfBloated(&out.shadow_bins[s]);
         }
     }
 }
 
-fn write_variant_row(ctx: *RendererContext, prefix: []const u8, frames: i32, elapsed_ms: u64, total_frames: u64, total_elapsed_ms: u64) void {
+fn writeVariantRow(ctx: *RendererContext, prefix: []const u8, frames: i32, elapsed_ms: u64, total_frames: u64, total_elapsed_ms: u64) void {
     const tp = ctx.thread_perf;
     const log = tp.log orelse return;
     const ff: f64 = @floatFromInt(frames);
@@ -206,12 +203,12 @@ fn write_variant_row(ctx: *RendererContext, prefix: []const u8, frames: i32, ela
     } else |_| {}
 }
 
-fn threadperf_advance_variant(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_physics_time: *u64, running: *bool) void {
+fn threadperfAdvanceVariant(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_physics_time: *u64, running: *bool) void {
     const tp = ctx.thread_perf;
     const pp = ctx.physics;
 
-    physics_pipeline.physics_wait_for_idle(pp);
-    const current_time = platform.TicksMs();
+    physics_pipeline.physicsWaitForIdle(pp);
+    const current_time = platform.ticksMs();
     {
         pp.mtx.lock();
         defer pp.mtx.unlock();
@@ -223,7 +220,7 @@ fn threadperf_advance_variant(ctx: *RendererContext, sim_time: *f32, frame_num: 
     const elapsed_ms = current_time - tp.variant_start_ticks;
     tp.total_frames += @intCast(tp.frames_this_variant);
     const total_elapsed_ms = current_time - tp.search_start_ticks;
-    write_variant_row(ctx, "", tp.frames_this_variant, elapsed_ms, tp.total_frames, total_elapsed_ms);
+    writeVariantRow(ctx, "", tp.frames_this_variant, elapsed_ms, tp.total_frames, total_elapsed_ms);
     if (tp.log) |log| _ = fflush(log);
 
     tp.variant_index += 1;
@@ -241,13 +238,13 @@ fn threadperf_advance_variant(ctx: *RendererContext, sim_time: *f32, frame_num: 
         tp.physics_cpu_ms_this_variant = 0.0;
         tp.physics_update_ms_this_variant = 0.0;
         tp.physics_sync_ms_this_variant = 0.0;
-        reset_animation(ctx, sim_time, frame_num, last_physics_time);
-        tp.variant_start_ticks = platform.TicksMs();
+        resetAnimation(ctx, sim_time, frame_num, last_physics_time);
+        tp.variant_start_ticks = platform.ticksMs();
         dbg.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
     }
 }
 
-fn threadperf_write_partial_at_exit(ctx: *RendererContext) void {
+fn threadperfWritePartialAtExit(ctx: *RendererContext) void {
     const tp = ctx.thread_perf;
     const pp = ctx.physics;
     const log = tp.log orelse return;
@@ -260,11 +257,11 @@ fn threadperf_write_partial_at_exit(ctx: *RendererContext) void {
             tp.physics_update_ms_this_variant = pp.update_wall_ms_accum;
             tp.physics_sync_ms_this_variant = pp.sync_wall_ms_accum;
         }
-        const now = platform.TicksMs();
+        const now = platform.ticksMs();
         const elapsed_ms = now - tp.variant_start_ticks;
         const partial_total = tp.total_frames + @as(u64, @intCast(tp.frames_this_variant));
         const total_elapsed_ms = now - tp.search_start_ticks;
-        write_variant_row(ctx, "partial ", tp.frames_this_variant, elapsed_ms, partial_total, total_elapsed_ms);
+        writeVariantRow(ctx, "partial ", tp.frames_this_variant, elapsed_ms, partial_total, total_elapsed_ms);
     }
     _ = std.c.fclose(log);
     tp.log = null;
@@ -274,7 +271,7 @@ fn threadperf_write_partial_at_exit(ctx: *RendererContext) void {
 var last_aspect: f32 = 0.0;
 var ll_projection: Mat4 = Mat4.identity();
 
-pub fn run_render_loop(ctx: *RendererContext) void {
+pub fn runRenderLoop(ctx: *RendererContext) void {
     const pp = ctx.physics;
     const tp = ctx.thread_perf;
 
@@ -297,12 +294,12 @@ pub fn run_render_loop(ctx: *RendererContext) void {
     var sim_time: f32 = 0.0;
     var frame_num: i32 = 1;
     var frame_sequence: i32 = 1;
-    var last_physics_time: u64 = platform.TicksMs();
+    var last_physics_time: u64 = platform.ticksMs();
 
-    ctx.fps_counter.start(platform.TicksMs());
+    ctx.fps_counter.start(platform.ticksMs());
 
     {
-        const now_ts = platform.PerfCounter();
+        const now_ts = platform.perfCounter();
         ctx.profiler.present_history[0].start_ts = now_ts;
         ctx.profiler.present_history[0].end_ts = now_ts;
         ctx.profiler.present_history[1].start_ts = now_ts;
@@ -310,21 +307,21 @@ pub fn run_render_loop(ctx: *RendererContext) void {
     }
 
     if (tp.enabled) {
-        reset_animation(ctx, &sim_time, &frame_num, &last_physics_time);
-        tp.search_start_ticks = platform.TicksMs();
+        resetAnimation(ctx, &sim_time, &frame_num, &last_physics_time);
+        tp.search_start_ticks = platform.ticksMs();
         tp.variant_start_ticks = tp.search_start_ticks;
         dbg.print("Thread perf variant {d}/{d}: TL={d} raster={d} frames={d}\n", .{ tp.variant_index + 1, tp.variants.items.len, config.NUM_TL_THREADS, config.NUM_RASTER_THREADS, tp.frames_per_variant });
     }
-    var window_renderable = platform.IsRenderable();
+    var window_renderable = platform.isRenderable();
 
     while (running) {
-        while (platform.PollEvent(&event)) {
+        while (platform.pollEvent(&event)) {
             switch (event.type) {
                 .Quit => running = false,
                 .VisibilityChanged => {
                     window_renderable = event.visible;
                     if (!event.visible) camera_orbiting = false;
-                    last_physics_time = platform.TicksMs();
+                    last_physics_time = platform.ticksMs();
                 },
                 .KeyDown => {
                     if (event.key == ' ') {
@@ -401,24 +398,24 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         }
 
         if (!running) break;
-        window_renderable = platform.IsRenderable();
+        window_renderable = platform.isRenderable();
         if (!window_renderable) {
             camera_orbiting = false;
-            last_physics_time = platform.TicksMs();
-            platform.Delay(16);
+            last_physics_time = platform.ticksMs();
+            platform.delay(16);
             continue;
         }
 
-        const fb = platform.GetFramebuffer() orelse {
+        const fb = platform.getFramebuffer() orelse {
             camera_orbiting = false;
-            last_physics_time = platform.TicksMs();
-            platform.Delay(16);
+            last_physics_time = platform.ticksMs();
+            platform.delay(16);
             continue;
         };
         if (fb.format == null or fb.format.?.BytesPerPixel != 4) {
             camera_orbiting = false;
-            last_physics_time = platform.TicksMs();
-            platform.Delay(16);
+            last_physics_time = platform.ticksMs();
+            platform.delay(16);
             continue;
         }
         const fb_w: i32 = @intCast(fb.w);
@@ -428,19 +425,19 @@ pub fn run_render_loop(ctx: *RendererContext) void {
             ctx.screen_height = fb_h;
             const npix: usize = @intCast(fb_w * fb_h);
             ctx.depth_buffer.clearRetainingCapacity();
-            ctx.depth_buffer.appendNTimes(1.0, npix) catch unreachable;
+            ctx.depth_buffer.appendNTimes(std.heap.c_allocator, 1.0, npix) catch unreachable;
             ctx.normal_buffer.clearRetainingCapacity();
-            ctx.normal_buffer.appendNTimes(0.0, npix * 3) catch unreachable;
+            ctx.normal_buffer.appendNTimes(std.heap.c_allocator, 0.0, npix * 3) catch unreachable;
             ctx.linear_z_buffer.clearRetainingCapacity();
-            ctx.linear_z_buffer.appendNTimes(config.LINEAR_Z_SKY, npix) catch unreachable;
-            last_physics_time = platform.TicksMs();
+            ctx.linear_z_buffer.appendNTimes(std.heap.c_allocator, config.LINEAR_Z_SKY, npix) catch unreachable;
+            last_physics_time = platform.ticksMs();
         }
         ctx.fb = fb;
 
         const pixels: [*]u8 = @ptrCast(fb.pixels.?);
         const pitch: i32 = @intCast(fb.pitch);
 
-        const now = platform.TicksMs();
+        const now = platform.ticksMs();
         var delta_time = @as(f32, @floatFromInt(now - last_physics_time)) / 1000.0;
         last_physics_time = now;
 
@@ -454,11 +451,11 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         const pose_read_idx = pp.published_snapshot.load(.acquire);
         sim_time = pp.pose_snapshots[@intCast(pose_read_idx)].sim_time;
         const time = sim_time;
-        physics_pipeline.physics_arm_after_tl(pp, delta_time, time + delta_time);
+        physics_pipeline.physicsArmAfterTl(pp, delta_time, time + delta_time);
 
         const aspect = @as(f32, @floatFromInt(fb.w)) / @as(f32, @floatFromInt(fb.h));
         if (aspect != last_aspect) {
-            ll_projection = clip.build_projection_matrix(60.0, aspect, config.NEAR_PLANE, config.CAMERA_FAR_PLANE);
+            ll_projection = clip.buildProjectionMatrix(60.0, aspect, config.NEAR_PLANE, config.CAMERA_FAR_PLANE);
             last_aspect = aspect;
         }
         const projection = ll_projection;
@@ -508,11 +505,11 @@ pub fn run_render_loop(ctx: *RendererContext) void {
 
             const light_view_world = clip.lookAt(light_pos_world, light_target_world, Vec3.init(0, 1, 0));
             shadow_view_matrix = light_view_world.mul(view_matrix.inverse());
-            shadow_matrix = clip.build_spot_shadow_tex_matrix(&shadow_view_matrix, 60.0, shadow_near, shadow_far);
+            shadow_matrix = clip.buildSpotShadowTexMatrix(&shadow_view_matrix, 60.0, shadow_near, shadow_far);
         } else {
             const light_dir_world = Vec3.init(1, 2, 1).normalized();
             light_dir = view_matrix.block33().mulVec3(light_dir_world).normalized();
-            shadow_matrix = clip.build_shadow_tex_matrix(&view_matrix, light_dir, shadow_scene_min, shadow_scene_max);
+            shadow_matrix = clip.buildShadowTexMatrix(&view_matrix, light_dir, shadow_scene_min, shadow_scene_max);
         }
 
         const instance_depths = ctx.instance_depths;
@@ -522,20 +519,20 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         occluders_eye.clearRetainingCapacity();
 
         const cube_inner_occluder_radius: f32 = 1.0;
-        const sphere_inner_occluder_radius = ctx.sphere_bound_radius;
+        const sphere_inner_occluder_radius = ctx.meshes[@intCast(@intFromEnum(scene.InstanceType.sphere))].bound_radius;
         const read_snapshot = &pp.pose_snapshots[@intCast(pose_read_idx)];
         for (instances.items, read_snapshot.poses.items, 0..) |inst, pose, i| {
             const center_view = view_matrix.mulVec4(Vec4.init(pose.tx, pose.ty, pose.tz, 1.0));
-            instance_depths.append(.{ .depth = center_view.z, .index = i }) catch unreachable;
+            instance_depths.append(std.heap.c_allocator, .{ .depth = center_view.z, .index = i }) catch unreachable;
             if (inst.type == .cube) {
-                occluders_eye.append(.{ .eye_pos = center_view.head3(), .inner_radius = cube_inner_occluder_radius }) catch unreachable;
+                occluders_eye.append(std.heap.c_allocator, .{ .eye_pos = center_view.head3(), .inner_radius = cube_inner_occluder_radius }) catch unreachable;
             } else if (inst.type == .sphere) {
-                occluders_eye.append(.{ .eye_pos = center_view.head3(), .inner_radius = sphere_inner_occluder_radius }) catch unreachable;
+                occluders_eye.append(std.heap.c_allocator, .{ .eye_pos = center_view.head3(), .inner_radius = sphere_inner_occluder_radius }) catch unreachable;
             }
         }
 
         const SortCtx = struct {
-            insts: *const std.array_list.Managed(scene.CubeInstance),
+            insts: *const std.ArrayList(scene.CubeInstance),
             fn less(self: @This(), a: buffers.InstanceDepth, b: buffers.InstanceDepth) bool {
                 const type_a = self.insts.items[a.index].type;
                 const type_b = self.insts.items[b.index].type;
@@ -562,20 +559,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         const tl_shared = ctx.tl_shared;
         tl_shared.instances = ctx.instances;
         tl_shared.sorted_instances = instance_depths;
-        tl_shared.cube_vertices = ctx.cube_vertices;
-        tl_shared.cube_faces = ctx.cube_faces;
-        tl_shared.sphere_vertices = ctx.sphere_vertices;
-        tl_shared.sphere_faces = ctx.sphere_faces;
-        tl_shared.torus_vertices = ctx.torus_vertices;
-        tl_shared.torus_faces = ctx.torus_faces;
-        tl_shared.teapot_vertices = ctx.teapot_vertices;
-        tl_shared.teapot_faces = ctx.teapot_faces;
-        tl_shared.smallball_vertices = ctx.smallball_vertices;
-        tl_shared.smallball_faces = ctx.smallball_faces;
-        tl_shared.ground_vertices = ctx.ground_vertices;
-        tl_shared.ground_faces = ctx.ground_faces;
-        tl_shared.lamp_vertices = ctx.lamp_vertices;
-        tl_shared.lamp_faces = ctx.lamp_faces;
+        tl_shared.meshes = ctx.meshes;
         tl_shared.opaque_triangles = &ctx.opaque_buffers[tl_buf_idx].triangles;
         tl_shared.trans_triangles = &ctx.trans_buffers[tl_buf_idx].triangles;
         tl_shared.shadow_triangles = &ctx.shadow_buffers[tl_buf_idx].triangles;
@@ -637,7 +621,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         const do_raster = (frame_num > 1);
 
         if (do_raster) {
-            const clear_color = pixel.pack_rgb_fast(fb.format.?, 45, 45, 45);
+            const clear_color = pixel.packRgbFast(fb.format.?, 45, 45, 45);
             const rs = &ctx.raster_shared[raster_buf_idx];
             rs.opaque_triangles = &ctx.opaque_buffers[raster_buf_idx].triangles;
             rs.trans_triangles = &ctx.trans_buffers[raster_buf_idx].triangles;
@@ -684,7 +668,7 @@ pub fn run_render_loop(ctx: *RendererContext) void {
             }
             prof.frozen.store(want_frozen, .monotonic);
         }
-        profiler_mod.thread_profiler_begin_frame(ctx.profiler);
+        profiler_mod.threadProfilerBeginFrame(ctx.profiler);
 
         var pool_active: i32 = undefined;
         var tl_pref: i32 = undefined;
@@ -728,19 +712,19 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         }
         threading.cv_pool.broadcast();
 
-        physics_pipeline.physics_trigger_after_tl(pp);
+        physics_pipeline.physicsTriggerAfterTl(pp);
 
-        const raster_phase_start = platform.PerfCounter();
+        const raster_phase_start = platform.perfCounter();
         const RasterDonePred = struct {
             fn pred(_: void) bool {
                 return threading.raster_pass.load(.acquire) >= @as(i32, @intCast(threading.RASTER_PASS_COUNT));
             }
         };
-        threading.wait_for_main_thread_predicate({}, RasterDonePred.pred);
+        threading.waitForMainThreadPredicate({}, RasterDonePred.pred);
         if (do_raster and ctx.raster_shared[raster_buf_idx].use_spotlight) {
-            draw.draw_spotlight_luminaire(pixels, pitch, ctx.depth_buffer.items.ptr, ctx.screen_width, ctx.screen_height, fb.format.?, &ctx.projection_buffers[raster_buf_idx], ctx.raster_shared[raster_buf_idx].light_pos);
+            draw.drawSpotlightLuminaire(pixels, pitch, ctx.depth_buffer.items.ptr, ctx.screen_width, ctx.screen_height, fb.format.?, &ctx.projection_buffers[raster_buf_idx], ctx.raster_shared[raster_buf_idx].light_pos);
         }
-        const raster_phase_end = platform.PerfCounter();
+        const raster_phase_end = platform.perfCounter();
 
         {
             const overlay_view = if (do_raster) ctx.view_matrix_buffers[raster_buf_idx] else view_matrix;
@@ -784,10 +768,10 @@ pub fn run_render_loop(ctx: *RendererContext) void {
                 if (visible[a] and visible[b2]) {
                     if (do_raster) {
                         const rs = &ctx.raster_shared[raster_buf_idx];
-                        draw.draw_lit_shadowed_line_depth(pixels, pitch, ctx.depth_buffer.items.ptr, sx[a], sy[a], sz[a], eye_corners[a], invw[a], sx[b2], sy[b2], sz[b2], eye_corners[b2], invw[b2], ctx.screen_width, ctx.screen_height, fb.format.?, rs.shadow_depth, rs.shadow_size, rs.light_pos, rs.spot_dir, rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos, &ctx.shadow_matrix_buffers[raster_buf_idx]);
+                        draw.drawLitShadowedLineDepth(pixels, pitch, ctx.depth_buffer.items.ptr, sx[a], sy[a], sz[a], eye_corners[a], invw[a], sx[b2], sy[b2], sz[b2], eye_corners[b2], invw[b2], ctx.screen_width, ctx.screen_height, fb.format.?, rs.shadow_depth, rs.shadow_size, rs.light_pos, rs.spot_dir, rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos, &ctx.shadow_matrix_buffers[raster_buf_idx]);
                     } else {
-                        const wire_color = pixel.pack_rgb_fast(fb.format.?, 255, 255, 0);
-                        draw.draw_line_depth(pixels, pitch, ctx.depth_buffer.items.ptr, sx[a], sy[a], sz[a], sx[b2], sy[b2], sz[b2], wire_color, ctx.screen_width, ctx.screen_height);
+                        const wire_color = pixel.packRgbFast(fb.format.?, 255, 255, 0);
+                        draw.drawLineDepth(pixels, pitch, ctx.depth_buffer.items.ptr, sx[a], sy[a], sz[a], sx[b2], sy[b2], sz[b2], wire_color, ctx.screen_width, ctx.screen_height);
                     }
                 }
             }
@@ -797,17 +781,17 @@ pub fn run_render_loop(ctx: *RendererContext) void {
         {
             var label_buf: [32]u8 = undefined;
             const label = std.fmt.bufPrint(&label_buf, "ZIG {d}/{d}", .{ pool_active, k_eff }) catch "";
-            pixel.draw_text(pixels, pitch, 20, 20, label, 255, 255, 255, fb.format.?);
+            pixel.drawText(pixels, pitch, 20, 20, label, 255, 255, 255, fb.format.?);
         }
 
-        const draw_end_ts = platform.PerfCounter();
+        const draw_end_ts = platform.perfCounter();
 
         if (trace_mode and !paused and ctx.profiler.enabled.load(.monotonic)) {
             const prev_blit_start = ctx.profiler.present_history[0].start_ts;
             if (trace_skip_next) {
                 trace_skip_next = false;
             } else if (prev_blit_start != 0) {
-                const delta_ms = threading.perf_ms(prev_blit_start, draw_end_ts);
+                const delta_ms = threading.perfMs(prev_blit_start, draw_end_ts);
                 if (trace_ring_count >= trace_window_size) {
                     const avg_ms = trace_ring_sum * (1.0 / @as(f64, @floatFromInt(trace_window_size)));
                     if (delta_ms > 1.3 * avg_ms) {
@@ -825,11 +809,11 @@ pub fn run_render_loop(ctx: *RendererContext) void {
             }
         }
 
-        profiler_mod.thread_profiler_draw(ctx.profiler, pixels, pitch, ctx.screen_width, ctx.screen_height, fb.format, draw_end_ts);
+        profiler_mod.threadProfilerDraw(ctx.profiler, pixels, pitch, ctx.screen_width, ctx.screen_height, fb.format, draw_end_ts);
 
-        const present_start_ts = platform.PerfCounter();
-        platform.Present();
-        const present_end_ts = platform.PerfCounter();
+        const present_start_ts = platform.perfCounter();
+        platform.present();
+        const present_end_ts = platform.perfCounter();
         {
             const prof = ctx.profiler;
             if (!prof.frozen.load(.monotonic)) {
@@ -841,35 +825,35 @@ pub fn run_render_loop(ctx: *RendererContext) void {
 
         {
             const expected_workers = pool_active;
-            const tl_wait_start = platform.PerfCounter();
+            const tl_wait_start = platform.perfCounter();
             const PoolDonePred = struct {
                 fn pred(exp: i32) bool {
                     return threading.pool_workers_done.load(.acquire) >= exp;
                 }
             };
-            threading.wait_for_main_thread_predicate(expected_workers, PoolDonePred.pred);
-            const tl_wait_end = platform.PerfCounter();
-            if (tp.enabled) tp.tl_tail_wait_ms_this_variant += threading.perf_ms(tl_wait_start, tl_wait_end);
+            threading.waitForMainThreadPredicate(expected_workers, PoolDonePred.pred);
+            const tl_wait_end = platform.perfCounter();
+            if (tp.enabled) tp.tl_tail_wait_ms_this_variant += threading.perfMs(tl_wait_start, tl_wait_end);
         }
-        if (tp.enabled and do_raster) tp.raster_ms_this_variant += threading.perf_ms(raster_phase_start, raster_phase_end);
+        if (tp.enabled and do_raster) tp.raster_ms_this_variant += threading.perfMs(raster_phase_start, raster_phase_end);
 
-        merge_tl_globals(ctx, tl_buf_idx);
+        mergeTlGlobals(ctx, tl_buf_idx);
 
-        if ((frame_num & 0xff) == 0) periodic_capacity_shrink(ctx);
+        if ((frame_num & 0xff) == 0) periodicCapacityShrink(ctx);
 
         frame_num += 1;
         frame_sequence += 1;
 
-        const current_time = platform.TicksMs();
+        const current_time = platform.ticksMs();
         _ = ctx.fps_counter.tick(current_time);
 
         if (tp.enabled) {
             tp.frames_this_variant += 1;
             if (tp.frames_this_variant >= tp.frames_per_variant) {
-                threadperf_advance_variant(ctx, &sim_time, &frame_num, &last_physics_time, &running);
+                threadperfAdvanceVariant(ctx, &sim_time, &frame_num, &last_physics_time, &running);
             }
         }
     }
 
-    threadperf_write_partial_at_exit(ctx);
+    threadperfWritePartialAtExit(ctx);
 }

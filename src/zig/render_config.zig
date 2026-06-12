@@ -1,6 +1,6 @@
 // render_config.zig — shared compile-time configuration + small POD typedefs.
 // Mirrors render_config.h. The runtime-set thread counts (NUM_*) live here as
-// `pub var` (the C++ originals were `extern int` set by init_thread_counts);
+// `pub var` (the C++ originals were `extern int` set by initThreadCounts);
 // threading.zig writes them at startup, everyone else reads them.
 
 pub const NEAR_PLANE: f32 = 1.0;
@@ -27,7 +27,7 @@ pub const SHADOW_DEPTH_BIAS_U16: ShadowDepth = @intFromFloat(SHADOW_DEPTH_BIAS *
 
 pub const Pixel32 = u32;
 
-pub inline fn shadow_depth_to_u16(z_in: f32) ShadowDepth {
+pub inline fn shadowDepthToU16(z_in: f32) ShadowDepth {
     var z = z_in;
     if (z > 1.0) z = 1.0;
     if (z < 0.0) z = 0.0;
@@ -38,7 +38,7 @@ pub const LUMINAIRE_CONE_SEGMENTS: i32 = 64;
 
 pub const TILE_X_SPLITS: i32 = 16;
 
-// Runtime-configured (set by threading.init_thread_counts).
+// Runtime-configured (set by threading.initThreadCounts).
 pub var NUM_TL_THREADS: i32 = 0;
 pub var NUM_RASTER_THREADS: i32 = 0;
 pub var NUM_STRIPS: i32 = 0;
@@ -49,7 +49,7 @@ pub var NUM_TILE_BINS: i32 = 0;
 // shares so they can never disagree on a tile boundary.
 pub const TileSpan = struct { lo: i32, hi: i32 };
 
-pub inline fn tile_span(extent: i32, splits: i32, idx: i32) TileSpan {
+pub inline fn tileSpan(extent: i32, splits: i32, idx: i32) TileSpan {
     var lo = @divTrunc(idx * extent, splits);
     var hi = @divTrunc((idx + 1) * extent, splits) - 1;
     if (lo < 0) lo = 0;
@@ -57,11 +57,11 @@ pub inline fn tile_span(extent: i32, splits: i32, idx: i32) TileSpan {
     return .{ .lo = lo, .hi = hi };
 }
 
-pub inline fn tile_column_range(width: i32, col: i32) TileSpan {
-    return tile_span(width, TILE_X_SPLITS, col);
+pub inline fn tileColumnRange(width: i32, col: i32) TileSpan {
+    return tileSpan(width, TILE_X_SPLITS, col);
 }
 
-pub inline fn tile_column_for_x(width: i32, x: i32) i32 {
+pub inline fn tileColumnForX(width: i32, x: i32) i32 {
     const col = @divTrunc(x * TILE_X_SPLITS, width);
     if (col < 0) return 0;
     if (col >= TILE_X_SPLITS) return TILE_X_SPLITS - 1;

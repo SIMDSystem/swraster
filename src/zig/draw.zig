@@ -104,7 +104,7 @@ pub const RasterTriangleSetup = struct {
     perspective_correct_normals: bool = false,
 };
 
-pub fn build_raster_triangle_setup(v0: *const VertexVaryings, v1: *const VertexVaryings, v2: *const VertexVaryings, screen_width: i32, screen_height: i32) RasterTriangleSetup {
+pub fn buildRasterTriangleSetup(v0: *const VertexVaryings, v1: *const VertexVaryings, v2: *const VertexVaryings, screen_width: i32, screen_height: i32) RasterTriangleSetup {
     var setup = RasterTriangleSetup{};
     setup.x_min = @intFromFloat(@min(v0.x, @min(v1.x, v2.x)));
     setup.x_max = @intFromFloat(@max(v0.x, @max(v1.x, v2.x)));
@@ -177,7 +177,7 @@ pub fn build_raster_triangle_setup(v0: *const VertexVaryings, v1: *const VertexV
     return setup;
 }
 
-pub fn draw_pixel(pixels: [*]u8, pitch: i32, x: i32, y: i32, color: u32, w: i32, h: i32) void {
+pub fn drawPixel(pixels: [*]u8, pitch: i32, x: i32, y: i32, color: u32, w: i32, h: i32) void {
     if (x < 0 or x >= w or y < 0 or y >= h) return;
     const row: [*]u32 = @ptrCast(@alignCast(pixels + @as(usize, @intCast(y * pitch))));
     row[@intCast(x)] = color;
@@ -186,7 +186,7 @@ pub fn draw_pixel(pixels: [*]u8, pitch: i32, x: i32, y: i32, color: u32, w: i32,
 // Liang-Barsky span of the line inside the rect, or null if fully outside.
 pub const LineClip = struct { t0: f32, t1: f32 };
 
-pub inline fn clip_line_to_rect(x0: f32, y0: f32, x1: f32, y1: f32, xmin: f32, ymin: f32, xmax: f32, ymax: f32) ?LineClip {
+pub inline fn clipLineToRect(x0: f32, y0: f32, x1: f32, y1: f32, xmin: f32, ymin: f32, xmax: f32, ymax: f32) ?LineClip {
     const dx = x1 - x0;
     const dy = y1 - y0;
     var t0: f32 = 0.0;
@@ -210,7 +210,7 @@ pub inline fn clip_line_to_rect(x0: f32, y0: f32, x1: f32, y1: f32, xmin: f32, y
     return .{ .t0 = t0, .t1 = t1 };
 }
 
-pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i32, y0_in: i32, z0_in: f32, x1_in: i32, y1_in: i32, z1_in: f32, color: u32, w: i32, h: i32) void {
+pub fn drawLineDepth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i32, y0_in: i32, z0_in: f32, x1_in: i32, y1_in: i32, z1_in: f32, color: u32, w: i32, h: i32) void {
     var x0 = x0_in;
     var y0 = y0_in;
     var z0 = z0_in;
@@ -218,7 +218,7 @@ pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i
     var y1 = y1_in;
     var z1 = z1_in;
     {
-        const span = clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
+        const span = clipLineToRect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
         const dx_f: f32 = @floatFromInt(x1 - x0);
         const dy_f: f32 = @floatFromInt(y1 - y0);
         const dz_f = z1 - z0;
@@ -246,7 +246,7 @@ pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i
     while (true) {
         const idx: usize = @intCast(y0 * w + x0);
         if (z < depth_buffer[idx]) {
-            draw_pixel(pixels, pitch, x0, y0, color, w, h);
+            drawPixel(pixels, pitch, x0, y0, color, w, h);
             depth_buffer[idx] = z;
         }
         if (x0 == x1 and y0 == y1) break;
@@ -263,7 +263,7 @@ pub fn draw_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i
     }
 }
 
-pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i32, y0_in: i32, z0_in: f32, p0_eye_in: Vec3, inv_w0_in: f32, x1_in: i32, y1_in: i32, z1_in: f32, p1_eye_in: Vec3, inv_w1_in: f32, w: i32, h: i32, format: *const PixelFormat, shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, shadow_matrix: *const Mat4) void {
+pub fn drawLitShadowedLineDepth(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, x0_in: i32, y0_in: i32, z0_in: f32, p0_eye_in: Vec3, inv_w0_in: f32, x1_in: i32, y1_in: i32, z1_in: f32, p1_eye_in: Vec3, inv_w1_in: f32, w: i32, h: i32, format: *const PixelFormat, shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, shadow_matrix: *const Mat4) void {
     var x0 = x0_in;
     var y0 = y0_in;
     var z0 = z0_in;
@@ -275,7 +275,7 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
     var inv_w0 = inv_w0_in;
     var inv_w1 = inv_w1_in;
     {
-        const span = clip_line_to_rect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
+        const span = clipLineToRect(@floatFromInt(x0), @floatFromInt(y0), @floatFromInt(x1), @floatFromInt(y1), 0.0, 0.0, @floatFromInt(w - 1), @floatFromInt(h - 1)) orelse return;
         const t_a = span.t0;
         const t_b = span.t1;
         if (t_a > 0.0 or t_b < 1.0) {
@@ -324,7 +324,7 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
             const a = 1.0 - t;
             const inv_w = inv_w0 * a + inv_w1 * t;
             const p_eye = p0_eye.scale(inv_w0 * a).add(p1_eye.scale(inv_w1 * t)).scale(1.0 / inv_w);
-            const visibility = shadow.sample_shadow_pcf(shadow_depth, shadow_size, shadow_matrix.mulVec4(Vec4.init(p_eye.x, p_eye.y, p_eye.z, 1.0)));
+            const visibility = shadow.sampleShadowPcf(shadow_depth, shadow_size, shadow_matrix.mulVec4(Vec4.init(p_eye.x, p_eye.y, p_eye.z, 1.0)));
             var direct: f32 = 0.8;
             if (use_spotlight) {
                 var L = light_pos.sub(p_eye);
@@ -340,7 +340,7 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
             }
             const illum = @min(1.0, 0.35 + direct * visibility);
             const row_pixels: [*]Pixel32 = @ptrCast(@alignCast(pixels + @as(usize, @intCast(y0 * pitch))));
-            row_pixels[@intCast(x0)] = pixel.pack_rgb_fast(format, @intFromFloat(255.0 * illum), @intFromFloat(255.0 * illum), 0);
+            row_pixels[@intCast(x0)] = pixel.packRgbFast(format, @intFromFloat(255.0 * illum), @intFromFloat(255.0 * illum), 0);
             depth_buffer[idx] = z;
         }
         if (x0 == x1 and y0 == y1) break;
@@ -358,14 +358,14 @@ pub fn draw_lit_shadowed_line_depth(pixels: [*]u8, pitch: i32, depth_buffer: [*]
     }
 }
 
-pub fn draw_spotlight_luminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, projection: *const Mat4, light_pos: Vec3) void {
-    const lp = clip.project_eye_point(projection, light_pos, screen_width, screen_height) orelse return;
+pub fn drawSpotlightLuminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, projection: *const Mat4, light_pos: Vec3) void {
+    const lp = clip.projectEyePoint(projection, light_pos, screen_width, screen_height) orelse return;
     const lx = lp.x;
     const ly = lp.y;
     const lz = lp.z;
 
     const glare_radius_3d: f32 = 0.42;
-    const edge = clip.project_eye_point(projection, light_pos.add(Vec3.init(glare_radius_3d, 0, 0)), screen_width, screen_height) orelse return;
+    const edge = clip.projectEyePoint(projection, light_pos.add(Vec3.init(glare_radius_3d, 0, 0)), screen_width, screen_height) orelse return;
     var disk_radius = @abs(edge.x - lx);
     if (disk_radius < 1.0) disk_radius = 1.0;
 
@@ -386,7 +386,7 @@ pub fn draw_spotlight_luminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32,
             const d2 = dx * dx + dy * dy;
             if (d2 > disk_radius * disk_radius) continue;
             const a = @exp(-d2 * inv_sigma2);
-            pixel.add_pixel_rgb(row_pixels, x, format, 255.0 * a, 255.0 * a, 255.0 * a);
+            pixel.addPixelRgb(row_pixels, x, format, 255.0 * a, 255.0 * a, 255.0 * a);
         }
     }
 }
@@ -438,7 +438,7 @@ const LitCtx = struct {
 // Shared Lit back-end: texture + Phong + alpha + buffer writes for one pixel.
 // Called per pixel from the scalar path and per lane from the quad path, so
 // both produce identical output. Texture/shadow are gathers, kept scalar.
-inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth: [*]f32, x: i32, y: i32, z: f32, inv_w: f32, f: LitFrag) void {
+inline fn shadeLitFragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth: [*]f32, x: i32, y: i32, z: f32, inv_w: f32, f: LitFrag) void {
     @setFloatMode(.optimized);
     const u = f.u - @floor(f.u);
     const v = f.v - @floor(f.v);
@@ -447,7 +447,7 @@ inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_dep
     var final_g: f32 = undefined;
     var final_b: f32 = undefined;
     if (ctx.has_texture) {
-        const tc = tex.sample_texture_anisotropic(ctx.tex_level.?, u, v, ctx.aniso_axis_u, ctx.aniso_axis_v, ctx.aniso_taps);
+        const tc = tex.sampleTextureAnisotropic(ctx.tex_level.?, u, v, ctx.aniso_axis_u, ctx.aniso_axis_v, ctx.aniso_taps);
         const tr: u8 = @truncate(tc >> 16);
         const tg: u8 = @truncate(tc >> 8);
         const tb: u8 = @truncate(tc);
@@ -510,7 +510,7 @@ inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_dep
             var light_visibility: f32 = 1.0;
             if (ctx.shadow_depth != null and ctx.shadow_size > 0) {
                 const inv_sq = 1.0 / f.sq;
-                light_visibility = shadow.sample_shadow_compare_bilinear_2x2(ctx.shadow_depth, ctx.shadow_size, f.ss * inv_sq, f.st * inv_sq, f.sr * inv_sq);
+                light_visibility = shadow.sampleShadowCompareBilinear2x2(ctx.shadow_depth, ctx.shadow_size, f.ss * inv_sq, f.st * inv_sq, f.sr * inv_sq);
             }
 
             if (light_visibility > 0.0) {
@@ -561,14 +561,14 @@ inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_dep
     if (final_b > 255.0) final_b = 255.0;
 
     if (f.a < 0.995 and f.a > 0.005) {
-        const dst = pixel.unpack_rgb_fast(row_pixels[@intCast(x)], ctx.format);
+        const dst = pixel.unpackRgbFast(row_pixels[@intCast(x)], ctx.format);
         const inv_alpha = 1.0 - f.a;
         final_r = final_r * f.a + @as(f32, @floatFromInt(dst.r)) * inv_alpha;
         final_g = final_g * f.a + @as(f32, @floatFromInt(dst.g)) * inv_alpha;
         final_b = final_b * f.a + @as(f32, @floatFromInt(dst.b)) * inv_alpha;
     }
 
-    row_pixels[@intCast(x)] = pixel.pack_rgb_fast(ctx.format, @intFromFloat(final_r), @intFromFloat(final_g), @intFromFloat(final_b));
+    row_pixels[@intCast(x)] = pixel.packRgbFast(ctx.format, @intFromFloat(final_r), @intFromFloat(final_g), @intFromFloat(final_b));
     if (ctx.depth_write) {
         row_depth[@intCast(x)] = z;
         if (ctx.linear_z) |lz_buf| lz_buf[@intCast(y * ctx.screen_width + x)] = 1.0 / inv_w;
@@ -591,7 +591,7 @@ inline fn shade_lit_fragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_dep
     }
 }
 
-pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalias depth_buffer: [*]f32, noalias normal_buffer: ?[*]f32, noalias linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, noalias texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, noalias shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
+pub fn drawTriangleBarycentricStrip(noalias pixels: [*]u8, pitch: i32, noalias depth_buffer: [*]f32, noalias normal_buffer: ?[*]f32, noalias linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, noalias texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, noalias shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
     // Allow FMA contraction + reassociation across the whole per-pixel loop.
     // This restores the -ffast-math style codegen Eigen relied on; barycentric
     // interpolation (a*w0 + b*w1 + c*w2) collapses into mul + fma chains.
@@ -599,7 +599,7 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
     var fallback_setup: RasterTriangleSetup = undefined;
     var setup: *const RasterTriangleSetup = undefined;
     if (precomputed_setup == null or !precomputed_setup.?.valid) {
-        fallback_setup = build_raster_triangle_setup(&v0, &v1, &v2, screen_width, screen_height);
+        fallback_setup = buildRasterTriangleSetup(&v0, &v1, &v2, screen_width, screen_height);
         setup = &fallback_setup;
     } else {
         setup = precomputed_setup.?;
@@ -837,7 +837,7 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
                         const sqv = (@as(@Vector(4, f32), @splat(sq0_w)) * b0v + @as(@Vector(4, f32), @splat(sq1_w)) * b1v + @as(@Vector(4, f32), @splat(sq2_w)) * b2v) * persp;
 
                         inline for (0..4) |k| {
-                            shade_lit_fragment(&ctx, row_pixels, row_depth, x + @as(i32, @intCast(k)), y, zv[k], inv_wv[k], .{
+                            shadeLitFragment(&ctx, row_pixels, row_depth, x + @as(i32, @intCast(k)), y, zv[k], inv_wv[k], .{
                                 .u = uv[k],
                                 .v = vv[k],
                                 .r = rv[k],
@@ -884,7 +884,7 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
                 const inv_w = v0.inv_w * b0 + v1.inv_w * b1 + v2.inv_w * b2;
 
                 if (shader == .DebugUnlitRed) {
-                    row_pixels[@intCast(x)] = pixel.pack_rgb_fast(format, 255, 0, 0);
+                    row_pixels[@intCast(x)] = pixel.packRgbFast(format, 255, 0, 0);
                     if (depth_write) row_depth[@intCast(x)] = z;
                     break :scalar;
                 }
@@ -920,12 +920,12 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
                         const silhouette_t = @min(1.0, @max(0.0, vdotn / 0.45));
                         const silhouette_fade = silhouette_t * silhouette_t * (3.0 - 2.0 * silhouette_t);
                         const a_add = 0.22 * distal_fade * silhouette_fade;
-                        pixel.add_pixel_rgb(row_pixels, x, format, 255.0 * a_add, 255.0 * a_add, 255.0 * a_add);
+                        pixel.addPixelRgb(row_pixels, x, format, 255.0 * a_add, 255.0 * a_add, 255.0 * a_add);
                     }
                     break :scalar;
                 }
 
-                shade_lit_fragment(&ctx, row_pixels, row_depth, x, y, z, inv_w, .{
+                shadeLitFragment(&ctx, row_pixels, row_depth, x, y, z, inv_w, .{
                     .u = (uw0 * b0 + uw1 * b1 + uw2 * b2) / inv_w,
                     .v = (v0_w * b0 + v1_w * b1 + v2_w * b2) / inv_w,
                     .r = v0.r * b0 + v1.r * b1 + v2.r * b2,
@@ -956,8 +956,8 @@ pub fn draw_triangle_barycentric_strip(noalias pixels: [*]u8, pitch: i32, noalia
     }
 }
 
-pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat4, light_pos: Vec3, spot_dir: Vec3, spot_outer_cos: f32, screen_width: i32, screen_height: i32) void {
-    out.tris.resize(@intCast(config.LUMINAIRE_CONE_SEGMENTS)) catch unreachable;
+pub fn buildLuminaireConeTl(out: *LuminaireConeBuffer, projection: *const Mat4, light_pos: Vec3, spot_dir: Vec3, spot_outer_cos: f32, screen_width: i32, screen_height: i32) void {
+    out.tris.resize(std.heap.c_allocator, @intCast(config.LUMINAIRE_CONE_SEGMENTS)) catch unreachable;
     out.valid = false;
 
     const axis = spot_dir.normalized();
@@ -971,9 +971,9 @@ pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat
     const v = axis.cross(u).normalized();
     const radius = @tan(outer_angle) * cone_len;
 
-    const make_vertex = struct {
+    const makeVertex = struct {
         fn f(proj: *const Mat4, p: Vec3, n: Vec3, sw: i32, sh: i32, vv: *VertexVaryings) bool {
-            const sp = clip.project_eye_point(proj, p, sw, sh) orelse return false;
+            const sp = clip.projectEyePoint(proj, p, sw, sh) orelse return false;
             vv.x = sp.x;
             vv.y = sp.y;
             vv.z = sp.z;
@@ -1021,9 +1021,9 @@ pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat
         var apex = VertexVaryings{};
         var p0 = VertexVaryings{};
         var p1 = VertexVaryings{};
-        if (!make_vertex(projection, light_pos, apex_n, screen_width, screen_height, &apex)) continue;
-        if (!make_vertex(projection, base_center.add(radial0.scale(radius)), n0, screen_width, screen_height, &p0)) continue;
-        if (!make_vertex(projection, base_center.add(radial1.scale(radius)), n1, screen_width, screen_height, &p1)) continue;
+        if (!makeVertex(projection, light_pos, apex_n, screen_width, screen_height, &apex)) continue;
+        if (!makeVertex(projection, base_center.add(radial0.scale(radius)), n0, screen_width, screen_height, &p0)) continue;
+        if (!makeVertex(projection, base_center.add(radial1.scale(radius)), n1, screen_width, screen_height, &p1)) continue;
         tri.v0 = apex;
         tri.v1 = p0;
         tri.v2 = p1;
@@ -1032,11 +1032,11 @@ pub fn build_luminaire_cone_tl(out: *LuminaireConeBuffer, projection: *const Mat
     out.valid = (emitted > 0);
 }
 
-pub fn draw_spotlight_cone_strip(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, cone: *const LuminaireConeBuffer, light_pos: Vec3, spot_dir: Vec3, spot_outer_cos: f32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32) void {
+pub fn drawSpotlightConeStrip(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, cone: *const LuminaireConeBuffer, light_pos: Vec3, spot_dir: Vec3, spot_outer_cos: f32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32) void {
     if (!cone.valid) return;
     const axis = spot_dir.normalized();
     for (cone.tris.items) |tri| {
-        draw_triangle_barycentric_strip(pixels, pitch, depth_buffer, null, null, screen_width, screen_height, tri.v0, tri.v1, tri.v2, format, null, Vec3.zero(), light_pos, axis, true, 1.0, spot_outer_cos, null, 0, x_tile_min, x_tile_max, y_strip_min, y_strip_max, false, .LuminaireCone, null);
+        drawTriangleBarycentricStrip(pixels, pitch, depth_buffer, null, null, screen_width, screen_height, tri.v0, tri.v1, tri.v2, format, null, Vec3.zero(), light_pos, axis, true, 1.0, spot_outer_cos, null, 0, x_tile_min, x_tile_max, y_strip_min, y_strip_max, false, .LuminaireCone, null);
     }
 }
 
@@ -1083,7 +1083,7 @@ const ssao_kernel: SsaoKernel = blk: {
     break :blk t;
 };
 
-pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]const f32, noalias normal_buffer: [*]const f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, frame_index: u32, proj00: f32, proj11: f32) void {
+pub fn applySsaoStrip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]const f32, noalias normal_buffer: [*]const f32, screen_width: i32, screen_height: i32, format: *const PixelFormat, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, frame_index: u32, proj00: f32, proj11: f32) void {
     @setFloatMode(.optimized);
     const world_radius: f32 = 0.7;
     const depth_bias: f32 = 0.03;
@@ -1234,11 +1234,11 @@ pub fn apply_ssao_strip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]
             if (ao < ao_floor) ao = ao_floor;
             if (ao >= 0.999) continue;
 
-            const c = pixel.unpack_rgb_fast(row_pixels[@intCast(x)], format);
+            const c = pixel.unpackRgbFast(row_pixels[@intCast(x)], format);
             var ao8: i32 = @intFromFloat(ao * 256.0);
             if (ao8 < 0) ao8 = 0 else if (ao8 > 256) ao8 = 256;
             const ao8u: u32 = @intCast(ao8);
-            row_pixels[@intCast(x)] = pixel.pack_rgb_fast(format, @truncate((@as(u32, c.r) * ao8u) >> 8), @truncate((@as(u32, c.g) * ao8u) >> 8), @truncate((@as(u32, c.b) * ao8u) >> 8));
+            row_pixels[@intCast(x)] = pixel.packRgbFast(format, @truncate((@as(u32, c.r) * ao8u) >> 8), @truncate((@as(u32, c.g) * ao8u) >> 8), @truncate((@as(u32, c.b) * ao8u) >> 8));
         }
     }
 }

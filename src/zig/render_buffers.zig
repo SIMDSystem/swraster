@@ -13,6 +13,7 @@ const shadow = @import("shadow.zig");
 const tex = @import("texture.zig");
 const scene = @import("scene.zig");
 const keysort = @import("keysort.zig");
+const renderer_context = @import("renderer_context.zig");
 
 const Vec3 = la.Vec3;
 const Mat4 = la.Mat4;
@@ -25,6 +26,7 @@ const Face = geom.Face;
 const ShadowVertex = shadow.ShadowVertex;
 const ShadowDepth = config.ShadowDepth;
 const OccluderEye = cull.OccluderEye;
+const MeshRef = renderer_context.MeshRef;
 
 pub const RenderTriangle = struct {
     v0: VertexVaryings = .{},
@@ -38,7 +40,7 @@ pub const RenderTriangle = struct {
     shadow_screendoor_mask: i32 = -1,
 };
 
-pub const RenderTriangleList = std.array_list.Managed(RenderTriangle);
+pub const RenderTriangleList = std.ArrayList(RenderTriangle);
 
 pub const TriangleBuffer = struct {
     triangles: RenderTriangleList = undefined,
@@ -61,7 +63,7 @@ pub const LuminaireConeTri = struct {
 };
 
 pub const LuminaireConeBuffer = struct {
-    tris: std.array_list.Managed(LuminaireConeTri) = undefined,
+    tris: std.ArrayList(LuminaireConeTri) = undefined,
     valid: bool = false,
 };
 
@@ -76,7 +78,7 @@ pub const InstancePose = struct {
 };
 
 pub const PoseSnapshot = struct {
-    poses: std.array_list.Managed(InstancePose) = undefined,
+    poses: std.ArrayList(InstancePose) = undefined,
     sim_time: f32 = 0.0,
     sequence: u64 = 0,
 };
@@ -87,22 +89,11 @@ pub const InstanceDepth = struct {
 };
 
 pub const TLSharedData = struct {
-    instances: ?*const std.array_list.Managed(scene.CubeInstance) = null,
-    sorted_instances: ?*const std.array_list.Managed(InstanceDepth) = null,
-    cube_vertices: ?*const RenderVertexList = null,
-    cube_faces: ?*const std.array_list.Managed(Face) = null,
-    sphere_vertices: ?*const RenderVertexList = null,
-    sphere_faces: ?*const std.array_list.Managed(Face) = null,
-    torus_vertices: ?*const RenderVertexList = null,
-    torus_faces: ?*const std.array_list.Managed(Face) = null,
-    teapot_vertices: ?*const RenderVertexList = null,
-    teapot_faces: ?*const std.array_list.Managed(Face) = null,
-    smallball_vertices: ?*const RenderVertexList = null,
-    smallball_faces: ?*const std.array_list.Managed(Face) = null,
-    ground_vertices: ?*const RenderVertexList = null,
-    ground_faces: ?*const std.array_list.Managed(Face) = null,
-    lamp_vertices: ?*const RenderVertexList = null,
-    lamp_faces: ?*const std.array_list.Managed(Face) = null,
+    instances: ?*const std.ArrayList(scene.CubeInstance) = null,
+    sorted_instances: ?*const std.ArrayList(InstanceDepth) = null,
+    // Per-frame republished copy of RendererContext.meshes, indexed by
+    // @intFromEnum(scene.InstanceType).
+    meshes: [7]MeshRef = undefined,
     opaque_triangles: ?*RenderTriangleList = null,
     trans_triangles: ?*RenderTriangleList = null,
     shadow_triangles: ?*RenderTriangleList = null,
@@ -128,7 +119,7 @@ pub const TLSharedData = struct {
     screen_width: i32 = 0,
     screen_height: i32 = 0,
     format: ?*PixelFormat = null,
-    occluders_eye: ?*const std.array_list.Managed(OccluderEye) = null,
+    occluders_eye: ?*const std.ArrayList(OccluderEye) = null,
     pose_snapshot: ?*const PoseSnapshot = null,
     cone_buf_write: ?*LuminaireConeBuffer = null,
 };
@@ -145,9 +136,9 @@ pub const TLThreadOutput = struct {
     // contends.
     merge_scratch: RenderTriangleList = undefined,
     // (key, index) scratch for the local key-sort; per-worker, reused.
-    sort_keys: std.array_list.Managed(keysort.KeyIdx) = undefined,
+    sort_keys: std.ArrayList(keysort.KeyIdx) = undefined,
     // Persistent per-worker transform scratch, reused across frames (the C++
-    // build constructs these per frame). transform_vertices resizes+overwrites
+    // build constructs these per frame). transformVertices resizes+overwrites
     // both fully, so retaining the buffers just avoids re-allocation.
     eye_scratch: RenderVertexList = undefined,
     clip_scratch: RenderVertexList = undefined,

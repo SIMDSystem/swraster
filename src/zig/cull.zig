@@ -10,7 +10,7 @@ pub const OccluderEye = struct {
     inner_radius: f32 = 0,
 };
 
-pub inline fn point_occluded_by_sphere(viewer: Vec3, p: Vec3, occ: Vec3, occ_inner_radius: f32, p_radius: f32) bool {
+pub inline fn pointOccludedBySphere(viewer: Vec3, p: Vec3, occ: Vec3, occ_inner_radius: f32, p_radius: f32) bool {
     const to_occ = occ.sub(viewer);
     const occ_dist2 = to_occ.squaredNorm();
     if (occ_dist2 <= 0.000001) return false;
@@ -28,7 +28,7 @@ pub inline fn point_occluded_by_sphere(viewer: Vec3, p: Vec3, occ: Vec3, occ_inn
     return cos_to_center >= cos_limit;
 }
 
-pub inline fn directional_occluded_by_sphere(light_axis: Vec3, p: Vec3, occ: Vec3, occ_inner_radius: f32, p_radius: f32) bool {
+pub inline fn directionalOccludedBySphere(light_axis: Vec3, p: Vec3, occ: Vec3, occ_inner_radius: f32, p_radius: f32) bool {
     const delta = p.sub(occ);
     const p_behind_occ = delta.dot(light_axis.neg());
     if (p_behind_occ <= p_radius) return false;
@@ -37,7 +37,7 @@ pub inline fn directional_occluded_by_sphere(light_axis: Vec3, p: Vec3, occ: Vec
     return perp2 <= expanded_radius * expanded_radius;
 }
 
-pub inline fn sphere_intersects_camera_frustum_eye(center: Vec3, radius: f32, aspect: f32, tan_half_fov_y: f32, near_plane: f32, far_plane: f32) bool {
+pub inline fn sphereIntersectsCameraFrustumEye(center: Vec3, radius: f32, aspect: f32, tan_half_fov_y: f32, near_plane: f32, far_plane: f32) bool {
     const depth = -center.z;
     if (depth + radius < near_plane) return false;
     if (depth - radius > far_plane) return false;
@@ -49,7 +49,7 @@ pub inline fn sphere_intersects_camera_frustum_eye(center: Vec3, radius: f32, as
     return true;
 }
 
-pub inline fn sphere_intersects_spotlight_frustum_eye(center: Vec3, radius: f32, light_pos: Vec3, spot_dir: Vec3, outer_cos: f32, near_plane: f32, far_plane: f32) bool {
+pub inline fn sphereIntersectsSpotlightFrustumEye(center: Vec3, radius: f32, light_pos: Vec3, spot_dir: Vec3, outer_cos: f32, near_plane: f32, far_plane: f32) bool {
     const to_center = center.sub(light_pos);
     const axial = to_center.dot(spot_dir);
     if (axial + radius < near_plane) return false;

@@ -11,7 +11,7 @@ const renderer_context = @import("renderer_context.zig");
 
 const RendererContext = renderer_context.RendererContext;
 
-pub fn pool_worker_main(worker_id: i32, ctx: *RendererContext) void {
+pub fn poolWorkerMain(worker_id: i32, ctx: *RendererContext) void {
     var last_frame_processed: i32 = 0;
 
     while (threading.pool_threads_running.load(.monotonic)) {
@@ -38,13 +38,13 @@ pub fn pool_worker_main(worker_id: i32, ctx: *RendererContext) void {
 
         if (worker_id >= pool_active) continue;
 
-        raster_worker.raster_worker_frame(worker_id, ctx, true);
+        raster_worker.rasterWorkerFrame(worker_id, ctx, true);
 
         if (worker_id < k_eff) {
-            tl_worker.tl_worker_frame(worker_id, k_eff, ctx, current_frame);
+            tl_worker.tlWorkerFrame(worker_id, k_eff, ctx, current_frame);
         }
 
-        raster_worker.raster_worker_frame(worker_id, ctx, false);
+        raster_worker.rasterWorkerFrame(worker_id, ctx, false);
 
         if (threading.pool_workers_done.fetchAdd(1, .acq_rel) + 1 >= pool_active) {
             threading.mtx_main.lock();

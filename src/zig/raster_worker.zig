@@ -37,7 +37,7 @@ const Frame = struct {
     total_cs_tiles: i32,
     total_lum_tiles: i32,
 
-    fn advance_pass_to(_: *Frame, next: i32) void {
+    fn advancePassTo(_: *Frame, next: i32) void {
         var wake_main = false;
         {
             threading.mtx_pool.lock();
@@ -57,16 +57,16 @@ const Frame = struct {
 
     const TileRect = struct { x_min: i32, x_max: i32, y_min: i32, y_max: i32 };
 
-    fn cs_tile_rect(self: *Frame, tile_col: i32, strip_idx: i32) TileRect {
-        const xs = config.tile_span(self.rs.screen_width, self.X, tile_col);
-        const ys = config.tile_span(self.rs.screen_height, self.R, strip_idx);
+    fn csTileRect(self: *Frame, tile_col: i32, strip_idx: i32) TileRect {
+        const xs = config.tileSpan(self.rs.screen_width, self.X, tile_col);
+        const ys = config.tileSpan(self.rs.screen_height, self.R, strip_idx);
         return .{ .x_min = xs.lo, .x_max = xs.hi, .y_min = ys.lo, .y_max = ys.hi };
     }
 
-    fn do_color_tile(self: *Frame, tile_col: i32, strip_idx: i32) void {
-        const t0 = platform.PerfCounter();
-        const c0 = platform.ThreadCpuNs();
-        const tile = self.cs_tile_rect(tile_col, strip_idx);
+    fn doColorTile(self: *Frame, tile_col: i32, strip_idx: i32) void {
+        const t0 = platform.perfCounter();
+        const c0 = platform.threadCpuNs();
+        const tile = self.csTileRect(tile_col, strip_idx);
         const x_min = tile.x_min;
         const x_max = tile.x_max;
         const y_min = tile.y_min;
@@ -98,17 +98,17 @@ const Frame = struct {
                 const take_global = (os >= opaque_strip.items.len) or
                     (og < rs.opaque_count and rs.opaque_triangles.?.items[og].sort_z <= opaque_strip.items[os].sort_z);
                 if (take_global) {
-                    self.draw_color_tri(&rs.opaque_triangles.?.items[og], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
+                    self.drawColorTri(&rs.opaque_triangles.?.items[og], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
                     og += 1;
                 } else {
-                    self.draw_color_tri(&opaque_strip.items[os], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
+                    self.drawColorTri(&opaque_strip.items[os], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
                     os += 1;
                 }
             }
         } else {
             var ti: usize = 0;
-            while (ti < rs.opaque_count) : (ti += 1) self.draw_color_tri(&rs.opaque_triangles.?.items[ti], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
-            for (opaque_strip.items) |*tri| self.draw_color_tri(tri, rs.depth_write_enabled, x_min, x_max, y_min, y_max);
+            while (ti < rs.opaque_count) : (ti += 1) self.drawColorTri(&rs.opaque_triangles.?.items[ti], rs.depth_write_enabled, x_min, x_max, y_min, y_max);
+            for (opaque_strip.items) |*tri| self.drawColorTri(tri, rs.depth_write_enabled, x_min, x_max, y_min, y_max);
         }
 
         const trans_strip = rs.trans_strip_triangles.?.bins[tile_idx];
@@ -119,70 +119,70 @@ const Frame = struct {
                 const take_global = (ts >= trans_strip.items.len) or
                     (tg < rs.trans_count and rs.trans_triangles.?.items[tg].sort_z >= trans_strip.items[ts].sort_z);
                 if (take_global) {
-                    self.draw_color_tri(&rs.trans_triangles.?.items[tg], false, x_min, x_max, y_min, y_max);
+                    self.drawColorTri(&rs.trans_triangles.?.items[tg], false, x_min, x_max, y_min, y_max);
                     tg += 1;
                 } else {
-                    self.draw_color_tri(&trans_strip.items[ts], false, x_min, x_max, y_min, y_max);
+                    self.drawColorTri(&trans_strip.items[ts], false, x_min, x_max, y_min, y_max);
                     ts += 1;
                 }
             }
         } else {
             var ti: usize = 0;
-            while (ti < rs.trans_count) : (ti += 1) self.draw_color_tri(&rs.trans_triangles.?.items[ti], false, x_min, x_max, y_min, y_max);
-            for (trans_strip.items) |*tri| self.draw_color_tri(tri, false, x_min, x_max, y_min, y_max);
+            while (ti < rs.trans_count) : (ti += 1) self.drawColorTri(&rs.trans_triangles.?.items[ti], false, x_min, x_max, y_min, y_max);
+            for (trans_strip.items) |*tri| self.drawColorTri(tri, false, x_min, x_max, y_min, y_max);
         }
 
-        const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Color));
+        const c1 = platform.threadCpuNs();
+        profiler.profilerRecordRaster(self.ctx.profiler, self.worker_id, t0, platform.perfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Color));
     }
 
-    fn draw_color_tri(self: *Frame, tri: *const RenderTriangle, depth_write: bool, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
+    fn drawColorTri(self: *Frame, tri: *const RenderTriangle, depth_write: bool, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
         const rs = self.rs;
-        draw.draw_triangle_barycentric_strip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.normal_buffer, rs.linear_z, rs.screen_width, rs.screen_height, tri.v0, tri.v1, tri.v2, rs.format.?, tri.texture, rs.light_dir, rs.light_pos, rs.spot_dir, rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos, rs.shadow_depth, rs.shadow_size, x_min, x_max, y_min, y_max, depth_write, if (tri.debug_unlit_red) TriangleShader.DebugUnlitRed else TriangleShader.Lit, &tri.rgb_setup);
+        draw.drawTriangleBarycentricStrip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.normal_buffer, rs.linear_z, rs.screen_width, rs.screen_height, tri.v0, tri.v1, tri.v2, rs.format.?, tri.texture, rs.light_dir, rs.light_pos, rs.spot_dir, rs.use_spotlight, rs.spot_inner_cos, rs.spot_outer_cos, rs.shadow_depth, rs.shadow_size, x_min, x_max, y_min, y_max, depth_write, if (tri.debug_unlit_red) TriangleShader.DebugUnlitRed else TriangleShader.Lit, &tri.rgb_setup);
     }
 
-    fn do_ssao_tile(self: *Frame, tile_col: i32, strip_idx: i32) void {
-        const t0 = platform.PerfCounter();
-        const c0 = platform.ThreadCpuNs();
-        const tile = self.cs_tile_rect(tile_col, strip_idx);
+    fn doSsaoTile(self: *Frame, tile_col: i32, strip_idx: i32) void {
+        const t0 = platform.perfCounter();
+        const c0 = platform.threadCpuNs();
+        const tile = self.csTileRect(tile_col, strip_idx);
         const rs = self.rs;
         if (config.ENABLE_SSAO) {
-            draw.apply_ssao_strip(rs.pixels.?, rs.pitch, rs.linear_z.?, rs.normal_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, tile.x_min, tile.x_max, tile.y_min, tile.y_max, rs.frame_index, rs.projection.m[0][0], rs.projection.m[1][1]);
+            draw.applySsaoStrip(rs.pixels.?, rs.pitch, rs.linear_z.?, rs.normal_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, tile.x_min, tile.x_max, tile.y_min, tile.y_max, rs.frame_index, rs.projection.m[0][0], rs.projection.m[1][1]);
         }
-        const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Ssao));
+        const c1 = platform.threadCpuNs();
+        profiler.profilerRecordRaster(self.ctx.profiler, self.worker_id, t0, platform.perfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Ssao));
     }
 
-    fn do_lum_tile(self: *Frame, tile_col: i32, fstrip: i32) void {
-        const t0 = platform.PerfCounter();
-        const c0 = platform.ThreadCpuNs();
+    fn doLumTile(self: *Frame, tile_col: i32, fstrip: i32) void {
+        const t0 = platform.perfCounter();
+        const c0 = platform.threadCpuNs();
         const rs = self.rs;
-        const xs = config.tile_span(rs.screen_width, self.X, tile_col);
-        const ys = config.tile_span(rs.screen_height, self.R * 2, fstrip);
+        const xs = config.tileSpan(rs.screen_width, self.X, tile_col);
+        const ys = config.tileSpan(rs.screen_height, self.R * 2, fstrip);
         if (rs.use_spotlight) {
             if (rs.cone_buf_read) |cone| {
                 if (cone.valid) {
-                    draw.draw_spotlight_cone_strip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, cone, rs.light_pos, rs.spot_dir, rs.spot_outer_cos, xs.lo, xs.hi, ys.lo, ys.hi);
+                    draw.drawSpotlightConeStrip(rs.pixels.?, rs.pitch, rs.depth_buffer.?, rs.screen_width, rs.screen_height, rs.format.?, cone, rs.light_pos, rs.spot_dir, rs.spot_outer_cos, xs.lo, xs.hi, ys.lo, ys.hi);
                 }
             }
         }
-        const c1 = platform.ThreadCpuNs();
-        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, t0, platform.PerfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Luminaire));
+        const c1 = platform.threadCpuNs();
+        profiler.profilerRecordRaster(self.ctx.profiler, self.worker_id, t0, platform.perfCounter(), if (c1 > c0) c1 - c0 else 0, @intFromEnum(RasterJobMode.Luminaire));
     }
 
-    fn run_lum_tile(self: *Frame, col: i32, fstrip: i32) bool {
+    fn runLumTile(self: *Frame, col: i32, fstrip: i32) bool {
         const X = self.X;
         const coarse = fstrip >> 1;
         if (threading.color_tile_done[@intCast(coarse * X + col)].load(.acquire) == 0) return false;
         if (threading.ssao_tile_done[@intCast(coarse * X + col)].load(.acquire) == 0) return false;
         if (threading.lum_tile_claimed[@intCast(fstrip * X + col)].cmpxchgStrong(0, 1, .acq_rel, .monotonic)) |_| return false;
-        self.do_lum_tile(col, fstrip);
+        self.doLumTile(col, fstrip);
         const done = threading.raster_pass_tiles_done[@intFromEnum(RasterJobMode.Luminaire)].fetchAdd(1, .acq_rel) + 1;
-        if (done >= self.total_lum_tiles) self.advance_pass_to(RPC);
+        if (done >= self.total_lum_tiles) self.advancePassTo(RPC);
         return true;
     }
 
-    fn lum_drain(self: *Frame) void {
+    fn lumDrain(self: *Frame) void {
         var progressed = true;
         const X = self.X;
         while (progressed) {
@@ -192,17 +192,17 @@ const Frame = struct {
                 var c: i32 = 0;
                 while (c < X) : (c += 1) {
                     if (threading.lum_tile_claimed[@intCast(f * X + c)].load(.monotonic) != 0) continue;
-                    if (self.run_lum_tile(c, f)) progressed = true;
+                    if (self.runLumTile(c, f)) progressed = true;
                 }
             }
         }
     }
 
-    fn color_done(self: *Frame, c: i32, r: i32) bool {
+    fn colorDone(self: *Frame, c: i32, r: i32) bool {
         return threading.color_tile_done[@intCast(r * self.X + c)].load(.acquire) != 0;
     }
 
-    fn ssao_eligible(self: *Frame, c: i32, r: i32) bool {
+    fn ssaoEligible(self: *Frame, c: i32, r: i32) bool {
         var dr: i32 = -1;
         while (dr <= 1) : (dr += 1) {
             var dc: i32 = -1;
@@ -210,31 +210,31 @@ const Frame = struct {
                 const nc = c + dc;
                 const nr = r + dr;
                 if (nc < 0 or nc >= self.X or nr < 0 or nr >= self.R) continue;
-                if (!self.color_done(nc, nr)) return false;
+                if (!self.colorDone(nc, nr)) return false;
             }
         }
         return true;
     }
 
-    fn run_ssao_tile(self: *Frame, c: i32, r: i32) bool {
+    fn runSsaoTile(self: *Frame, c: i32, r: i32) bool {
         const X = self.X;
-        if (!self.ssao_eligible(c, r)) return false;
+        if (!self.ssaoEligible(c, r)) return false;
         if (threading.ssao_tile_claimed[@intCast(r * X + c)].cmpxchgStrong(0, 1, .acq_rel, .monotonic)) |_| return false;
-        self.do_ssao_tile(c, r);
+        self.doSsaoTile(c, r);
         threading.ssao_tile_done[@intCast(r * X + c)].store(1, .release);
         if (!self.hard_barrier) {
             var half: i32 = 0;
             while (half < 2) : (half += 1) {
                 const f = r * 2 + half;
-                if (threading.lum_tile_claimed[@intCast(f * X + c)].load(.monotonic) == 0) _ = self.run_lum_tile(c, f);
+                if (threading.lum_tile_claimed[@intCast(f * X + c)].load(.monotonic) == 0) _ = self.runLumTile(c, f);
             }
         }
         const done = threading.raster_pass_tiles_done[@intFromEnum(RasterJobMode.Ssao)].fetchAdd(1, .acq_rel) + 1;
-        if (done >= self.total_cs_tiles) self.advance_pass_to(@intFromEnum(RasterJobMode.Luminaire));
+        if (done >= self.total_cs_tiles) self.advancePassTo(@intFromEnum(RasterJobMode.Luminaire));
         return true;
     }
 
-    fn ssao_drain(self: *Frame) void {
+    fn ssaoDrain(self: *Frame) void {
         var progressed = true;
         const X = self.X;
         while (progressed) {
@@ -244,20 +244,20 @@ const Frame = struct {
                 var c: i32 = 0;
                 while (c < X) : (c += 1) {
                     if (threading.ssao_tile_claimed[@intCast(r * X + c)].load(.monotonic) != 0) continue;
-                    if (self.run_ssao_tile(c, r)) progressed = true;
+                    if (self.runSsaoTile(c, r)) progressed = true;
                 }
             }
         }
     }
 
-    fn do_shadow_tile(self: *Frame, tile_col: i32, strip_idx: i32, cols_total: i32, strips_total: i32) void {
+    fn doShadowTile(self: *Frame, tile_col: i32, strip_idx: i32, cols_total: i32, strips_total: i32) void {
         const rs = self.rs;
         const tile_idx: usize = @intCast(tile_col * config.NUM_STRIPS + strip_idx);
-        const tile_start_ts = platform.PerfCounter();
-        const tile_start_cpu_ns = platform.ThreadCpuNs();
+        const tile_start_ts = platform.perfCounter();
+        const tile_start_cpu_ns = platform.threadCpuNs();
 
-        const xs = config.tile_span(rs.shadow_size, cols_total, tile_col);
-        const ys = config.tile_span(rs.shadow_size, strips_total, strip_idx);
+        const xs = config.tileSpan(rs.shadow_size, cols_total, tile_col);
+        const ys = config.tileSpan(rs.shadow_size, strips_total, strip_idx);
         const x_min = xs.lo;
         const x_max = xs.hi;
         const y_min = ys.lo;
@@ -279,17 +279,17 @@ const Frame = struct {
                 const take_global = (si >= shadow_strip.items.len) or
                     (gi < rs.shadow_count and rs.shadow_triangles.?.items[gi].sort_z <= shadow_strip.items[si].sort_z);
                 if (take_global) {
-                    self.draw_shadow_tri(&rs.shadow_triangles.?.items[gi], x_min, x_max, y_min, y_max);
+                    self.drawShadowTri(&rs.shadow_triangles.?.items[gi], x_min, x_max, y_min, y_max);
                     gi += 1;
                 } else {
-                    self.draw_shadow_tri(&shadow_strip.items[si], x_min, x_max, y_min, y_max);
+                    self.drawShadowTri(&shadow_strip.items[si], x_min, x_max, y_min, y_max);
                     si += 1;
                 }
             }
         } else {
             var ti: usize = 0;
-            while (ti < rs.shadow_count) : (ti += 1) self.draw_shadow_tri(&rs.shadow_triangles.?.items[ti], x_min, x_max, y_min, y_max);
-            for (shadow_strip.items) |*tri| self.draw_shadow_tri(tri, x_min, x_max, y_min, y_max);
+            while (ti < rs.shadow_count) : (ti += 1) self.drawShadowTri(&rs.shadow_triangles.?.items[ti], x_min, x_max, y_min, y_max);
+            for (shadow_strip.items) |*tri| self.drawShadowTri(tri, x_min, x_max, y_min, y_max);
         }
 
         if (rs.shadow_box) |box| {
@@ -297,31 +297,31 @@ const Frame = struct {
                 const a = e[0];
                 const b = e[1];
                 if (box.visible[a] and box.visible[b]) {
-                    shadow.draw_shadow_line_strip(sd, rs.shadow_size, &box.vertices[a], &box.vertices[b], x_min, x_max, y_min, y_max);
+                    shadow.drawShadowLineStrip(sd, rs.shadow_size, &box.vertices[a], &box.vertices[b], x_min, x_max, y_min, y_max);
                 }
             }
         }
 
-        const tile_end_cpu_ns = platform.ThreadCpuNs();
+        const tile_end_cpu_ns = platform.threadCpuNs();
         const tile_cpu_ns = if (tile_end_cpu_ns > tile_start_cpu_ns) tile_end_cpu_ns - tile_start_cpu_ns else 0;
-        profiler.profiler_record_raster(self.ctx.profiler, self.worker_id, tile_start_ts, platform.PerfCounter(), tile_cpu_ns, @intFromEnum(RasterJobMode.ShadowDepth));
+        profiler.profilerRecordRaster(self.ctx.profiler, self.worker_id, tile_start_ts, platform.perfCounter(), tile_cpu_ns, @intFromEnum(RasterJobMode.ShadowDepth));
     }
 
-    fn draw_shadow_tri(self: *Frame, tri: *const RenderTriangle, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
+    fn drawShadowTri(self: *Frame, tri: *const RenderTriangle, x_min: i32, x_max: i32, y_min: i32, y_max: i32) void {
         const rs = self.rs;
         var sv0: ShadowVertex = undefined;
         var sv1: ShadowVertex = undefined;
         var sv2: ShadowVertex = undefined;
-        if (shadow.shadow_vertex_from_varying(&tri.v0, &sv0) and
-            shadow.shadow_vertex_from_varying(&tri.v1, &sv1) and
-            shadow.shadow_vertex_from_varying(&tri.v2, &sv2))
+        if (shadow.shadowVertexFromVarying(&tri.v0, &sv0) and
+            shadow.shadowVertexFromVarying(&tri.v1, &sv1) and
+            shadow.shadowVertexFromVarying(&tri.v2, &sv2))
         {
-            shadow.draw_shadow_triangle_strip(rs.shadow_depth_write.?, rs.shadow_size, &sv0, &sv1, &sv2, x_min, x_max, y_min, y_max, tri.shadow_screendoor_mask);
+            shadow.drawShadowTriangleStrip(rs.shadow_depth_write.?, rs.shadow_size, &sv0, &sv1, &sv2, x_min, x_max, y_min, y_max, tri.shadow_screendoor_mask);
         }
     }
 };
 
-pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: bool) void {
+pub fn rasterWorkerFrame(worker_id: i32, ctx: *RendererContext, shadow_only: bool) void {
     if (!threading.pool_do_raster) return;
 
     const pool = threading.active_raster_job_thread_count;
@@ -351,7 +351,7 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
         if (shadow_only and job_mode != RasterJobMode.ShadowDepth) break;
 
         if (job_mode == RasterJobMode.Ssao) {
-            frame.ssao_drain();
+            frame.ssaoDrain();
             threading.mtx_pool.lock();
             defer threading.mtx_pool.unlock();
             while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
@@ -359,7 +359,7 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
         }
 
         if (job_mode == RasterJobMode.Luminaire) {
-            frame.lum_drain();
+            frame.lumDrain();
             threading.mtx_pool.lock();
             defer threading.mtx_pool.unlock();
             while (!(threading.raster_pass.load(.acquire) > P or !threading.pool_threads_running.load(.monotonic))) threading.cv_pool.wait(&threading.mtx_pool);
@@ -384,10 +384,10 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
             const strip_idx = current_row;
 
             if (job_mode == RasterJobMode.Color) {
-                frame.do_color_tile(tile_col, strip_idx);
+                frame.doColorTile(tile_col, strip_idx);
                 threading.color_tile_done[@intCast(strip_idx * X + tile_col)].store(1, .release);
                 const done = threading.raster_pass_tiles_done[@intCast(P)].fetchAdd(1, .acq_rel) + 1;
-                if (done >= total_tiles) frame.advance_pass_to(P + 1);
+                if (done >= total_tiles) frame.advancePassTo(P + 1);
                 if (!hard_barrier) {
                     var dr: i32 = -1;
                     while (dr <= 1) : (dr += 1) {
@@ -396,19 +396,19 @@ pub fn raster_worker_frame(worker_id: i32, ctx: *RendererContext, shadow_only: b
                             const nc = tile_col + dc;
                             const nr = strip_idx + dr;
                             if (nc < 0 or nc >= X or nr < 0 or nr >= R) continue;
-                            if (threading.ssao_tile_claimed[@intCast(nr * X + nc)].load(.monotonic) == 0) _ = frame.run_ssao_tile(nc, nr);
+                            if (threading.ssao_tile_claimed[@intCast(nr * X + nc)].load(.monotonic) == 0) _ = frame.runSsaoTile(nc, nr);
                         }
                     }
                 }
                 continue;
             }
 
-            frame.do_shadow_tile(tile_col, strip_idx, cols_total, strips_total);
+            frame.doShadowTile(tile_col, strip_idx, cols_total, strips_total);
             const done = threading.raster_pass_tiles_done[@intCast(P)].fetchAdd(1, .acq_rel) + 1;
-            if (done >= total_tiles) frame.advance_pass_to(P + 1);
+            if (done >= total_tiles) frame.advancePassTo(P + 1);
         }
 
-        if (job_mode == RasterJobMode.Color and !hard_barrier) frame.ssao_drain();
+        if (job_mode == RasterJobMode.Color and !hard_barrier) frame.ssaoDrain();
 
         if (shadow_only) return;
 

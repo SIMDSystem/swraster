@@ -50,7 +50,7 @@ pub const ClipVertex = struct {
 // Eye-space point projected to screen space; null when behind the near guard.
 pub const ScreenPoint = struct { x: f32, y: f32, z: f32, inv_w: f32 };
 
-pub inline fn project_eye_point(projection: *const Mat4, p: Vec3, screen_width: i32, screen_height: i32) ?ScreenPoint {
+pub inline fn projectEyePoint(projection: *const Mat4, p: Vec3, screen_width: i32, screen_height: i32) ?ScreenPoint {
     const clip = projection.mulVec4(Vec4.init(p.x, p.y, p.z, 1.0));
     if (clip.w <= 0.1) return null;
     const inv_w = 1.0 / clip.w;
@@ -64,7 +64,7 @@ pub inline fn project_eye_point(projection: *const Mat4, p: Vec3, screen_width: 
     };
 }
 
-pub fn build_projection_matrix(fov_degrees: f32, aspect: f32, near_plane: f32, far_plane: f32) Mat4 {
+pub fn buildProjectionMatrix(fov_degrees: f32, aspect: f32, near_plane: f32, far_plane: f32) Mat4 {
     const fov_rad = fov_degrees * std.math.pi / 180.0;
     const f = 1.0 / @tan(fov_rad / 2.0);
 
@@ -98,7 +98,7 @@ pub fn lookAt(eye: Vec3, target: Vec3, up: Vec3) Mat4 {
     return view;
 }
 
-pub fn build_shadow_tex_matrix(view_matrix: *const Mat4, light_dir: Vec3, scene_min: Vec3, scene_max: Vec3) Mat4 {
+pub fn buildShadowTexMatrix(view_matrix: *const Mat4, light_dir: Vec3, scene_min: Vec3, scene_max: Vec3) Mat4 {
     const L = light_dir.normalized();
     var up = Vec3.init(0, 1, 0);
     if (@abs(L.dot(up)) > 0.95) up = Vec3.init(1, 0, 0);
@@ -164,8 +164,8 @@ pub fn build_shadow_tex_matrix(view_matrix: *const Mat4, light_dir: Vec3, scene_
     return m;
 }
 
-pub fn build_spot_shadow_tex_matrix(light_view_eye: *const Mat4, fov_degrees: f32, near_plane: f32, far_plane: f32) Mat4 {
-    const light_proj = build_projection_matrix(fov_degrees, 1.0, near_plane, far_plane);
+pub fn buildSpotShadowTexMatrix(light_view_eye: *const Mat4, fov_degrees: f32, near_plane: f32, far_plane: f32) Mat4 {
+    const light_proj = buildProjectionMatrix(fov_degrees, 1.0, near_plane, far_plane);
     var bias = Mat4.identity();
     bias.m[0][0] = 0.5;
     bias.m[0][3] = 0.5;
@@ -176,9 +176,9 @@ pub fn build_spot_shadow_tex_matrix(light_view_eye: *const Mat4, fov_degrees: f3
     return bias.mul(light_proj).mul(light_view_eye.*);
 }
 
-pub fn transform_vertices(source_vertices: *const RenderVertexList, transformed_vertices: *RenderVertexList, transform: *const Mat4) void {
+pub fn transformVertices(source_vertices: *const RenderVertexList, transformed_vertices: *RenderVertexList, transform: *const Mat4) void {
     @setFloatMode(.optimized);
-    transformed_vertices.resize(source_vertices.items.len) catch unreachable;
+    transformed_vertices.resize(std.heap.c_allocator, source_vertices.items.len) catch unreachable;
     const normal_matrix: Mat3 = transform.block33();
 
     for (transformed_vertices.items, source_vertices.items) |*dst, src| {
@@ -192,7 +192,7 @@ pub fn transform_vertices(source_vertices: *const RenderVertexList, transformed_
     }
 }
 
-pub fn project_vertex(v3d: *const Vertex3D, screen_width: i32, screen_height: i32) VertexVaryings {
+pub fn projectVertex(v3d: *const Vertex3D, screen_width: i32, screen_height: i32) VertexVaryings {
     @setFloatMode(.optimized);
     const w = v3d.position.w;
     const inv_w = 1.0 / w;
@@ -223,7 +223,7 @@ pub fn project_vertex(v3d: *const Vertex3D, screen_width: i32, screen_height: i3
     return v2d;
 }
 
-pub fn is_back_face(v0: *const Vertex3D, v1: *const Vertex3D, v2: *const Vertex3D) bool {
+pub fn isBackFace(v0: *const Vertex3D, v1: *const Vertex3D, v2: *const Vertex3D) bool {
     const p0 = v0.position.head3();
     const p1 = v1.position.head3();
     const p2 = v2.position.head3();
@@ -231,18 +231,18 @@ pub fn is_back_face(v0: *const Vertex3D, v1: *const Vertex3D, v2: *const Vertex3
     return normal.dot(p0.neg()) < 0.0;
 }
 
-inline fn near_plane_distance(v: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) f32 {
+inline fn nearPlaneDistance(v: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) f32 {
     const p = view_matrix.mulVec4(v.position);
     return -p.z - near_plane;
 }
 
-inline fn is_inside_near(v: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) bool {
-    return near_plane_distance(v, view_matrix, near_plane) >= 0.0;
+inline fn isInsideNear(v: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) bool {
+    return nearPlaneDistance(v, view_matrix, near_plane) >= 0.0;
 }
 
-inline fn interpolate_clip_vertex(a: *const ClipVertex, b: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) ClipVertex {
-    const da = near_plane_distance(a, view_matrix, near_plane);
-    const db = near_plane_distance(b, view_matrix, near_plane);
+inline fn interpolateClipVertex(a: *const ClipVertex, b: *const ClipVertex, view_matrix: *const Mat4, near_plane: f32) ClipVertex {
+    const da = nearPlaneDistance(a, view_matrix, near_plane);
+    const db = nearPlaneDistance(b, view_matrix, near_plane);
     const t = da / (da - db);
     var out = ClipVertex{};
     out.position = a.position.add(b.position.sub(a.position).scale(t));
@@ -256,15 +256,15 @@ inline fn interpolate_clip_vertex(a: *const ClipVertex, b: *const ClipVertex, vi
     return out;
 }
 
-pub fn clip_triangle_near(in: *const [3]ClipVertex, out: *[4]ClipVertex, view_matrix: *const Mat4, near_plane: f32) i32 {
+pub fn clipTriangleNear(in: *const [3]ClipVertex, out: *[4]ClipVertex, view_matrix: *const Mat4, near_plane: f32) i32 {
     var out_count: i32 = 0;
     var prev = in[2];
-    var prev_inside = is_inside_near(&prev, view_matrix, near_plane);
+    var prev_inside = isInsideNear(&prev, view_matrix, near_plane);
 
     for (in) |cur| {
-        const cur_inside = is_inside_near(&cur, view_matrix, near_plane);
+        const cur_inside = isInsideNear(&cur, view_matrix, near_plane);
         if (cur_inside != prev_inside) {
-            out[@intCast(out_count)] = interpolate_clip_vertex(&prev, &cur, view_matrix, near_plane);
+            out[@intCast(out_count)] = interpolateClipVertex(&prev, &cur, view_matrix, near_plane);
             out_count += 1;
         }
         if (cur_inside) {
@@ -277,7 +277,7 @@ pub fn clip_triangle_near(in: *const [3]ClipVertex, out: *[4]ClipVertex, view_ma
     return out_count;
 }
 
-pub fn is_back_face_clip_vertices(v0: *const ClipVertex, v1: *const ClipVertex, v2: *const ClipVertex) bool {
+pub fn isBackFaceClipVertices(v0: *const ClipVertex, v1: *const ClipVertex, v2: *const ClipVertex) bool {
     const p0 = v0.position.head3();
     const p1 = v1.position.head3();
     const p2 = v2.position.head3();
@@ -285,7 +285,7 @@ pub fn is_back_face_clip_vertices(v0: *const ClipVertex, v1: *const ClipVertex, 
     return normal.dot(p0.neg()) < 0.0;
 }
 
-pub fn project_clip_vertex(v: *const ClipVertex, projection: *const Mat4, shadow_matrix: *const Mat4, screen_width: i32, screen_height: i32) VertexVaryings {
+pub fn projectClipVertex(v: *const ClipVertex, projection: *const Mat4, shadow_matrix: *const Mat4, screen_width: i32, screen_height: i32) VertexVaryings {
     @setFloatMode(.optimized);
     var projected = Vertex3D{};
     projected.position = projection.mulVec4(v.position);
@@ -295,7 +295,7 @@ pub fn project_clip_vertex(v: *const ClipVertex, projection: *const Mat4, shadow
     projected.u = v.u;
     projected.v = v.v;
 
-    var out = project_vertex(&projected, screen_width, screen_height);
+    var out = projectVertex(&projected, screen_width, screen_height);
     out.a = v.a;
     out.nx = v.normal.x;
     out.ny = v.normal.y;

@@ -64,7 +64,7 @@ const mac = if (is_mac) @import("platform_mac.zig") else struct {};
 // ===========================================================================
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
-pub fn ThreadCpuNs() u64 {
+pub fn threadCpuNs() u64 {
     var ts: std.c.timespec = undefined;
     // CLOCK_THREAD_CPUTIME_ID: CPU time consumed by the calling thread.
     if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
@@ -87,7 +87,7 @@ var bmp_rgba_format: PixelFormat = .{
     .Amask = 0xff000000,
 };
 
-pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
+pub fn loadBmp(path: [*:0]const u8) ?*Surface {
     const alloc = std.heap.c_allocator;
     const file = std.c.fopen(path, "rb") orelse return null;
     defer _ = std.c.fclose(file);
@@ -153,7 +153,7 @@ pub fn LoadBMP(path: [*:0]const u8) ?*Surface {
     return surf;
 }
 
-pub fn FreeSurface(s: ?*Surface) void {
+pub fn freeSurface(s: ?*Surface) void {
     const surf = s orelse return;
     if (surf.owns_pixels) {
         if (surf.pixels) |p| std.c.free(p);
@@ -164,51 +164,51 @@ pub fn FreeSurface(s: ?*Surface) void {
 // ===========================================================================
 //  Backend dispatch
 // ===========================================================================
-pub fn Init(w: i32, h: i32, title: [*:0]const u8) bool {
-    if (is_mac) return mac.Init(w, h, title);
+pub fn init(w: i32, h: i32, title: [*:0]const u8) bool {
+    if (is_mac) return mac.init(w, h, title);
     if (is_web) return web.init(w, h, title);
     return false;
 }
-pub fn Shutdown() void {
-    if (is_mac) return mac.Shutdown();
+pub fn shutdown() void {
+    if (is_mac) return mac.shutdown();
     if (is_web) return web.shutdown();
 }
-pub fn GetFramebuffer() ?*Surface {
-    if (is_mac) return mac.GetFramebuffer();
+pub fn getFramebuffer() ?*Surface {
+    if (is_mac) return mac.getFramebuffer();
     if (is_web) return web.getFramebuffer();
     return null;
 }
-pub fn Present() void {
-    if (is_mac) return mac.Present();
+pub fn present() void {
+    if (is_mac) return mac.present();
     if (is_web) return web.present();
 }
-pub fn IsRenderable() bool {
-    if (is_mac) return mac.IsRenderable();
+pub fn isRenderable() bool {
+    if (is_mac) return mac.isRenderable();
     if (is_web) return web.isRenderable();
     return true;
 }
-pub fn PollEvent(out: *Event) bool {
-    if (is_mac) return mac.PollEvent(out);
+pub fn pollEvent(out: *Event) bool {
+    if (is_mac) return mac.pollEvent(out);
     if (is_web) return web.pollEvent(out);
     return false;
 }
-pub fn TicksMs() u64 {
-    if (is_mac) return mac.TicksMs();
+pub fn ticksMs() u64 {
+    if (is_mac) return mac.ticksMs();
     if (is_web) return web.ticksMs();
     return @intCast(std.time.milliTimestamp());
 }
-pub fn PerfCounter() u64 {
-    if (is_mac) return mac.PerfCounter();
+pub fn perfCounter() u64 {
+    if (is_mac) return mac.perfCounter();
     if (is_web) return web.perfCounter();
     return @intCast(std.time.nanoTimestamp());
 }
-pub fn PerfFrequency() u64 {
-    if (is_mac) return mac.PerfFrequency();
+pub fn perfFrequency() u64 {
+    if (is_mac) return mac.perfFrequency();
     if (is_web) return web.perfFrequency();
     return 1_000_000_000;
 }
-pub fn Delay(ms: u32) void {
-    if (is_mac) return mac.Delay(ms);
+pub fn delay(ms: u32) void {
+    if (is_mac) return mac.delay(ms);
     if (is_web) return web.delay(ms);
     std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
 }
@@ -234,7 +234,7 @@ const web = struct {
     var q_head: usize = 0;
     var q_tail: usize = 0;
 
-    fn push_event(ev: Event) void {
+    fn pushEvent(ev: Event) void {
         event_mtx.lock();
         defer event_mtx.unlock();
         const next = (q_tail + 1) % QueueLen;
@@ -307,20 +307,20 @@ const web = struct {
 
     // C entry points called directly from JS in the page shell.
     export fn swr_push_key(key: c_int) void {
-        push_event(.{ .type = .KeyDown, .key = key });
+        pushEvent(.{ .type = .KeyDown, .key = key });
     }
     export fn swr_push_mouse_button(button: c_int, pressed: c_int) void {
-        push_event(.{ .type = .MouseButton, .button = button, .pressed = pressed != 0 });
+        pushEvent(.{ .type = .MouseButton, .button = button, .pressed = pressed != 0 });
     }
     export fn swr_push_mouse_motion(dx: c_int, dy: c_int) void {
-        push_event(.{ .type = .MouseMotion, .xrel = dx, .yrel = dy });
+        pushEvent(.{ .type = .MouseMotion, .xrel = dx, .yrel = dy });
     }
     export fn swr_push_wheel(wy: c_int) void {
-        push_event(.{ .type = .MouseWheel, .wheel_y = wy });
+        pushEvent(.{ .type = .MouseWheel, .wheel_y = wy });
     }
     export fn swr_push_visibility(visible: c_int) void {
         page_visible = visible != 0;
-        push_event(.{ .type = .VisibilityChanged, .visible = visible != 0 });
+        pushEvent(.{ .type = .VisibilityChanged, .visible = visible != 0 });
     }
 };
 

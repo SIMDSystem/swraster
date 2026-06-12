@@ -39,7 +39,7 @@ pub var cv_main: sync.Condition = .{};
 
 pub var tl_done_counter = std.atomic.Value(i32).init(0);
 
-// std::vector<std::mutex> — allocated in init_thread_counts.
+// std::vector<std::mutex> — allocated in initThreadCounts.
 pub var tile_bin_locks: []sync.Mutex = &.{};
 
 pub var raster_row_next_col = [_][MAX_RASTER_STRIPS]std.atomic.Value(i32){[_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** MAX_RASTER_STRIPS} ** RASTER_PASS_COUNT;
@@ -50,7 +50,7 @@ pub var ssao_tile_done = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} *
 pub var lum_tile_claimed = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** MAX_RASTER_TILES;
 
 // Wait for a predicate worker threads will eventually set true.
-pub fn wait_for_main_thread_predicate(context: anytype, comptime predicate: fn (@TypeOf(context)) bool) void {
+pub fn waitForMainThreadPredicate(context: anytype, comptime predicate: fn (@TypeOf(context)) bool) void {
     if (builtin.target.os.tag != .emscripten) {
         mtx_main.lock();
         defer mtx_main.unlock();
@@ -71,7 +71,7 @@ pub const JOLT_WORKER_THREADS: i32 = 2;
 // takes a BSD sysctl path on this target, pulling in an undefined sysctlbyname.
 extern fn emscripten_num_logical_cores() c_int;
 
-pub fn init_thread_counts() void {
+pub fn initThreadCounts() void {
     var hw: i32 = if (builtin.target.os.tag == .emscripten)
         emscripten_num_logical_cores()
     else
@@ -96,12 +96,12 @@ pub fn init_thread_counts() void {
 
 // ---- Perf timing ----
 var inv_freq_ms: f64 = 0.0;
-pub fn perf_ms(start: u64, end: u64) f64 {
-    if (inv_freq_ms == 0.0) inv_freq_ms = 1000.0 / @as(f64, @floatFromInt(platform.PerfFrequency()));
+pub fn perfMs(start: u64, end: u64) f64 {
+    if (inv_freq_ms == 0.0) inv_freq_ms = 1000.0 / @as(f64, @floatFromInt(platform.perfFrequency()));
     return @as(f64, @floatFromInt(end - start)) * inv_freq_ms;
 }
 
-pub fn process_cpu_ms() f64 {
+pub fn processCpuMs() f64 {
     if (builtin.target.os.tag == .emscripten) return 0.0;
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const timeval_ms = struct {
@@ -121,7 +121,7 @@ pub const ThreadPerfVariant = struct {
 pub const ThreadPerfSearch = struct {
     enabled: bool = false,
     frames_per_variant: i32 = 1000,
-    variants: std.array_list.Managed(ThreadPerfVariant) = undefined,
+    variants: std.ArrayList(ThreadPerfVariant) = .empty,
     log: ?*std.c.FILE = null,
     variant_index: usize = 0,
     frames_this_variant: i32 = 0,
@@ -142,9 +142,8 @@ pub const ThreadPerfSearch = struct {
     max_raster_threads: i32 = 0,
 };
 
-pub fn make_thread_perf_search(args: []const [:0]const u8) ThreadPerfSearch {
+pub fn makeThreadPerfSearch(args: []const [:0]const u8) ThreadPerfSearch {
     var search = ThreadPerfSearch{};
-    search.variants = std.array_list.Managed(ThreadPerfVariant).init(std.heap.c_allocator);
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--threadperf")) {
@@ -181,7 +180,7 @@ pub fn make_thread_perf_search(args: []const [:0]const u8) ThreadPerfSearch {
     while (tl <= search.max_tl_threads) : (tl += 1) {
         var raster = search.min_raster_threads;
         while (raster <= search.max_raster_threads) : (raster += 1) {
-            search.variants.append(.{ .tl_threads = tl, .raster_threads = raster }) catch unreachable;
+            search.variants.append(std.heap.c_allocator, .{ .tl_threads = tl, .raster_threads = raster }) catch unreachable;
         }
     }
     return search;

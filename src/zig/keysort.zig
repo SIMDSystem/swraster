@@ -31,15 +31,15 @@ pub fn sortByKey(
     comptime T: type,
     items: []T,
     ascending: bool,
-    keys: *std.array_list.Managed(KeyIdx),
-    gather: *std.array_list.Managed(T),
+    keys: *std.ArrayList(KeyIdx),
+    gather: *std.ArrayList(T),
     comptime keyOf: fn (*const T) f32,
 ) void {
     const n = items.len;
     if (n < 2) return;
 
     keys.clearRetainingCapacity();
-    keys.ensureTotalCapacity(n) catch unreachable;
+    keys.ensureTotalCapacity(std.heap.c_allocator, n) catch unreachable;
     var i: u32 = 0;
     while (i < n) : (i += 1) {
         keys.appendAssumeCapacity(.{ .key = keyOf(&items[i]), .idx = i });
@@ -52,7 +52,7 @@ pub fn sortByKey(
     }
 
     gather.clearRetainingCapacity();
-    gather.ensureTotalCapacity(n) catch unreachable;
+    gather.ensureTotalCapacity(std.heap.c_allocator, n) catch unreachable;
     for (keys.items) |ki| {
         gather.appendAssumeCapacity(items[ki.idx]);
     }

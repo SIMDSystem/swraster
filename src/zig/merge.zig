@@ -23,7 +23,7 @@ pub fn mergeSortedRuns(
     comptime T: type,
     items: []T,
     mid: usize,
-    scratch: *std.array_list.Managed(T),
+    scratch: *std.ArrayList(T),
     context: anytype,
     comptime lessThan: fn (@TypeOf(context), T, T) bool,
 ) void {
@@ -37,7 +37,7 @@ pub fn mergeSortedRuns(
         // index k never overtakes the right read index j: k = i + (j - mid) and
         // i <= mid, so k <= j throughout — no unread element is clobbered.
         scratch.clearRetainingCapacity();
-        scratch.appendSlice(items[0..left_len]) catch unreachable;
+        scratch.appendSlice(std.heap.c_allocator, items[0..left_len]) catch unreachable;
         const buf = scratch.items;
         var i: usize = 0; // index into buf (left run)
         var j: usize = mid; // index into items (right run)
@@ -62,7 +62,7 @@ pub fn mergeSortedRuns(
         // index k-1 is always >= the left read index i-1 (k = i + j, j >= 1),
         // so the unread left run is never clobbered.
         scratch.clearRetainingCapacity();
-        scratch.appendSlice(items[mid..n]) catch unreachable;
+        scratch.appendSlice(std.heap.c_allocator, items[mid..n]) catch unreachable;
         const buf = scratch.items;
         var i: usize = mid; // one past current left index
         var j: usize = right_len; // count remaining in buf

@@ -20,7 +20,7 @@ pub const ShadowVertex = struct {
     z: f32 = 0,
 };
 
-pub inline fn shadow_vertex_from_varying(v: *const VertexVaryings, out: *ShadowVertex) bool {
+pub inline fn shadowVertexFromVarying(v: *const VertexVaryings, out: *ShadowVertex) bool {
     if (v.sq == 0.0) return false;
     const inv_q = 1.0 / v.sq;
     out.x = v.ss * inv_q * @as(f32, @floatFromInt(SHADOW_MAP_SIZE - 1));
@@ -29,7 +29,7 @@ pub inline fn shadow_vertex_from_varying(v: *const VertexVaryings, out: *ShadowV
     return true;
 }
 
-pub fn sample_shadow_compare_bilinear(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, s: f32, t: f32, r: f32) f32 {
+pub fn sampleShadowCompareBilinear(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, s: f32, t: f32, r: f32) f32 {
     const depth = shadow_depth orelse return 1.0;
     if (shadow_size <= 0) return 1.0;
     if (s < 0.0 or s > 1.0 or t < 0.0 or t > 1.0 or r < 0.0 or r > 1.0) return 1.0;
@@ -40,7 +40,7 @@ pub fn sample_shadow_compare_bilinear(shadow_depth: ?[*]const ShadowDepth, shado
     const y0: i32 = @intFromFloat(@floor(fy));
     const tx = fx - @as(f32, @floatFromInt(x0));
     const ty = fy - @as(f32, @floatFromInt(y0));
-    const r16 = config.shadow_depth_to_u16(r);
+    const r16 = config.shadowDepthToU16(r);
 
     const compare = struct {
         fn f(d: [*]const ShadowDepth, size: i32, ri: ShadowDepth, x: i32, y: i32) f32 {
@@ -60,7 +60,7 @@ pub fn sample_shadow_compare_bilinear(shadow_depth: ?[*]const ShadowDepth, shado
     return cx0 + (cx1 - cx0) * ty;
 }
 
-pub fn sample_shadow_compare_bilinear_2x2(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, s: f32, t: f32, r: f32) f32 {
+pub fn sampleShadowCompareBilinear2x2(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, s: f32, t: f32, r: f32) f32 {
     @setFloatMode(.optimized);
     const depth = shadow_depth orelse return 1.0;
     if (shadow_size <= 0) return 1.0;
@@ -69,7 +69,7 @@ pub fn sample_shadow_compare_bilinear_2x2(shadow_depth: ?[*]const ShadowDepth, s
     if (r < 0.0 or r > 1.0) return 1.0;
 
     const sizef = @as(f32, @floatFromInt(shadow_size - 1));
-    const r16: u32 = config.shadow_depth_to_u16(r);
+    const r16: u32 = config.shadowDepthToU16(r);
 
     const fx = s * sizef;
     const fy = t * sizef;
@@ -127,7 +127,7 @@ pub fn sample_shadow_compare_bilinear_2x2(shadow_depth: ?[*]const ShadowDepth, s
     return sum * 0.25;
 }
 
-pub fn sample_shadow_pcf(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, shadow: Vec4) f32 {
+pub fn sampleShadowPcf(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, shadow: Vec4) f32 {
     const depth = shadow_depth orelse return 1.0;
     if (shadow_size <= 0 or shadow.w == 0.0) return 1.0;
     const inv_w = 1.0 / shadow.w;
@@ -135,14 +135,14 @@ pub fn sample_shadow_pcf(shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, 
     const t = shadow.y * inv_w;
     const r = shadow.z * inv_w;
     if (s < 0.0 or s > 1.0 or t < 0.0 or t > 1.0 or r < 0.0 or r > 1.0) return 1.0;
-    return sample_shadow_compare_bilinear_2x2(depth, shadow_size, s, t, r);
+    return sampleShadowCompareBilinear2x2(depth, shadow_size, s, t, r);
 }
 
-pub fn draw_shadow_triangle(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, v2: *const ShadowVertex) void {
-    draw_shadow_triangle_strip(shadow_depth, shadow_size, v0, v1, v2, 0, shadow_size - 1, 0, shadow_size - 1, -1);
+pub fn drawShadowTriangle(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, v2: *const ShadowVertex) void {
+    drawShadowTriangleStrip(shadow_depth, shadow_size, v0, v1, v2, 0, shadow_size - 1, 0, shadow_size - 1, -1);
 }
 
-pub fn draw_shadow_triangle_strip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, v2: *const ShadowVertex, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, screendoor_mask: i32) void {
+pub fn drawShadowTriangleStrip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, v2: *const ShadowVertex, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, screendoor_mask: i32) void {
     @setFloatMode(.optimized);
     var x_min: i32 = @intFromFloat(@floor(@min(v0.x, @min(v1.x, v2.x))));
     var x_max: i32 = @intFromFloat(@ceil(@max(v0.x, @max(v1.x, v2.x))));
@@ -224,7 +224,7 @@ pub fn draw_shadow_triangle_strip(shadow_depth: [*]ShadowDepth, shadow_size: i32
     }
 }
 
-pub fn draw_shadow_line(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex) void {
+pub fn drawShadowLine(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex) void {
     var x0: i32 = @intFromFloat(v0.x + 0.5);
     var y0: i32 = @intFromFloat(v0.y + 0.5);
     const x1: i32 = @intFromFloat(v1.x + 0.5);
@@ -241,7 +241,7 @@ pub fn draw_shadow_line(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *con
     while (true) {
         if (x0 >= 0 and x0 < shadow_size and y0 >= 0 and y0 < shadow_size and z >= 0.0 and z <= 1.0) {
             const idx: usize = @intCast(y0 * shadow_size + x0);
-            const z16 = config.shadow_depth_to_u16(z);
+            const z16 = config.shadowDepthToU16(z);
             if (z16 < shadow_depth[idx]) shadow_depth[idx] = z16;
         }
         if (x0 == x1 and y0 == y1) break;
@@ -258,13 +258,13 @@ pub fn draw_shadow_line(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *con
     }
 }
 
-pub fn draw_shadow_line_strip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32) void {
+pub fn drawShadowLineStrip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0: *const ShadowVertex, v1: *const ShadowVertex, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32) void {
     const clip_xmin: f32 = @floatFromInt(@max(x_tile_min, 0));
     const clip_ymin: f32 = @floatFromInt(@max(y_strip_min, 0));
     const clip_xmax: f32 = @floatFromInt(@min(x_tile_max, shadow_size - 1));
     const clip_ymax: f32 = @floatFromInt(@min(y_strip_max, shadow_size - 1));
     if (clip_xmin > clip_xmax or clip_ymin > clip_ymax) return;
-    const span = draw.clip_line_to_rect(v0.x, v0.y, v1.x, v1.y, clip_xmin, clip_ymin, clip_xmax, clip_ymax) orelse return;
+    const span = draw.clipLineToRect(v0.x, v0.y, v1.x, v1.y, clip_xmin, clip_ymin, clip_xmax, clip_ymax) orelse return;
     const dx_f = v1.x - v0.x;
     const dy_f = v1.y - v0.y;
     const dz_f = v1.z - v0.z;
@@ -286,7 +286,7 @@ pub fn draw_shadow_line_strip(shadow_depth: [*]ShadowDepth, shadow_size: i32, v0
     while (true) {
         if (z >= 0.0 and z <= 1.0) {
             const idx: usize = @intCast(y0 * shadow_size + x0);
-            const z16 = config.shadow_depth_to_u16(z);
+            const z16 = config.shadowDepthToU16(z);
             if (z16 < shadow_depth[idx]) shadow_depth[idx] = z16;
         }
         if (x0 == x1 and y0 == y1) break;

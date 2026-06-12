@@ -71,11 +71,11 @@ var rng_state: std.Random.DefaultPrng = undefined;
 fn srand(seed: u64) void {
     rng_state = std.Random.DefaultPrng.init(seed);
 }
-fn rand_unit() f32 {
+fn randUnit() f32 {
     return rng_state.random().float(f32);
 }
 
-pub fn compute_bound_radius(vertices: *const RenderVertexList) f32 {
+pub fn computeBoundRadius(vertices: *const RenderVertexList) f32 {
     var max_r2: f32 = 0.0;
     for (vertices.items) |v| {
         max_r2 = @max(max_r2, v.position.head3().squaredNorm());
@@ -83,45 +83,45 @@ pub fn compute_bound_radius(vertices: *const RenderVertexList) f32 {
     return @sqrt(max_r2);
 }
 
-pub fn build_ground_geometry(ground_half: f32, out_vertices: *RenderVertexList, out_faces: *std.array_list.Managed(Face)) void {
+pub fn buildGroundGeometry(ground_half: f32, out_vertices: *RenderVertexList, out_faces: *std.ArrayList(Face)) void {
     out_vertices.clearRetainingCapacity();
     out_faces.clearRetainingCapacity();
-    const add_vertex = struct {
+    const addVertex = struct {
         fn f(verts: *RenderVertexList, x: f32, z: f32, u: f32, vv: f32) i32 {
             var vert = Vertex3D.at(x, 0.0, z);
             vert.normal = la.Vec3.init(0, 1, 0);
             vert.u = u;
             vert.v = vv;
-            verts.append(vert) catch unreachable;
+            verts.append(std.heap.c_allocator, vert) catch unreachable;
             return @intCast(verts.items.len - 1);
         }
     }.f;
-    const g0 = add_vertex(out_vertices, -ground_half, -ground_half, 0.0, 0.0);
-    const g1 = add_vertex(out_vertices, ground_half, -ground_half, 2.0, 0.0);
-    const g2 = add_vertex(out_vertices, ground_half, ground_half, 2.0, 2.0);
-    const g3 = add_vertex(out_vertices, -ground_half, ground_half, 0.0, 2.0);
-    out_faces.append(.{ .v0 = g0, .v1 = g2, .v2 = g1, .r = 0.68, .g = 0.68, .b = 0.68, .a = 1.0 }) catch unreachable;
-    out_faces.append(.{ .v0 = g0, .v1 = g3, .v2 = g2, .r = 0.68, .g = 0.68, .b = 0.68, .a = 1.0 }) catch unreachable;
+    const g0 = addVertex(out_vertices, -ground_half, -ground_half, 0.0, 0.0);
+    const g1 = addVertex(out_vertices, ground_half, -ground_half, 2.0, 0.0);
+    const g2 = addVertex(out_vertices, ground_half, ground_half, 2.0, 2.0);
+    const g3 = addVertex(out_vertices, -ground_half, ground_half, 0.0, 2.0);
+    out_faces.append(std.heap.c_allocator, .{ .v0 = g0, .v1 = g2, .v2 = g1, .r = 0.68, .g = 0.68, .b = 0.68, .a = 1.0 }) catch unreachable;
+    out_faces.append(std.heap.c_allocator, .{ .v0 = g0, .v1 = g3, .v2 = g2, .r = 0.68, .g = 0.68, .b = 0.68, .a = 1.0 }) catch unreachable;
 }
 
-pub fn build_tumbling_walls(bi: *jolt.BodyInterface, box_half: f32, wall_thick: f32, bounce: f32, out_walls: *std.array_list.Managed(WallData)) void {
-    const create_wall = struct {
-        fn f(bi2: *jolt.BodyInterface, shape: *jolt.Shape, local_pos: Vec3, bounce2: f32, walls: *std.array_list.Managed(WallData)) void {
+pub fn buildTumblingWalls(bi: *jolt.BodyInterface, box_half: f32, wall_thick: f32, bounce: f32, out_walls: *std.ArrayList(WallData)) void {
+    const createWall = struct {
+        fn f(bi2: *jolt.BodyInterface, shape: *jolt.Shape, local_pos: Vec3, bounce2: f32, walls: *std.ArrayList(WallData)) void {
             const id = jolt.jph_body_create_and_add(bi2, shape, local_pos, Quat.identity(), .kinematic, setup.PhysicsLayers.NON_MOVING, bounce2, .activate);
-            walls.append(.{ .id = id, .local_pos = local_pos }) catch unreachable;
+            walls.append(std.heap.c_allocator, .{ .id = id, .local_pos = local_pos }) catch unreachable;
         }
     }.f;
 
     const full = box_half + wall_thick * 2;
-    create_wall(bi, jolt.jph_box_shape_create(full, wall_thick, full).?, Vec3.init(0, -box_half - wall_thick, 0), bounce, out_walls);
-    create_wall(bi, jolt.jph_box_shape_create(full, wall_thick, full).?, Vec3.init(0, box_half + wall_thick, 0), bounce, out_walls);
-    create_wall(bi, jolt.jph_box_shape_create(wall_thick, full, full).?, Vec3.init(-box_half - wall_thick, 0, 0), bounce, out_walls);
-    create_wall(bi, jolt.jph_box_shape_create(wall_thick, full, full).?, Vec3.init(box_half + wall_thick, 0, 0), bounce, out_walls);
-    create_wall(bi, jolt.jph_box_shape_create(full, full, wall_thick).?, Vec3.init(0, 0, -box_half - wall_thick), bounce, out_walls);
-    create_wall(bi, jolt.jph_box_shape_create(full, full, wall_thick).?, Vec3.init(0, 0, box_half + wall_thick), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(full, wall_thick, full).?, Vec3.init(0, -box_half - wall_thick, 0), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(full, wall_thick, full).?, Vec3.init(0, box_half + wall_thick, 0), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(wall_thick, full, full).?, Vec3.init(-box_half - wall_thick, 0, 0), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(wall_thick, full, full).?, Vec3.init(box_half + wall_thick, 0, 0), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(full, full, wall_thick).?, Vec3.init(0, 0, -box_half - wall_thick), bounce, out_walls);
+    createWall(bi, jolt.jph_box_shape_create(full, full, wall_thick).?, Vec3.init(0, 0, box_half + wall_thick), bounce, out_walls);
 }
 
-pub fn build_torus_compound_shape(major_radius: f32, minor_radius: f32, num_segments: i32, half_height: f32) ?*jolt.Shape {
+pub fn buildTorusCompoundShape(major_radius: f32, minor_radius: f32, num_segments: i32, half_height: f32) ?*jolt.Shape {
     const builder = jolt.jph_compound_builder_create() orelse return null;
     defer jolt.jph_compound_builder_destroy(builder);
     const capsule = jolt.jph_capsule_shape_create(half_height, minor_radius) orelse return null;
@@ -135,16 +135,16 @@ pub fn build_torus_compound_shape(major_radius: f32, minor_radius: f32, num_segm
     return jolt.jph_compound_builder_build(builder);
 }
 
-fn bezier_sample(p: *const [4]f32, t: f32) f32 {
+fn bezierSample(p: *const [4]f32, t: f32) f32 {
     const mt = 1.0 - t;
     return mt * mt * mt * p[0] + 3 * mt * mt * t * p[1] + 3 * mt * t * t * p[2] + t * t * t * p[3];
 }
 
-pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
+pub fn buildTeapotCompoundShape(scale: f32, tess: i32) ?*jolt.Shape {
     const alloc = std.heap.c_allocator;
-    const extract_patch_points = struct {
-        fn f(a: std.mem.Allocator, scale2: f32, tess2: i32, start_patch: usize, end_patch: usize) std.array_list.Managed(Vec3) {
-            var points = std.array_list.Managed(Vec3).init(a);
+    const extractPatchPoints = struct {
+        fn f(a: std.mem.Allocator, scale2: f32, tess2: i32, start_patch: usize, end_patch: usize) std.ArrayList(Vec3) {
+            var points: std.ArrayList(Vec3) = .empty;
             var p = start_patch;
             while (p <= end_patch) : (p += 1) {
                 var i: i32 = 0;
@@ -160,14 +160,14 @@ pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
                             const cpx = [4]f32{ geom.teapot_data[p][k][0][0], geom.teapot_data[p][k][1][0], geom.teapot_data[p][k][2][0], geom.teapot_data[p][k][3][0] };
                             const cpy = [4]f32{ geom.teapot_data[p][k][0][1], geom.teapot_data[p][k][1][1], geom.teapot_data[p][k][2][1], geom.teapot_data[p][k][3][1] };
                             const cpz = [4]f32{ geom.teapot_data[p][k][0][2], geom.teapot_data[p][k][1][2], geom.teapot_data[p][k][2][2], geom.teapot_data[p][k][3][2] };
-                            px[k] = bezier_sample(&cpx, v);
-                            py[k] = bezier_sample(&cpy, v);
-                            pz[k] = bezier_sample(&cpz, v);
+                            px[k] = bezierSample(&cpx, v);
+                            py[k] = bezierSample(&cpy, v);
+                            pz[k] = bezierSample(&cpz, v);
                         }
-                        const x = bezier_sample(&px, u) * scale2;
-                        const y = bezier_sample(&py, u) * scale2;
-                        const z = bezier_sample(&pz, u) * scale2;
-                        points.append(Vec3.init(x, y, z)) catch unreachable;
+                        const x = bezierSample(&px, u) * scale2;
+                        const y = bezierSample(&py, u) * scale2;
+                        const z = bezierSample(&pz, u) * scale2;
+                        points.append(a, Vec3.init(x, y, z)) catch unreachable;
                     }
                 }
             }
@@ -175,7 +175,7 @@ pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
         }
     }.f;
 
-    const make_hull = struct {
+    const makeHull = struct {
         fn f(pts: []const Vec3) ?*jolt.Shape {
             return jolt.jph_convex_hull_shape_create(pts.ptr, @intCast(pts.len));
         }
@@ -184,32 +184,32 @@ pub fn build_teapot_compound_shape(scale: f32, tess: i32) ?*jolt.Shape {
     const builder = jolt.jph_compound_builder_create() orelse return null;
     defer jolt.jph_compound_builder_destroy(builder);
 
-    var body_pts = extract_patch_points(alloc, scale, tess, 4, 11);
-    defer body_pts.deinit();
-    if (make_hull(body_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
-    var handle_pts = extract_patch_points(alloc, scale, tess, 12, 15);
-    defer handle_pts.deinit();
-    if (make_hull(handle_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
-    var spout_pts = extract_patch_points(alloc, scale, tess, 16, 19);
-    defer spout_pts.deinit();
-    if (make_hull(spout_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
-    var lid_top_pts = extract_patch_points(alloc, scale, tess, 0, 3);
-    defer lid_top_pts.deinit();
-    if (make_hull(lid_top_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
-    var lid_base_pts = extract_patch_points(alloc, scale, tess, 20, 27);
-    defer lid_base_pts.deinit();
-    if (make_hull(lid_base_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
+    var body_pts = extractPatchPoints(alloc, scale, tess, 4, 11);
+    defer body_pts.deinit(alloc);
+    if (makeHull(body_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
+    var handle_pts = extractPatchPoints(alloc, scale, tess, 12, 15);
+    defer handle_pts.deinit(alloc);
+    if (makeHull(handle_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
+    var spout_pts = extractPatchPoints(alloc, scale, tess, 16, 19);
+    defer spout_pts.deinit(alloc);
+    if (makeHull(spout_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
+    var lid_top_pts = extractPatchPoints(alloc, scale, tess, 0, 3);
+    defer lid_top_pts.deinit(alloc);
+    if (makeHull(lid_top_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
+    var lid_base_pts = extractPatchPoints(alloc, scale, tess, 20, 27);
+    defer lid_base_pts.deinit(alloc);
+    if (makeHull(lid_base_pts.items)) |h| jolt.jph_compound_builder_add(builder, Vec3.zero(), Quat.identity(), h);
 
     dbg.print("Jolt: Teapot compound collision created (body + handle + spout + lid_top + lid_base)\n", .{});
     return jolt.jph_compound_builder_build(builder);
 }
 
-pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const PackedTexture, tex_main_sphere: ?*const PackedTexture, tex_main_torus: ?*const PackedTexture, tex_main_teapot: ?*const PackedTexture, tex_ground: ?*const PackedTexture, torus_shape: *jolt.Shape, teapot_shape: *jolt.Shape, ground_y: f32, instances: *std.array_list.Managed(CubeInstance)) void {
+pub fn populateSceneInstances(bi: *jolt.BodyInterface, tex_main_cube: ?*const PackedTexture, tex_main_sphere: ?*const PackedTexture, tex_main_torus: ?*const PackedTexture, tex_main_teapot: ?*const PackedTexture, tex_ground: ?*const PackedTexture, torus_shape: *jolt.Shape, teapot_shape: *jolt.Shape, ground_y: f32, instances: *std.ArrayList(CubeInstance)) void {
     srand(42);
     var transparent_shadow_mask_counter: i32 = 0;
 
-    const create_main_object = struct {
-        fn f(bi2: *jolt.BodyInterface, ty: InstanceType, px: f32, py: f32, pz: f32, shape: *jolt.Shape, t: ?*const PackedTexture, mask_counter: *i32, insts: *std.array_list.Managed(CubeInstance)) void {
+    const createMainObject = struct {
+        fn f(bi2: *jolt.BodyInterface, ty: InstanceType, px: f32, py: f32, pz: f32, shape: *jolt.Shape, t: ?*const PackedTexture, mask_counter: *i32, insts: *std.ArrayList(CubeInstance)) void {
             var inst = CubeInstance{};
             inst.tx = px;
             inst.ty = py;
@@ -226,60 +226,60 @@ pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const 
                 break :blk m;
             } else -1;
 
-            const rx = rand_unit() * 2.0 * std.math.pi;
-            const ry = rand_unit() * 2.0 * std.math.pi;
-            const rz = rand_unit() * 2.0 * std.math.pi;
+            const rx = randUnit() * 2.0 * std.math.pi;
+            const ry = randUnit() * 2.0 * std.math.pi;
+            const rz = randUnit() * 2.0 * std.math.pi;
             const initial_rotation = Quat.sEulerAngles(Vec3.init(rx, ry, rz));
             inst.body_id = jolt.jph_body_create_and_add(bi2, shape, Vec3.init(px, py, pz), initial_rotation, .dynamic, setup.PhysicsLayers.MOVING, 0.8, .activate);
-            insts.append(inst) catch unreachable;
+            insts.append(std.heap.c_allocator, inst) catch unreachable;
         }
     }.f;
 
     for (0..10) |_| {
-        const px = rand_unit() * 10.0 - 5.0;
-        const py = rand_unit() * 10.0 - 5.0;
-        const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, .cube, px, py, pz, jolt.jph_box_shape_create(1.0, 1.0, 1.0).?, tex_main_cube, &transparent_shadow_mask_counter, instances);
+        const px = randUnit() * 10.0 - 5.0;
+        const py = randUnit() * 10.0 - 5.0;
+        const pz = randUnit() * 10.0 - 5.0;
+        createMainObject(bi, .cube, px, py, pz, jolt.jph_box_shape_create(1.0, 1.0, 1.0).?, tex_main_cube, &transparent_shadow_mask_counter, instances);
     }
     for (0..10) |_| {
-        const px = rand_unit() * 10.0 - 5.0;
-        const py = rand_unit() * 10.0 - 5.0;
-        const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, .sphere, px, py, pz, jolt.jph_sphere_shape_create(1.3).?, tex_main_sphere, &transparent_shadow_mask_counter, instances);
+        const px = randUnit() * 10.0 - 5.0;
+        const py = randUnit() * 10.0 - 5.0;
+        const pz = randUnit() * 10.0 - 5.0;
+        createMainObject(bi, .sphere, px, py, pz, jolt.jph_sphere_shape_create(1.3).?, tex_main_sphere, &transparent_shadow_mask_counter, instances);
     }
     for (0..10) |_| {
-        const px = rand_unit() * 10.0 - 5.0;
-        const py = rand_unit() * 10.0 - 5.0;
-        const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, .torus, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances);
+        const px = randUnit() * 10.0 - 5.0;
+        const py = randUnit() * 10.0 - 5.0;
+        const pz = randUnit() * 10.0 - 5.0;
+        createMainObject(bi, .torus, px, py, pz, torus_shape, tex_main_torus, &transparent_shadow_mask_counter, instances);
     }
     for (0..10) |_| {
-        const px = rand_unit() * 10.0 - 5.0;
-        const py = rand_unit() * 10.0 - 5.0;
-        const pz = rand_unit() * 10.0 - 5.0;
-        create_main_object(bi, .teapot, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances);
+        const px = randUnit() * 10.0 - 5.0;
+        const py = randUnit() * 10.0 - 5.0;
+        const pz = randUnit() * 10.0 - 5.0;
+        createMainObject(bi, .teapot, px, py, pz, teapot_shape, tex_main_teapot, &transparent_shadow_mask_counter, instances);
     }
 
     for (0..400) |_| {
         var inst = CubeInstance{};
-        inst.tx = rand_unit() * 10.0 - 5.0;
-        inst.ty = rand_unit() * 10.0 - 5.0;
-        inst.tz = rand_unit() * 10.0 - 5.0;
+        inst.tx = randUnit() * 10.0 - 5.0;
+        inst.ty = randUnit() * 10.0 - 5.0;
+        inst.tz = randUnit() * 10.0 - 5.0;
         inst.qw = 1.0;
         inst.texture = null;
         inst.type = .smallball;
         inst.shadow_screendoor_mask = -1;
-        inst.color_r = 0.3 + rand_unit() * 0.7;
-        inst.color_g = 0.3 + rand_unit() * 0.7;
-        inst.color_b = 0.3 + rand_unit() * 0.7;
+        inst.color_r = 0.3 + randUnit() * 0.7;
+        inst.color_g = 0.3 + randUnit() * 0.7;
+        inst.color_b = 0.3 + randUnit() * 0.7;
 
         const shape = jolt.jph_sphere_shape_create(0.3).?;
-        const rx = rand_unit() * 2.0 * std.math.pi;
-        const ry = rand_unit() * 2.0 * std.math.pi;
-        const rz = rand_unit() * 2.0 * std.math.pi;
+        const rx = randUnit() * 2.0 * std.math.pi;
+        const ry = randUnit() * 2.0 * std.math.pi;
+        const rz = randUnit() * 2.0 * std.math.pi;
         const initial_rotation = Quat.sEulerAngles(Vec3.init(rx, ry, rz));
         inst.body_id = jolt.jph_body_create_and_add(bi, shape, Vec3.init(inst.tx, inst.ty, inst.tz), initial_rotation, .dynamic, setup.PhysicsLayers.MOVING, 0.9, .activate);
-        instances.append(inst) catch unreachable;
+        instances.append(std.heap.c_allocator, inst) catch unreachable;
     }
 
     var ground = CubeInstance{};
@@ -292,11 +292,11 @@ pub fn populate_scene_instances(bi: *jolt.BodyInterface, tex_main_cube: ?*const 
     ground.color_b = 0.68;
     ground.shadow_screendoor_mask = -1;
     ground.body_id = .{};
-    instances.append(ground) catch unreachable;
+    instances.append(std.heap.c_allocator, ground) catch unreachable;
 }
 
-pub fn capture_initial_instance_states(instances: *const std.array_list.Managed(CubeInstance), bi: *jolt.BodyInterface) std.array_list.Managed(InitialInstanceState) {
-    var out = std.array_list.Managed(InitialInstanceState).init(std.heap.c_allocator);
+pub fn captureInitialInstanceStates(instances: *const std.ArrayList(CubeInstance), bi: *jolt.BodyInterface) std.ArrayList(InitialInstanceState) {
+    var out: std.ArrayList(InitialInstanceState) = .empty;
     for (instances.items) |inst| {
         var state = InitialInstanceState{
             .tx = inst.tx,
@@ -322,16 +322,16 @@ pub fn capture_initial_instance_states(instances: *const std.array_list.Managed(
             state.qz = rot.z;
             state.qw = rot.w;
         }
-        out.append(state) catch unreachable;
+        out.append(std.heap.c_allocator, state) catch unreachable;
     }
     return out;
 }
 
-pub fn write_instance_pose_snapshot(snapshot: *buffers.PoseSnapshot, instances: *const std.array_list.Managed(CubeInstance), snapshot_time: f32, sequence: u64) void {
+pub fn writeInstancePoseSnapshot(snapshot: *buffers.PoseSnapshot, instances: *const std.ArrayList(CubeInstance), snapshot_time: f32, sequence: u64) void {
     snapshot.sim_time = snapshot_time;
     snapshot.sequence = sequence;
     if (snapshot.poses.items.len != instances.items.len) {
-        snapshot.poses.resize(instances.items.len) catch unreachable;
+        snapshot.poses.resize(std.heap.c_allocator, instances.items.len) catch unreachable;
     }
     for (instances.items, 0..) |inst, i| {
         snapshot.poses.items[i] = .{ .tx = inst.tx, .ty = inst.ty, .tz = inst.tz, .qx = inst.qx, .qy = inst.qy, .qz = inst.qz, .qw = inst.qw };

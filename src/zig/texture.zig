@@ -23,11 +23,11 @@ pub const PackedTexture = struct {
     }
 };
 
-fn is_power_of_two(v: i32) bool {
+fn isPowerOfTwo(v: i32) bool {
     return v > 0 and std.math.isPowerOfTwo(v);
 }
 
-fn previous_power_of_two(v: i32) i32 {
+fn previousPowerOfTwo(v: i32) i32 {
     if (v <= 1) return 1;
     return std.math.floorPowerOfTwo(i32, v);
 }
@@ -35,23 +35,23 @@ fn previous_power_of_two(v: i32) i32 {
 // Optional wrapper keeps the C++-shaped "null on any failure" contract for
 // callers; the error-union builder below gets errdefer-based cleanup so a
 // mid-build OOM cannot leak the texture, the mip levels, or the scratch.
-pub fn make_packed_texture(allocator: std.mem.Allocator, src: ?*Surface) ?*PackedTexture {
+pub fn makePackedTexture(allocator: std.mem.Allocator, src: ?*Surface) ?*PackedTexture {
     const s = src orelse return null;
     if (s.pixels == null or s.format == null) return null;
-    return build_packed_texture(allocator, s) catch null;
+    return buildPackedTexture(allocator, s) catch null;
 }
 
-fn build_packed_texture(allocator: std.mem.Allocator, s: *Surface) !*PackedTexture {
+fn buildPackedTexture(allocator: std.mem.Allocator, s: *Surface) !*PackedTexture {
     const fmt = s.format.?;
 
     const tex = try allocator.create(PackedTexture);
     errdefer allocator.destroy(tex);
     tex.* = .{ .allocator = allocator };
 
-    var levels = std.array_list.Managed(PackedTextureLevel).init(allocator);
+    var levels: std.ArrayList(PackedTextureLevel) = .empty;
     errdefer {
         for (levels.items) |level| allocator.free(level.rgb);
-        levels.deinit();
+        levels.deinit(allocator);
     }
 
     // Unpack source into canonical 0x00RRGGBB.
@@ -77,15 +77,15 @@ fn build_packed_texture(allocator: std.mem.Allocator, s: *Surface) !*PackedTextu
             } else {
                 px = p[0];
             }
-            const c = pixel.unpack_rgb_fast(px, fmt);
+            const c = pixel.unpackRgbFast(px, fmt);
             source_rgb[y * src_w_u + x] = (@as(u32, c.r) << 16) | (@as(u32, c.g) << 8) | c.b;
         }
     }
 
     // Resample base to nearest power-of-two dims.
     var base = PackedTextureLevel{};
-    base.w = if (is_power_of_two(src_w)) src_w else previous_power_of_two(src_w);
-    base.h = if (is_power_of_two(src_h)) src_h else previous_power_of_two(src_h);
+    base.w = if (isPowerOfTwo(src_w)) src_w else previousPowerOfTwo(src_w);
+    base.h = if (isPowerOfTwo(src_h)) src_h else previousPowerOfTwo(src_h);
     if (base.w == src_w and base.h == src_h) {
         base.rgb = source_rgb;
     } else {
@@ -105,7 +105,7 @@ fn build_packed_texture(allocator: std.mem.Allocator, s: *Surface) !*PackedTextu
 
     {
         errdefer allocator.free(base.rgb);
-        try levels.append(base);
+        try levels.append(allocator, base);
     }
 
     while (levels.items[levels.items.len - 1].w > 1 or levels.items[levels.items.len - 1].h > 1) {
@@ -138,15 +138,15 @@ fn build_packed_texture(allocator: std.mem.Allocator, s: *Surface) !*PackedTextu
         }
         {
             errdefer allocator.free(next.rgb);
-            try levels.append(next);
+            try levels.append(allocator, next);
         }
     }
 
-    tex.levels = try levels.toOwnedSlice();
+    tex.levels = try levels.toOwnedSlice(allocator);
     return tex;
 }
 
-pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, v: f32) u32 {
+pub inline fn sampleTextureBilinear(level: *const PackedTextureLevel, u: f32, v: f32) u32 {
     // Match clang's default -ffp-contract=on (the C++ build contracts mul+add
     // within expressions); Zig defaults to strict, which left this per-pixel
     // sampler emitting un-contracted, un-reassociated float ops vs C++.
@@ -174,10 +174,10 @@ pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, 
     const s01: @Vector(3, f32) = @splat((1.0 - tx) * ty);
     const s11: @Vector(3, f32) = @splat(tx * ty);
 
-    var acc = unpack_rgb_f32(c00) * s00;
-    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c10), s10, acc);
-    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c01), s01, acc);
-    acc = la.mulAdd(@Vector(3, f32), unpack_rgb_f32(c11), s11, acc);
+    var acc = unpackRgbF32(c00) * s00;
+    acc = la.mulAdd(@Vector(3, f32), unpackRgbF32(c10), s10, acc);
+    acc = la.mulAdd(@Vector(3, f32), unpackRgbF32(c01), s01, acc);
+    acc = la.mulAdd(@Vector(3, f32), unpackRgbF32(c11), s11, acc);
     acc += @as(@Vector(3, f32), @splat(0.5));
 
     const r: u32 = @intFromFloat(acc[0]);
@@ -186,7 +186,7 @@ pub inline fn sample_texture_bilinear(level: *const PackedTextureLevel, u: f32, 
     return (r << 16) | (g << 8) | b;
 }
 
-inline fn unpack_rgb_f32(c: u32) @Vector(3, f32) {
+inline fn unpackRgbF32(c: u32) @Vector(3, f32) {
     return .{
         @floatFromInt((c >> 16) & 0xff),
         @floatFromInt((c >> 8) & 0xff),
@@ -194,16 +194,16 @@ inline fn unpack_rgb_f32(c: u32) @Vector(3, f32) {
     };
 }
 
-pub inline fn sample_texture_anisotropic(level: *const PackedTextureLevel, u: f32, v: f32, axis_u: f32, axis_v: f32, taps: i32) u32 {
+pub inline fn sampleTextureAnisotropic(level: *const PackedTextureLevel, u: f32, v: f32, axis_u: f32, axis_v: f32, taps: i32) u32 {
     @setFloatMode(.optimized);
-    if (taps <= 1) return sample_texture_bilinear(level, u, v);
+    if (taps <= 1) return sampleTextureBilinear(level, u, v);
     var r: u32 = 0;
     var g: u32 = 0;
     var b: u32 = 0;
     var i: i32 = 0;
     while (i < taps) : (i += 1) {
         const t = (@as(f32, @floatFromInt(i)) + 0.5) / @as(f32, @floatFromInt(taps)) - 0.5;
-        const c = sample_texture_bilinear(level, u + axis_u * t, v + axis_v * t);
+        const c = sampleTextureBilinear(level, u + axis_u * t, v + axis_v * t);
         r += (c >> 16) & 0xff;
         g += (c >> 8) & 0xff;
         b += c & 0xff;

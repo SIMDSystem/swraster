@@ -10,34 +10,34 @@ pub const Pixel32 = config.Pixel32;
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
-pub inline fn expand_channel(value_in: u32, loss: u8) u8 {
+pub inline fn expandChannel(value_in: u32, loss: u8) u8 {
     var value = value_in << @intCast(loss);
     if (loss != 0 and value < 255) value |= value >> @intCast(8 - loss);
     return @truncate(value);
 }
 
-pub inline fn pack_rgb_fast(format: *const PixelFormat, r: u8, g: u8, b: u8) u32 {
+pub inline fn packRgbFast(format: *const PixelFormat, r: u8, g: u8, b: u8) u32 {
     return ((@as(u32, r >> @intCast(format.Rloss)) << @intCast(format.Rshift)) & format.Rmask) |
         ((@as(u32, g >> @intCast(format.Gloss)) << @intCast(format.Gshift)) & format.Gmask) |
         ((@as(u32, b >> @intCast(format.Bloss)) << @intCast(format.Bshift)) & format.Bmask) |
         format.Amask;
 }
 
-pub inline fn unpack_rgb_fast(pixel: u32, format: *const PixelFormat) Rgb {
+pub inline fn unpackRgbFast(pixel: u32, format: *const PixelFormat) Rgb {
     return .{
-        .r = expand_channel((pixel & format.Rmask) >> @intCast(format.Rshift), format.Rloss),
-        .g = expand_channel((pixel & format.Gmask) >> @intCast(format.Gshift), format.Gloss),
-        .b = expand_channel((pixel & format.Bmask) >> @intCast(format.Bshift), format.Bloss),
+        .r = expandChannel((pixel & format.Rmask) >> @intCast(format.Rshift), format.Rloss),
+        .g = expandChannel((pixel & format.Gmask) >> @intCast(format.Gshift), format.Gloss),
+        .b = expandChannel((pixel & format.Bmask) >> @intCast(format.Bshift), format.Bloss),
     };
 }
 
-pub inline fn add_pixel_rgb(row_pixels: [*]Pixel32, x: i32, format: *const PixelFormat, add_r: f32, add_g: f32, add_b: f32) void {
+pub inline fn addPixelRgb(row_pixels: [*]Pixel32, x: i32, format: *const PixelFormat, add_r: f32, add_g: f32, add_b: f32) void {
     const xi: usize = @intCast(x);
-    const d = unpack_rgb_fast(row_pixels[xi], format);
+    const d = unpackRgbFast(row_pixels[xi], format);
     const r = @as(i32, d.r) + @as(i32, @intFromFloat(add_r));
     const g = @as(i32, d.g) + @as(i32, @intFromFloat(add_g));
     const b = @as(i32, d.b) + @as(i32, @intFromFloat(add_b));
-    row_pixels[xi] = pack_rgb_fast(
+    row_pixels[xi] = packRgbFast(
         format,
         @intCast(@min(r, 255)),
         @intCast(@min(g, 255)),
@@ -59,7 +59,7 @@ const font_5x7 = [10][7]u8{
     .{ 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x11, 0x0E }, // 9
 };
 
-fn glyph_for(ch: u8) [7]u8 {
+fn glyphFor(ch: u8) [7]u8 {
     if (ch >= '0' and ch <= '9') return font_5x7[@intCast(ch - '0')];
     return switch (ch) {
         '/' => .{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x00, 0x00 },
@@ -79,7 +79,7 @@ fn glyph_for(ch: u8) [7]u8 {
     };
 }
 
-pub fn draw_digit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: u32, format: *const PixelFormat) void {
+pub fn drawDigit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: u32, format: *const PixelFormat) void {
     if (digit < 0 or digit > 9) return;
     const bpp: i32 = format.BytesPerPixel;
     for (font_5x7[@intCast(digit)], 0..) |bits, row| {
@@ -95,12 +95,12 @@ pub fn draw_digit(pixels: [*]u8, pitch: i32, x: i32, y: i32, digit: i32, color: 
     }
 }
 
-pub fn draw_text(pixels: [*]u8, pitch: i32, x: i32, y: i32, text: []const u8, r: u8, g: u8, b: u8, format: *const PixelFormat) void {
-    const color = pack_rgb_fast(format, r, g, b);
+pub fn drawText(pixels: [*]u8, pitch: i32, x: i32, y: i32, text: []const u8, r: u8, g: u8, b: u8, format: *const PixelFormat) void {
+    const color = packRgbFast(format, r, g, b);
     const bpp: i32 = format.BytesPerPixel;
     var pos: i32 = 0;
     for (text) |ch| {
-        const glyph = glyph_for(ch);
+        const glyph = glyphFor(ch);
         for (glyph, 0..) |bits, row| {
             for (0..5) |col| {
                 if (bits & (@as(u8, 0x10) >> @intCast(col)) != 0) {
@@ -116,14 +116,14 @@ pub fn draw_text(pixels: [*]u8, pitch: i32, x: i32, y: i32, text: []const u8, r:
     }
 }
 
-pub fn draw_number(pixels: [*]u8, pitch: i32, x: i32, y: i32, number: i32, r: u8, g: u8, b: u8, format: *const PixelFormat) void {
-    const color = pack_rgb_fast(format, r, g, b);
+pub fn drawNumber(pixels: [*]u8, pitch: i32, x: i32, y: i32, number: i32, r: u8, g: u8, b: u8, format: *const PixelFormat) void {
+    const color = packRgbFast(format, r, g, b);
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, "{d}", .{number}) catch return;
     var pos: i32 = 0;
     for (s) |ch| {
         if (ch >= '0' and ch <= '9') {
-            draw_digit(pixels, pitch, x + pos * 6, y, @intCast(ch - '0'), color, format);
+            drawDigit(pixels, pitch, x + pos * 6, y, @intCast(ch - '0'), color, format);
             pos += 1;
         }
     }

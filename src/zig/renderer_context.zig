@@ -22,42 +22,30 @@ const Vec3 = la.Vec3;
 const Mat4 = la.Mat4;
 const Surface = platform.Surface;
 const RenderVertexList = geom.RenderVertexList;
-const Face = geom.Face;
+const FaceList = geom.FaceList;
 const ShadowDepth = config.ShadowDepth;
+
+// One renderable mesh (geometry + cull radius). The renderer keeps one per
+// scene.InstanceType, indexed by @intFromEnum(type): cube=0 .. lamp=6.
+pub const MeshRef = struct {
+    vertices: *const RenderVertexList,
+    faces: *const FaceList,
+    bound_radius: f32,
+};
 
 pub const RendererContext = struct {
     fb: *Surface,
     screen_width: i32,
     screen_height: i32,
 
-    cube_vertices: *const RenderVertexList,
-    cube_faces: *const std.array_list.Managed(Face),
-    sphere_vertices: *const RenderVertexList,
-    sphere_faces: *const std.array_list.Managed(Face),
-    torus_vertices: *const RenderVertexList,
-    torus_faces: *const std.array_list.Managed(Face),
-    teapot_vertices: *const RenderVertexList,
-    teapot_faces: *const std.array_list.Managed(Face),
-    smallball_vertices: *const RenderVertexList,
-    smallball_faces: *const std.array_list.Managed(Face),
-    ground_vertices: *const RenderVertexList,
-    ground_faces: *const std.array_list.Managed(Face),
-    lamp_vertices: *const RenderVertexList,
-    lamp_faces: *const std.array_list.Managed(Face),
-
-    cube_bound_radius: f32,
-    sphere_bound_radius: f32,
-    torus_bound_radius: f32,
-    teapot_bound_radius: f32,
-    smallball_bound_radius: f32,
-    ground_bound_radius: f32,
-    lamp_bound_radius: f32,
+    // Indexed by @intFromEnum(scene.InstanceType).
+    meshes: [7]MeshRef,
 
     lamp_instance_index: i32,
 
-    instances: *std.array_list.Managed(scene.CubeInstance),
-    initial_instance_states: *const std.array_list.Managed(scene.InitialInstanceState),
-    walls: *const std.array_list.Managed(scene.WallData),
+    instances: *std.ArrayList(scene.CubeInstance),
+    initial_instance_states: *const std.ArrayList(scene.InitialInstanceState),
+    walls: *const std.ArrayList(scene.WallData),
     box_half: f32,
     wall_thick: f32,
     ground_y: f32,
@@ -82,20 +70,20 @@ pub const RendererContext = struct {
     shadow_matrix_buffers: *[2]Mat4,
     time_buffers: *[2]f32,
 
-    shadow_depth_buffers: *[2]std.array_list.Managed(ShadowDepth),
-    depth_buffer: *std.array_list.Managed(f32),
-    normal_buffer: *std.array_list.Managed(f32),
-    linear_z_buffer: *std.array_list.Managed(f32),
+    shadow_depth_buffers: *[2]std.ArrayList(ShadowDepth),
+    depth_buffer: *std.ArrayList(f32),
+    normal_buffer: *std.ArrayList(f32),
+    linear_z_buffer: *std.ArrayList(f32),
 
     tl_shared: *buffers.TLSharedData,
-    tl_thread_outputs: *std.array_list.Managed(buffers.TLThreadOutput),
+    tl_thread_outputs: *std.ArrayList(buffers.TLThreadOutput),
     launched_tl_threads: i32,
 
     raster_shared: *[2]buffers.RasterSharedData,
     launched_raster_threads: i32,
 
-    instance_depths: *std.array_list.Managed(buffers.InstanceDepth),
-    occluders_eye: *std.array_list.Managed(cull.OccluderEye),
+    instance_depths: *std.ArrayList(buffers.InstanceDepth),
+    occluders_eye: *std.ArrayList(cull.OccluderEye),
 
     physics: *physics_pipeline.PhysicsPipeline,
     thread_perf: *threading.ThreadPerfSearch,

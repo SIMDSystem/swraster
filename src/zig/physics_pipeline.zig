@@ -22,8 +22,8 @@ pub const PhysicsPipeline = struct {
     body_interface: ?*jolt.BodyInterface = null,
     temp_allocator: ?*jolt.TempAllocator = null,
     job_system: ?*jolt.JobSystem = null,
-    instances: ?*std.array_list.Managed(CubeInstance) = null,
-    walls: ?*const std.array_list.Managed(WallData) = null,
+    instances: ?*std.ArrayList(CubeInstance) = null,
+    walls: ?*const std.ArrayList(WallData) = null,
     profiler: ?*ThreadProfiler = null,
 
     pose_snapshots: [2]PoseSnapshot = .{ .{}, .{} },
@@ -50,18 +50,18 @@ pub const PhysicsPipeline = struct {
     sync_wall_ms_accum: f64 = 0.0,
 };
 
-pub fn physics_wait_for_idle(pp: *PhysicsPipeline) void {
+pub fn physicsWaitForIdle(pp: *PhysicsPipeline) void {
     pp.mtx.lock();
     defer pp.mtx.unlock();
     while (pp.job_pending or pp.job_active) pp.idle_cv.wait(&pp.mtx);
 }
 
-pub fn physics_current_sim_time(pp: *const PhysicsPipeline) f32 {
+pub fn physicsCurrentSimTime(pp: *const PhysicsPipeline) f32 {
     const idx = pp.published_snapshot.load(.acquire);
     return pp.pose_snapshots[@intCast(idx)].sim_time;
 }
 
-pub fn physics_arm_after_tl(pp: *PhysicsPipeline, delta_time: f32, target_time: f32) void {
+pub fn physicsArmAfterTl(pp: *PhysicsPipeline, delta_time: f32, target_time: f32) void {
     pp.mtx.lock();
     defer pp.mtx.unlock();
     pp.job_armed = delta_time > 0.0 and !pp.job_pending and !pp.job_active;
@@ -73,7 +73,7 @@ pub fn physics_arm_after_tl(pp: *PhysicsPipeline, delta_time: f32, target_time: 
     }
 }
 
-pub fn physics_trigger_after_tl(pp: *PhysicsPipeline) void {
+pub fn physicsTriggerAfterTl(pp: *PhysicsPipeline) void {
     pp.mtx.lock();
     defer pp.mtx.unlock();
     if (!pp.job_armed or pp.job_pending or pp.job_active) return;
@@ -82,9 +82,9 @@ pub fn physics_trigger_after_tl(pp: *PhysicsPipeline) void {
     pp.cv.signal();
 }
 
-pub fn physics_step_to_snapshot(pp: *PhysicsPipeline, delta_time: f32, target_time: f32, sequence: u64, out_snapshot: *PoseSnapshot) void {
-    const phase_start = platform.PerfCounter();
-    const cpu_start_ms = threading.process_cpu_ms();
+pub fn physicsStepToSnapshot(pp: *PhysicsPipeline, delta_time: f32, target_time: f32, sequence: u64, out_snapshot: *PoseSnapshot) void {
+    const phase_start = platform.perfCounter();
+    const cpu_start_ms = threading.processCpuMs();
 
     const box_rot = Quat.sEulerAngles(Vec3.init(target_time * 0.8, target_time * 0.6, target_time * 0.4));
     for (pp.walls.?.items) |wall| {
@@ -95,15 +95,15 @@ pub fn physics_step_to_snapshot(pp: *PhysicsPipeline, delta_time: f32, target_ti
     var collision_steps: c_int = @intFromFloat(@ceil(delta_time * 60.0));
     if (collision_steps < 1) collision_steps = 1;
     if (collision_steps > 4) collision_steps = 4;
-    const update_start = platform.PerfCounter();
+    const update_start = platform.perfCounter();
     jolt.jph_physics_system_update(pp.system.?, delta_time, collision_steps, pp.temp_allocator.?, pp.job_system.?);
-    const update_end = platform.PerfCounter();
+    const update_end = platform.perfCounter();
 
     out_snapshot.sim_time = target_time;
     out_snapshot.sequence = sequence;
     const instances = pp.instances.?;
     if (out_snapshot.poses.items.len != instances.items.len) {
-        out_snapshot.poses.resize(instances.items.len) catch unreachable;
+        out_snapshot.poses.resize(std.heap.c_allocator, instances.items.len) catch unreachable;
     }
     for (instances.items, 0..) |inst, i| {
         var pose = buffers.InstancePose{ .tx = inst.tx, .ty = inst.ty, .tz = inst.tz, .qx = inst.qx, .qy = inst.qy, .qz = inst.qz, .qw = inst.qw };
@@ -121,12 +121,12 @@ pub fn physics_step_to_snapshot(pp: *PhysicsPipeline, delta_time: f32, target_ti
         }
         out_snapshot.poses.items[i] = pose;
     }
-    const sync_end = platform.PerfCounter();
+    const sync_end = platform.perfCounter();
 
-    const wall_ms = threading.perf_ms(phase_start, sync_end);
-    const update_wall_ms = threading.perf_ms(update_start, update_end);
-    const sync_wall_ms = threading.perf_ms(update_end, sync_end);
-    const cpu_ms = threading.process_cpu_ms() - cpu_start_ms;
+    const wall_ms = threading.perfMs(phase_start, sync_end);
+    const update_wall_ms = threading.perfMs(update_start, update_end);
+    const sync_wall_ms = threading.perfMs(update_end, sync_end);
+    const cpu_ms = threading.processCpuMs() - cpu_start_ms;
     pp.mtx.lock();
     defer pp.mtx.unlock();
     pp.wall_ms_accum += wall_ms;
@@ -135,7 +135,7 @@ pub fn physics_step_to_snapshot(pp: *PhysicsPipeline, delta_time: f32, target_ti
     pp.sync_wall_ms_accum += sync_wall_ms;
 }
 
-pub fn physics_reset_pipeline_state(pp: *PhysicsPipeline) void {
+pub fn physicsResetPipelineState(pp: *PhysicsPipeline) void {
     pp.published_snapshot.store(0, .release);
     pp.published_sequence.store(0, .release);
     pp.mtx.lock();
@@ -153,7 +153,7 @@ pub fn physics_reset_pipeline_state(pp: *PhysicsPipeline) void {
     pp.sync_wall_ms_accum = 0.0;
 }
 
-pub fn physics_worker_thread(pp: *PhysicsPipeline) void {
+pub fn physicsWorkerThread(pp: *PhysicsPipeline) void {
     while (true) {
         var delta_time: f32 = undefined;
         var target_time: f32 = undefined;
@@ -175,13 +175,13 @@ pub fn physics_worker_thread(pp: *PhysicsPipeline) void {
             pp.mtx.unlock();
         }
 
-        const work_start_ts = platform.PerfCounter();
-        const work_start_cpu_ns = platform.ThreadCpuNs();
-        physics_step_to_snapshot(pp, delta_time, target_time, sequence, &pp.pose_snapshots[@intCast(snapshot_idx)]);
+        const work_start_ts = platform.perfCounter();
+        const work_start_cpu_ns = platform.threadCpuNs();
+        physicsStepToSnapshot(pp, delta_time, target_time, sequence, &pp.pose_snapshots[@intCast(snapshot_idx)]);
         if (pp.profiler) |prof| {
-            const end_cpu_ns = platform.ThreadCpuNs();
+            const end_cpu_ns = platform.threadCpuNs();
             const cpu_ns = if (end_cpu_ns > work_start_cpu_ns) end_cpu_ns - work_start_cpu_ns else 0;
-            profiler.profiler_record_physics(prof, work_start_ts, platform.PerfCounter(), cpu_ns);
+            profiler.profilerRecordPhysics(prof, work_start_ts, platform.perfCounter(), cpu_ns);
         }
 
         pp.published_snapshot.store(snapshot_idx, .release);
@@ -195,7 +195,7 @@ pub fn physics_worker_thread(pp: *PhysicsPipeline) void {
     }
 }
 
-pub fn physics_request_shutdown(pp: *PhysicsPipeline) void {
+pub fn physicsRequestShutdown(pp: *PhysicsPipeline) void {
     pp.mtx.lock();
     defer pp.mtx.unlock();
     pp.thread_running = false;

@@ -16,7 +16,7 @@ pub const PhysicsLayers = struct {
 pub const JOLT_MAX_PHYSICS_JOBS: i32 = 1024;
 pub const JOLT_MAX_PHYSICS_BARRIERS: i32 = 8;
 
-pub fn register_jolt_callbacks() void {
+pub fn registerJoltCallbacks() void {
     jolt.jph_register_callbacks();
 }
 

@@ -32,8 +32,8 @@ pub const Face = struct {
     a: f32,
 };
 
-pub const RenderVertexList = std.array_list.Managed(Vertex3D);
-pub const FaceList = std.array_list.Managed(Face);
+pub const RenderVertexList = std.ArrayList(Vertex3D);
+pub const FaceList = std.ArrayList(Face);
 
 // Utah Teapot Bezier patch control points (32 patches, 4x4 control points each).
 pub const teapot_data = [32][4][4][3]f32{
@@ -72,11 +72,11 @@ pub const teapot_data = [32][4][4][3]f32{
 };
 
 fn pushVertex(vertices: *RenderVertexList, vert: Vertex3D) i32 {
-    vertices.append(vert) catch unreachable;
+    vertices.append(std.heap.c_allocator, vert) catch unreachable;
     return @intCast(vertices.items.len - 1);
 }
 
-pub fn generate_cube(vertices: *RenderVertexList, faces: *FaceList) void {
+pub fn generateCube(vertices: *RenderVertexList, faces: *FaceList) void {
     vertices.clearRetainingCapacity();
     faces.clearRetainingCapacity();
 
@@ -95,46 +95,46 @@ pub fn generate_cube(vertices: *RenderVertexList, faces: *FaceList) void {
     const f1 = mk(vertices, 1, -1, 1, 0, 0, 1, 1, 1);
     const f2 = mk(vertices, 1, 1, 1, 0, 0, 1, 1, 0);
     const f3 = mk(vertices, -1, 1, 1, 0, 0, 1, 0, 0);
-    faces.append(.{ .v0 = f0, .v1 = f1, .v2 = f2, .r = 1, .g = 0, .b = 0, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = f0, .v1 = f2, .v2 = f3, .r = 1, .g = 0, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = f0, .v1 = f1, .v2 = f2, .r = 1, .g = 0, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = f0, .v1 = f2, .v2 = f3, .r = 1, .g = 0, .b = 0, .a = 1.0 }) catch unreachable;
     // Back (Z-)
     const b0 = mk(vertices, 1, -1, -1, 0, 0, -1, 0, 1);
     const b1 = mk(vertices, -1, -1, -1, 0, 0, -1, 1, 1);
     const b2 = mk(vertices, -1, 1, -1, 0, 0, -1, 1, 0);
     const b3 = mk(vertices, 1, 1, -1, 0, 0, -1, 0, 0);
-    faces.append(.{ .v0 = b0, .v1 = b1, .v2 = b2, .r = 0, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = b0, .v1 = b2, .v2 = b3, .r = 0, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = b0, .v1 = b1, .v2 = b2, .r = 0, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = b0, .v1 = b2, .v2 = b3, .r = 0, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
     // Right (X+)
     const r0 = mk(vertices, 1, -1, 1, 1, 0, 0, 0, 1);
     const r1 = mk(vertices, 1, -1, -1, 1, 0, 0, 1, 1);
     const r2 = mk(vertices, 1, 1, -1, 1, 0, 0, 1, 0);
     const r3 = mk(vertices, 1, 1, 1, 1, 0, 0, 0, 0);
-    faces.append(.{ .v0 = r0, .v1 = r1, .v2 = r2, .r = 1, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = r0, .v1 = r2, .v2 = r3, .r = 1, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = r0, .v1 = r1, .v2 = r2, .r = 1, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = r0, .v1 = r2, .v2 = r3, .r = 1, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
     // Left (X-)
     const l0 = mk(vertices, -1, -1, -1, -1, 0, 0, 0, 1);
     const l1 = mk(vertices, -1, -1, 1, -1, 0, 0, 1, 1);
     const l2 = mk(vertices, -1, 1, 1, -1, 0, 0, 1, 0);
     const l3 = mk(vertices, -1, 1, -1, -1, 0, 0, 0, 0);
-    faces.append(.{ .v0 = l0, .v1 = l1, .v2 = l2, .r = 0, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = l0, .v1 = l2, .v2 = l3, .r = 0, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = l0, .v1 = l1, .v2 = l2, .r = 0, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = l0, .v1 = l2, .v2 = l3, .r = 0, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
     // Top (Y+)
     const t0 = mk(vertices, -1, 1, 1, 0, 1, 0, 0, 1);
     const t1 = mk(vertices, 1, 1, 1, 0, 1, 0, 1, 1);
     const t2 = mk(vertices, 1, 1, -1, 0, 1, 0, 1, 0);
     const t3 = mk(vertices, -1, 1, -1, 0, 1, 0, 0, 0);
-    faces.append(.{ .v0 = t0, .v1 = t1, .v2 = t2, .r = 0, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = t0, .v1 = t2, .v2 = t3, .r = 0, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = t0, .v1 = t1, .v2 = t2, .r = 0, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = t0, .v1 = t2, .v2 = t3, .r = 0, .g = 0, .b = 1, .a = 1.0 }) catch unreachable;
     // Bottom (Y-)
     const bt0 = mk(vertices, -1, -1, -1, 0, -1, 0, 0, 1);
     const bt1 = mk(vertices, 1, -1, -1, 0, -1, 0, 1, 1);
     const bt2 = mk(vertices, 1, -1, 1, 0, -1, 0, 1, 0);
     const bt3 = mk(vertices, -1, -1, 1, 0, -1, 0, 0, 0);
-    faces.append(.{ .v0 = bt0, .v1 = bt1, .v2 = bt2, .r = 1, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
-    faces.append(.{ .v0 = bt0, .v1 = bt2, .v2 = bt3, .r = 1, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = bt0, .v1 = bt1, .v2 = bt2, .r = 1, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
+    faces.append(std.heap.c_allocator, .{ .v0 = bt0, .v1 = bt2, .v2 = bt3, .r = 1, .g = 1, .b = 0, .a = 1.0 }) catch unreachable;
 }
 
-pub fn generate_sphere(radius: f32, slices: i32, stacks: i32, vertices: *RenderVertexList, faces: *FaceList) void {
+pub fn generateSphere(radius: f32, slices: i32, stacks: i32, vertices: *RenderVertexList, faces: *FaceList) void {
     vertices.clearRetainingCapacity();
     faces.clearRetainingCapacity();
 
@@ -153,7 +153,7 @@ pub fn generate_sphere(radius: f32, slices: i32, stacks: i32, vertices: *RenderV
             vert.normal = Vec3.init(x, y, z);
             vert.u = u;
             vert.v = v;
-            vertices.append(vert) catch unreachable;
+            vertices.append(std.heap.c_allocator, vert) catch unreachable;
         }
     }
 
@@ -163,13 +163,13 @@ pub fn generate_sphere(radius: f32, slices: i32, stacks: i32, vertices: *RenderV
         while (j < slices) : (j += 1) {
             const first = (i * (slices + 1)) + j;
             const second = first + slices + 1;
-            faces.append(.{ .v0 = first, .v1 = first + 1, .v2 = second, .r = 1, .g = 1, .b = 1, .a = 1 }) catch unreachable;
-            faces.append(.{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = 1, .g = 1, .b = 1, .a = 1 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = first, .v1 = first + 1, .v2 = second, .r = 1, .g = 1, .b = 1, .a = 1 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = 1, .g = 1, .b = 1, .a = 1 }) catch unreachable;
         }
     }
 }
 
-pub fn generate_spotlight_housing(radius: f32, slices: i32, stacks: i32, opening_half_angle_deg: f32, vertices: *RenderVertexList, faces: *FaceList) void {
+pub fn generateSpotlightHousing(radius: f32, slices: i32, stacks: i32, opening_half_angle_deg: f32, vertices: *RenderVertexList, faces: *FaceList) void {
     vertices.clearRetainingCapacity();
     faces.clearRetainingCapacity();
 
@@ -193,7 +193,7 @@ pub fn generate_spotlight_housing(radius: f32, slices: i32, stacks: i32, opening
                 vert.normal = Vec3.init(nsign * x, nsign * y, nsign * z);
                 vert.u = u;
                 vert.v = v;
-                vertices.append(vert) catch unreachable;
+                vertices.append(std.heap.c_allocator, vert) catch unreachable;
             }
         }
     }
@@ -215,17 +215,17 @@ pub fn generate_spotlight_housing(radius: f32, slices: i32, stacks: i32, opening
         while (j < slices) : (j += 1) {
             const first = (i * ring) + j;
             const second = first + ring;
-            faces.append(.{ .v0 = first, .v1 = first + 1, .v2 = second, .r = out_r, .g = out_g, .b = out_b, .a = 1.0 }) catch unreachable;
-            faces.append(.{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = out_r, .g = out_g, .b = out_b, .a = 1.0 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = first, .v1 = first + 1, .v2 = second, .r = out_r, .g = out_g, .b = out_b, .a = 1.0 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = out_r, .g = out_g, .b = out_b, .a = 1.0 }) catch unreachable;
             const fi = first + vcount;
             const si = second + vcount;
-            faces.append(.{ .v0 = fi, .v1 = si, .v2 = fi + 1, .r = in_r, .g = in_g, .b = in_b, .a = 1.0 }) catch unreachable;
-            faces.append(.{ .v0 = si, .v1 = si + 1, .v2 = fi + 1, .r = in_r, .g = in_g, .b = in_b, .a = 1.0 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = fi, .v1 = si, .v2 = fi + 1, .r = in_r, .g = in_g, .b = in_b, .a = 1.0 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = si, .v1 = si + 1, .v2 = fi + 1, .r = in_r, .g = in_g, .b = in_b, .a = 1.0 }) catch unreachable;
         }
     }
 }
 
-pub fn generate_torus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i32, vertices: *RenderVertexList, faces: *FaceList) void {
+pub fn generateTorus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i32, vertices: *RenderVertexList, faces: *FaceList) void {
     vertices.clearRetainingCapacity();
     faces.clearRetainingCapacity();
 
@@ -250,7 +250,7 @@ pub fn generate_torus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i
             vert.normal = Vec3.init(nx, ny, nz);
             vert.u = (@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(slices))) * 2.0;
             vert.v = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(stacks));
-            vertices.append(vert) catch unreachable;
+            vertices.append(std.heap.c_allocator, vert) catch unreachable;
         }
     }
 
@@ -260,13 +260,13 @@ pub fn generate_torus(main_radius: f32, tube_radius: f32, slices: i32, stacks: i
         while (j < stacks) : (j += 1) {
             const first = (i * (stacks + 1)) + j;
             const second = first + stacks + 1;
-            faces.append(.{ .v0 = first, .v1 = first + 1, .v2 = second, .r = 1, .g = 1, .b = 1, .a = 0.5 }) catch unreachable;
-            faces.append(.{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = 1, .g = 1, .b = 1, .a = 0.5 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = first, .v1 = first + 1, .v2 = second, .r = 1, .g = 1, .b = 1, .a = 0.5 }) catch unreachable;
+            faces.append(std.heap.c_allocator, .{ .v0 = second, .v1 = first + 1, .v2 = second + 1, .r = 1, .g = 1, .b = 1, .a = 0.5 }) catch unreachable;
         }
     }
 }
 
-fn bezier_curve(p: *const [4]Vec3, t: f32) Vec3 {
+fn bezierCurve(p: *const [4]Vec3, t: f32) Vec3 {
     const t2 = t * t;
     const t3 = t2 * t;
     const mt = 1.0 - t;
@@ -275,15 +275,15 @@ fn bezier_curve(p: *const [4]Vec3, t: f32) Vec3 {
     return p[0].scale(mt3).add(p[1].scale(3.0 * mt2 * t)).add(p[2].scale(3.0 * mt * t2)).add(p[3].scale(t3));
 }
 
-fn bezier_patch(patch: *const [4][4]Vec3, u: f32, v: f32) Vec3 {
+fn bezierPatch(patch: *const [4][4]Vec3, u: f32, v: f32) Vec3 {
     var u_curve: [4]Vec3 = undefined;
     for (&u_curve, patch) |*uc, row| {
-        uc.* = bezier_curve(&row, v);
+        uc.* = bezierCurve(&row, v);
     }
-    return bezier_curve(&u_curve, u);
+    return bezierCurve(&u_curve, u);
 }
 
-pub fn generate_teapot(vertices: *RenderVertexList, faces: *FaceList) void {
+pub fn generateTeapot(vertices: *RenderVertexList, faces: *FaceList) void {
     vertices.clearRetainingCapacity();
     faces.clearRetainingCapacity();
 
@@ -295,8 +295,8 @@ pub fn generate_teapot(vertices: *RenderVertexList, faces: *FaceList) void {
     const alloc = std.heap.c_allocator;
     var vertex_map = std.AutoHashMap([3]i32, i32).init(alloc);
     defer vertex_map.deinit();
-    var patch_vertex_indices = std.array_list.Managed(i32).init(alloc);
-    defer patch_vertex_indices.deinit();
+    var patch_vertex_indices: std.ArrayList(i32) = .empty;
+    defer patch_vertex_indices.deinit(alloc);
 
     for (0..32) |patch_idx| {
         var patch: [4][4]Vec3 = undefined;
@@ -317,22 +317,22 @@ pub fn generate_teapot(vertices: *RenderVertexList, faces: *FaceList) void {
             var j: i32 = 0;
             while (j <= tessellation) : (j += 1) {
                 const v = @as(f32, @floatFromInt(j)) / @as(f32, @floatFromInt(tessellation));
-                const pos = bezier_patch(&patch, u, v);
+                const pos = bezierPatch(&patch, u, v);
                 const qx: i32 = @intFromFloat(pos.x * inv_tolerance);
                 const qy: i32 = @intFromFloat(pos.y * inv_tolerance);
                 const qz: i32 = @intFromFloat(pos.z * inv_tolerance);
                 const key = [3]i32{ qx, qy, qz };
                 if (vertex_map.get(key)) |idx| {
-                    patch_vertex_indices.append(idx) catch unreachable;
+                    patch_vertex_indices.append(std.heap.c_allocator, idx) catch unreachable;
                 } else {
                     var vert = Vertex3D.at(pos.x, pos.y, pos.z);
                     vert.normal = Vec3.zero();
                     vert.u = u;
                     vert.v = v;
                     const vertex_idx: i32 = @intCast(vertices.items.len);
-                    vertices.append(vert) catch unreachable;
+                    vertices.append(std.heap.c_allocator, vert) catch unreachable;
                     vertex_map.put(key, vertex_idx) catch unreachable;
-                    patch_vertex_indices.append(vertex_idx) catch unreachable;
+                    patch_vertex_indices.append(std.heap.c_allocator, vertex_idx) catch unreachable;
                 }
             }
         }
@@ -347,8 +347,8 @@ pub fn generate_teapot(vertices: *RenderVertexList, faces: *FaceList) void {
                 const v1_idx = patch_vertex_indices.items[@intCast(next_row)];
                 const v2_idx = patch_vertex_indices.items[@intCast(base + 1)];
                 const v3_idx = patch_vertex_indices.items[@intCast(next_row + 1)];
-                faces.append(.{ .v0 = v0_idx, .v1 = v1_idx, .v2 = v2_idx, .r = 1, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
-                faces.append(.{ .v0 = v2_idx, .v1 = v1_idx, .v2 = v3_idx, .r = 1, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
+                faces.append(std.heap.c_allocator, .{ .v0 = v0_idx, .v1 = v1_idx, .v2 = v2_idx, .r = 1, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
+                faces.append(std.heap.c_allocator, .{ .v0 = v2_idx, .v1 = v1_idx, .v2 = v3_idx, .r = 1, .g = 1, .b = 1, .a = 1.0 }) catch unreachable;
             }
         }
     }
