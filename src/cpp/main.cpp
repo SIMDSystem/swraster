@@ -96,6 +96,21 @@ static Surface* load_texture(const char* basename) {
                     Surface* s = Platform::LoadBMP(texture_path);
                     if (s) return s;
                 }
+                // Relative to the executable's directory (CWD-independent).
+                // The raw binary sits at <repo>/build/cpp/bin/raster, so walk
+                // a few levels up looking for assets/ (same as the other ports).
+                if (char* slash = strrchr(real_path, '/')) {
+                    *slash = '\0';
+                    static const char* rels[] = {
+                        "/assets/", "/../assets/", "/../../assets/",
+                        "/../../../assets/", "/../Resources/",
+                    };
+                    for (const char* rel : rels) {
+                        char texture_path[PATH_MAX];
+                        snprintf(texture_path, PATH_MAX, "%s%s%s", real_path, rel, basename);
+                        if (Surface* s = Platform::LoadBMP(texture_path)) return s;
+                    }
+                }
                 }
             }
         }

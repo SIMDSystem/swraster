@@ -488,6 +488,7 @@ define make_app_bundle
 	@echo "APPL????" > $(2)/Contents/PkgInfo
 	@xattr -dr com.apple.quarantine $(2) 2>/dev/null || true
 	@codesign --force --deep --sign - $(2) >/dev/null 2>&1
+	@touch $(2)
 	@echo "  -> $(2)/Contents/MacOS/raster"
 endef
 
