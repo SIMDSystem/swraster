@@ -1,5 +1,4 @@
-// pixel.odin — pixel pack/unpack inlines + the 5x7 bitmap-font number renderer
-// for the on-screen FPS readout. Mirrors pixel.h + pixel.cpp.
+// pixel.odin — pixel pack/unpack + 5x7 bitmap-font text/number renderer.
 
 package main
 
@@ -47,7 +46,7 @@ add_pixel_rgb :: proc(row_pixels: [^]Pixel32, x: i32, format: ^Pixel_Format, add
 	)
 }
 
-// Simple 5x7 font for digits 0-9. Each row's low 5 bits are pixels.
+// Digits 0-9; each row's low 5 bits are the pixel mask.
 @(rodata)
 font_5x7 := [10][7]u8{
 	{0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, // 0

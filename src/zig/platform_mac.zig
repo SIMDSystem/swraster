@@ -1,8 +1,6 @@
-// platform_mac.zig — macOS native backend (Cocoa + IOSurface), ported from
-// platform_mac.mm. Objective-C++ is replaced by direct Objective-C runtime
-// calls (objc_msgSend) plus the IOSurface / CoreFoundation / QuartzCore C APIs.
-// The framebuffer is a ring of IOSurfaces the window server composites in place
-// (zero-copy present), exactly as the .mm version.
+// platform_mac — macOS native backend via the Objective-C runtime (objc_msgSend)
+// + IOSurface/CoreFoundation/QuartzCore C APIs. The framebuffer is a ring of
+// IOSurfaces the window server composites in place (zero-copy present).
 
 const std = @import("std");
 const platform = @import("platform.zig");
@@ -184,7 +182,7 @@ fn createSurfaces(w: i32, h: i32) bool {
     return true;
 }
 
-// Window delegate: refuse the close and set the quit flag.
+// Refuse the close, set the quit flag instead.
 fn windowShouldCloseImp(self: id, _cmd: SEL, sender: id) callconv(.c) i8 {
     _ = self;
     _ = _cmd;

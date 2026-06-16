@@ -1,5 +1,4 @@
-// scene.zig — scene description + builders. Mirrors scene.h + scene.cpp.
-// Jolt C++ usage is routed through the joltc wrapper (jolt.zig).
+// scene — scene description + builders; Jolt usage routed through jolt.zig.
 
 const std = @import("std");
 const dbg = @import("dbg.zig");
@@ -17,8 +16,6 @@ const PackedTexture = tex.PackedTexture;
 const Vec3 = jolt.Vec3;
 const Quat = jolt.Quat;
 
-// Mesh/material kind for a scene instance. enum(i32) keeps the field layout
-// byte-identical to the C++ `int type` (and the other three ports).
 pub const InstanceType = enum(i32) {
     cube = 0,
     sphere = 1,
@@ -66,7 +63,7 @@ pub const WallData = struct {
     local_pos: Vec3,
 };
 
-// Deterministic RNG matching the fixed-seed reproducibility intent.
+// Fixed-seed RNG for reproducible scenes.
 var rng_state: std.Random.DefaultPrng = undefined;
 fn srand(seed: u64) void {
     rng_state = std.Random.DefaultPrng.init(seed);

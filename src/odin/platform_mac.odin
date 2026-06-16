@@ -1,10 +1,5 @@
-// platform_mac.odin — macOS native backend (Cocoa + IOSurface), ported from
-// platform_mac.mm. Cocoa/AppKit calls use foreign Foundation objc bindings;
-// IOSurface / CoreFoundation / QuartzCore constants come from libSystem.
-// The framebuffer is a ring of IOSurfaces the window server composites in place
-// (zero-copy present), exactly as the .mm version.
-//
-// Link AppKit, QuartzCore, IOSurface via -extra-linker-flags in the build.
+// platform_mac.odin — macOS native backend (Cocoa + IOSurface).
+// Framebuffer is a ring of IOSurfaces the window server composites in place (zero-copy present).
 
 #+build darwin
 package main

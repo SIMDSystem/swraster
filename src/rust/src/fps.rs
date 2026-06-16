@@ -1,5 +1,4 @@
-//! fps.rs — on-screen FPS indicator. Ported from fps.zig. `pixels` is the u32
-//! framebuffer; `pitch` is in u32 elements.
+//! On-screen FPS indicator. `pitch` is in u32 elements.
 
 use crate::pixel;
 use crate::platform::PixelFormat;

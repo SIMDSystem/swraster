@@ -1,5 +1,4 @@
-// pixel.zig — pixel pack/unpack inlines + the 5x7 bitmap-font number renderer
-// for the on-screen FPS readout. Mirrors pixel.h + pixel.cpp.
+// pixel — pixel pack/unpack inlines + 5x7 bitmap-font number renderer.
 
 const std = @import("std");
 const platform = @import("platform.zig");
@@ -45,7 +44,7 @@ pub inline fn addPixelRgb(row_pixels: [*]Pixel32, x: i32, format: *const PixelFo
     );
 }
 
-// Simple 5x7 font for digits 0-9. Each row's low 5 bits are pixels.
+// 5x7 font for digits 0-9; each row's low 5 bits are pixels.
 const font_5x7 = [10][7]u8{
     .{ 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E }, // 0
     .{ 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E }, // 1

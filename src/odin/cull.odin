@@ -1,5 +1,4 @@
 // cull.odin — conservative sphere/frustum + occlusion tests run before T&L.
-// Mirrors cull.h (header-only).
 
 package main
 

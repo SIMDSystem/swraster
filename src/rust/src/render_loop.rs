@@ -1,12 +1,9 @@
-//! render_loop.rs — RenderState: owns all scene/render data and runs one frame.
-//! Ports the C++/Zig multithreaded double-buffered pipeline (render_loop.zig +
-//! pool_worker.zig + tl_worker.zig + raster_worker.zig): a unified per-frame
-//! pool where every worker drains the previous frame's shadow tiles, runs this
-//! frame's T&L chunk, then cooperatively drains the rest of the raster
-//! (color/SSAO/luminaire) via a shared pass state machine — while one task steps
-//! physics. So T&L(N) ‖ raster(N-1) ‖ physics(N) overlap, and within raster the
-//! heterogeneous sub-passes pipeline by tile instead of blocking on per-pass
-//! join barriers.
+//! RenderState: owns all scene/render data and runs one frame. A unified per-frame
+//! worker pool where every worker drains the previous frame's shadow tiles, runs
+//! this frame's T&L chunk, then cooperatively drains the rest of the raster
+//! (color/SSAO/luminaire) via a shared pass state machine — while the main thread
+//! steps physics. So T&L(N) ‖ raster(N-1) ‖ physics(N) overlap, and within raster
+//! the sub-passes pipeline by tile instead of blocking on per-pass barriers.
 
 use crate::clip::{self, ClipVertex, VertexVaryings};
 use crate::cull::{self, OccluderEye};
@@ -43,8 +40,7 @@ impl Mesh {
 }
 
 pub struct RenderState {
-    // Persistent worker pool (spawned once; kicked per frame). Mirrors the
-    // pool_worker.cpp / pool_worker.zig persistent threads. Declared FIRST so
+    // Persistent worker pool (spawned once; kicked per frame). Declared FIRST so
     // it drops first: Drop joins every worker before the buffers the FramePlan
     // points into are freed, even on unwind.
     pool: RenderPool,
@@ -58,7 +54,7 @@ pub struct RenderState {
     lamp: Mesh,
     ground: Mesh,
 
-    // Texture table; triangles/instances reference entries by index.
+    // Triangles/instances reference entries by index.
     textures: Vec<PackedTexture>,
 
     instances: Vec<CubeInstance>,
@@ -73,8 +69,7 @@ pub struct RenderState {
 
     physics: PhysicsPipeline,
     // Double-buffered pose snapshots: physics writes the back buffer while T&L
-    // reads the published front buffer (snap_read). Mirrors the double-buffered
-    // pose handoff in render_loop.zig.
+    // reads the published front buffer (snap_read).
     snapshots: [PoseSnapshot; 2],
     snap_read: usize,
 
@@ -86,9 +81,9 @@ pub struct RenderState {
     linear_z: Vec<f32>,
     shadow_depth: Vec<u16>,
 
-    // Double-buffered T&L output: frame N's T&L writes [tl_idx] while frame N's
-    // raster consumes frame N-1's output in [raster_idx]. This is the pipeline
-    // lag that lets T&L(N) ‖ raster(N-1) ‖ physics(N) overlap.
+    // Double-buffered T&L output: frame N's T&L writes [tl_idx] while raster
+    // consumes frame N-1's output in [raster_idx] — the pipeline lag that lets
+    // T&L(N) ‖ raster(N-1) ‖ physics(N) overlap.
     opaque: [Vec<RenderTriangle>; 2],
     trans: [Vec<RenderTriangle>; 2],
     shadow: [Vec<RenderTriangle>; 2],
@@ -103,12 +98,10 @@ pub struct RenderState {
     sort_keys: Vec<KeyIdx>,
     sort_gather: Vec<RenderTriangle>,
 
-    // Stable storage for this frame's T&L params so the worker plan can hold a
-    // pointer to it across the two-phase kick (raster fired before setup fills
-    // these, T&L gated until publish_tl). Filled each frame during setup.
+    // Stable storage so the worker plan can hold a pointer across the two-phase
+    // kick (raster fires before setup fills these; T&L gated until publish_tl).
     frame_tl_params: TlParams,
 
-    // Worker count for parallel T&L + raster passes.
     num_threads: usize,
     active_workers: usize,
     // Worker count of the most recent kicked frame; merge_flat_globals clamps
@@ -134,7 +127,6 @@ pub struct RenderState {
     started: bool,
     profiler_unfreeze: bool,
 
-    // Per-thread concurrency profiler overlay (toggled with 's').
     profiler: Profiler,
 }
 
@@ -159,10 +151,8 @@ struct TlParams {
     screen_height: i32,
 }
 
-// Per-frame view/lighting state needed by the raster + overlay passes. Stored
-// double-buffered so raster(N-1) and the overlays use the matrices that match
-// the geometry T&L produced last frame (mirrors projection_buffers /
-// raster_shared params in render_loop.zig).
+// Per-frame view/lighting state for the raster + overlay passes. Double-buffered
+// so raster(N-1) uses the matrices matching the geometry T&L produced last frame.
 #[derive(Clone, Copy, Default)]
 struct FrameParams {
     view: Mat4,
@@ -178,11 +168,9 @@ struct FrameParams {
     valid: bool,
 }
 
-// Raster dispatch grid: TILE_X_SPLITS columns x NUM_STRIPS rows, matching the
-// C++/Zig tile grid (raster_worker.cpp + threading.zig). Workers claim tiles via
-// per-row column counters and scavenge across all rows, advancing a shared pass
-// counter so heterogeneous work (shadow -> color(+SSAO overlap) -> ssao ->
-// luminaire) overlaps instead of barriering. Tile index is row-major: row*X+col.
+// Raster dispatch grid: X columns x R rows. Workers claim tiles via per-row column
+// counters and scavenge across rows, advancing a shared pass counter so passes
+// (shadow -> color(+SSAO overlap) -> ssao -> luminaire) overlap. Tile = row*X+col.
 const X: usize = config::TILE_X_SPLITS as usize; // 16 columns
 const R: usize = 16; // NUM_STRIPS rows
 const NTILES: usize = X * R; // 256 tiles per pass
@@ -262,10 +250,8 @@ fn sort_triangles_by_key(items: &mut [RenderTriangle], ascending: bool, keys: &m
     items.copy_from_slice(&gather[..n]);
 }
 
-// Per-tile triangle bins (mirror StripTriangleBuffer / TLThreadOutput bins).
-// Small triangles (covering <=4 tiles) are binned per tile so each raster tile
-// only draws its own bin merged with the flat global list; larger triangles
-// fall back to the flat global lists.
+// Per-tile triangle bins. Small triangles (covering <=4 tiles) are binned per
+// tile; larger triangles fall back to the flat global lists.
 #[derive(Default)]
 struct TileBins {
     opaque: Vec<RenderTriangle>,
@@ -273,12 +259,9 @@ struct TileBins {
     shadow: Vec<RenderTriangle>,
 }
 
-// Published scatter-merge target: each tile's three lists live inside the
-// Mutex that guards them, so the lock<->data association is compiler-checked
-// (one lock per tile — identical granularity to the C++ per-bin locks).
-// Writers (tl_phase scatter) lock per tile; next frame's raster reads the
-// completed buffer through Mutex::get_mut on exclusively claimed tiles —
-// synchronized by the frame barrier, so the read path stays lock-free.
+// Published scatter-merge target, one Mutex per tile. Writers (tl_phase scatter)
+// lock per tile; next frame's raster reads via Mutex::get_mut on exclusively
+// claimed tiles (frame barrier synchronizes), so the read path stays lock-free.
 struct TriBins {
     tiles: Vec<std::sync::Mutex<TileBins>>,
 }
@@ -337,8 +320,8 @@ impl LocalBins {
     }
 }
 
-// Per-worker T&L scratch output (mirror TLThreadOutput): flat fallback lists +
-// per-tile bins, both locally sorted, plus this worker's profiler intervals.
+// Per-worker T&L scratch output: flat fallback lists + per-tile bins (both locally
+// sorted), plus this worker's profiler intervals.
 #[derive(Default)]
 struct WorkerLocal {
     opaque: Vec<RenderTriangle>,
@@ -370,8 +353,7 @@ impl WorkerLocal {
 }
 
 // Tile coverage of a screen/shadow-space triangle. Returns inclusive
-// (first_col, last_col, first_row, last_row) or None if fully off-screen.
-// Mirrors screen_tile_range in tl_worker.cpp.
+// (first_col, last_col, first_row, last_row), or None if fully off-screen.
 #[inline]
 fn screen_tile_range(
     x0: f32, x1: f32, x2: f32, y0: f32, y1: f32, y2: f32, width: i32, height: i32,
@@ -641,9 +623,9 @@ impl RenderState {
         let run_physics = delta_time > 0.0;
         let seq = self.physics.sequence + 1;
 
-        // Pipeline double-buffer indices. Physics writes the back pose snapshot
-        // while T&L reads the published front one; T&L writes its triangles into
-        // tl_idx while raster consumes the previous frame's output in raster_idx.
+        // Pipeline double-buffer indices: physics writes the back pose snapshot,
+        // T&L reads the front one; T&L writes triangles into tl_idx, raster
+        // consumes the previous frame's output in raster_idx.
         let read_idx = self.snap_read;
         let write_idx = 1 - read_idx;
         let tl_idx = (self.frame_num as usize) & 1;
@@ -660,8 +642,7 @@ impl RenderState {
         let time = self.snapshots[read_idx].sim_time;
 
         // Projection (rebuild only on aspect change). Computed up front so the
-        // raster kick below — which is independent of this frame's T&L setup —
-        // can go out before the main thread does any setup work.
+        // raster kick below can fire before any of this frame's setup work.
         let aspect = w as f32 / h as f32;
         if aspect != self.last_aspect {
             self.projection = clip::build_projection_matrix(60.0, aspect, config::NEAR_PLANE, config::CAMERA_FAR_PLANE);
@@ -674,32 +655,26 @@ impl RenderState {
         let nthreads = self.active_workers.clamp(1, self.num_threads.max(1));
         let tl_workers = config::num_tl_threads().clamp(1, nthreads as i32);
 
-        // Raster runs the buffer the previous frame's T&L populated. Its inputs
-        // (raster_idx geometry, matrices, cone, shadow box) are all complete from
-        // last frame, so it does not depend on anything in this frame's setup.
+        // Raster runs raster_idx (the previous frame's T&L output); its inputs are
+        // all complete from last frame, independent of this frame's setup.
         let do_raster = self.frame_params[raster_idx].valid;
         let fp_raster = self.frame_params[raster_idx];
 
-        // Finalize the previous frame's flat-global triangles into the buffer
-        // this frame rasterizes. Per-tile bins were scatter-merged by the workers
-        // last frame; only the few big-triangle flat fallbacks are concatenated +
-        // sorted here. Done at frame top (after the previous Present) so it is off
-        // the path between raster completion and Present (mirrors C++
-        // merge_tl_globals running post-Present).
+        // Finalize the previous frame's flat-global triangles into the buffer this
+        // frame rasterizes. Done at frame top (post-Present) so it stays off the
+        // path between raster completion and Present. Bins were scatter-merged by
+        // the workers last frame; only big-triangle flat fallbacks merge here.
         if do_raster {
             self.merge_flat_globals(raster_idx);
         }
-        // Record this frame's worker count: next frame's merge_flat_globals
-        // must only fold locals from workers that run this frame.
+        // Next frame's merge_flat_globals must only fold locals from this frame's workers.
         self.tl_locals_workers = nthreads;
 
-        // Clear this frame's scatter-merge target before the pool can touch it.
         self.bins[tl_idx].clear();
 
-        // Derive each framebuffer/G-buffer pointer exactly once per frame:
-        // Phase-A workers write through these from the moment kick_raster
-        // fires, so the publish_tl plan must reuse the same derivations instead
-        // of re-borrowing buffers the workers are already writing through.
+        // Derive each buffer pointer once: Phase-A workers write through these from
+        // the moment kick_raster fires, so publish_tl must reuse the same derivations
+        // rather than re-borrow buffers the workers already write through.
         let pix_ptr = fb.as_mut_ptr();
         let depth_ptr = self.depth.as_mut_ptr();
         let normal_ptr = self.normal.as_mut_ptr();
@@ -708,9 +683,9 @@ impl RenderState {
         let r_bins_ptr = self.bins[raster_idx].tiles.as_mut_ptr();
         let w_bins_ptr = self.bins[tl_idx].tiles.as_mut_ptr();
 
-        // ----- Phase 1 kick: fire the previous frame's raster NOW. The shadow
-        // pre-pass overlaps the main-thread T&L setup that follows. The plan's
-        // T&L fields are placeholders here; publish_tl fills them post-setup. -----
+        // Phase 1 kick: fire the previous frame's raster now so its shadow pre-pass
+        // overlaps the T&L setup below. The plan's T&L fields are placeholders here;
+        // publish_tl fills them post-setup.
         let raster_plan = FramePlan {
             do_raster,
             nthreads: nthreads as i32,
@@ -760,7 +735,7 @@ impl RenderState {
         };
         self.pool.kick_raster(raster_plan);
 
-        // ----- Camera + matrices (setup; overlaps the shadow pre-pass above) ---
+        // ----- Camera + matrices (overlaps the shadow pre-pass above) -----
         let cp = self.camera_pitch.cos();
         let camera_pos = Vec3::new(
             self.camera_distance * cp * self.camera_yaw.sin(),
@@ -851,8 +826,8 @@ impl RenderState {
             }
         });
 
-        // ----- T&L params (stored on self so the worker plan can hold a stable
-        // pointer to them across the two-phase kick). -----
+        // T&L params (stored on self so the plan can hold a stable pointer across
+        // the two-phase kick).
         self.frame_tl_params = TlParams {
             view,
             projection,
@@ -872,10 +847,9 @@ impl RenderState {
             screen_width: w,
             screen_height: h,
         };
-        // ----- Build THIS frame's shadow box / frame params into tl_idx. The
-        // luminaire cone is built by worker 0 during T&L (see tl_phase), matching
-        // tl_worker.cpp; raster consumes the previous frame's copy from
-        // raster_idx, so neither blocks the main thread. -----
+        // Build this frame's shadow box / frame params into tl_idx. The luminaire
+        // cone is built by worker 0 during T&L (see tl_phase); raster consumes the
+        // previous frame's copy from raster_idx, so neither blocks the main thread.
         self.build_shadow_box(tl_idx, &view, &shadow_matrix, time);
         self.frame_params[tl_idx] = FrameParams {
             view,
@@ -891,20 +865,18 @@ impl RenderState {
             valid: true,
         };
 
-        // Split the pose snapshots: T&L reads the published front buffer while
-        // physics writes the back buffer (concurrently, disjoint).
+        // Split the pose snapshots: T&L reads the front buffer, physics writes the
+        // back one (concurrently, disjoint).
         let (read_snap, write_snap): (&PoseSnapshot, &mut PoseSnapshot) = {
             let (a, b) = self.snapshots.split_at_mut(1);
             if write_idx == 0 { (&b[0], &mut a[0]) } else { (&a[0], &mut b[0]) }
         };
 
-        // Raw pointer to this frame's cone buffer (extracted before the literal
-        // so it doesn't overlap the r_cone = &self.cone[raster_idx] borrow).
+        // Extracted before the literal so it doesn't overlap the r_cone borrow.
         let w_cone_ptr = &mut self.cone[tl_idx] as *mut LuminaireConeBuffer;
 
-        // ----- Phase 2 publish: republish the now-complete plan (T&L fields
-        // filled by the setup above) and open the T&L gate so the parked workers
-        // run T&L, then drain the rest of the raster. -----
+        // Phase 2 publish: republish the now-complete plan and open the T&L gate so
+        // the parked workers run T&L, then drain the rest of the raster.
         let plan = FramePlan {
             do_raster,
             nthreads: nthreads as i32,
@@ -959,9 +931,9 @@ impl RenderState {
             epoch: self.profiler.epoch_instant(),
         };
 
-        // Open the T&L gate (Phase 2), then step physics on the main thread
-        // concurrently with the pool's T&L(N) ‖ raster(N-1). Physics writes the
-        // back snapshot (write_idx); the pool reads the disjoint front one.
+        // Open the T&L gate, then step physics on the main thread concurrently with
+        // the pool's T&L(N) ‖ raster(N-1). Physics writes the back snapshot; the
+        // pool reads the disjoint front one.
         self.pool.publish_tl(plan);
 
         let physics_iv = if run_physics {
@@ -974,9 +946,8 @@ impl RenderState {
 
         self.pool.wait();
 
-        // ----- Record profiler intervals from the worker locals. The flat-global
-        // merge for this frame's T&L output is deferred to the top of the next
-        // frame (merge_flat_globals), keeping it off the path to Present. -----
+        // Record profiler intervals from the worker locals. (The flat-global merge
+        // for this frame's T&L output is deferred to the top of the next frame.)
         {
             let prof = &mut self.profiler;
             for wid in 0..nthreads {
@@ -993,22 +964,20 @@ impl RenderState {
             self.profiler.record_physics(iv);
         }
 
-        // ----- Publish physics result. -----
         if run_physics {
             self.snap_read = write_idx;
             self.sim_time = self.snapshots[write_idx].sim_time;
         }
 
-        // ----- Single-threaded overlays (glare + wireframe) on the now-complete
-        // raster; or clear on the first frame which has no geometry yet. -----
+        // Single-threaded overlays (glare + wireframe); or clear on the first frame,
+        // which has no geometry yet.
         if do_raster {
             self.draw_overlays(fb, w, h, fp_raster);
         } else {
             fb.fill(clear_color);
         }
 
-        // ----- Overlays: FPS, then the concurrency profiler (drawn last so it
-        // sits on top). The profiler uses the previous frame's present timing. -----
+        // FPS, then the profiler (drawn last so it sits on top).
         self.fps.draw(fb, w, w, &self.format);
         let label = format!("RUST {}/{}", nthreads, tl_workers);
         pixel::draw_text(fb, w, 20, 20, &label, 255, 255, 255, &self.format);
@@ -1020,20 +989,15 @@ impl RenderState {
         self.frame_num += 1;
     }
 
-    // Concatenate the worker-local flat-global triangle lists (the big triangles
-    // that span >4 tiles and fall out of per-tile binning) into buffer `idx` and
-    // re-sort. Reads the previous frame's worker locals while the pool is parked
-    // (called at frame top, before kick_raster wakes the workers to clear them),
-    // mirroring the C++ main-thread global merge that runs post-Present.
+    // Concatenate the worker-local flat-global lists (big triangles spanning >4
+    // tiles) into buffer `idx` and re-sort. Reads the previous frame's worker
+    // locals while the pool is parked (called at frame top, before kick_raster).
     fn merge_flat_globals(&mut self, idx: usize) {
         self.opaque[idx].clear();
         self.trans[idx].clear();
         self.shadow[idx].clear();
-        // Only the workers that actually ran the frame which produced these
-        // locals cleared + filled them; workers that sat out (worker_id >=
-        // that frame's nthreads) still hold an older frame's triangles, so
-        // clamp the merge to the recorded count (C++ k_eff guard,
-        // render_loop.cpp merge clamping to active_tl_job_thread_count).
+        // Workers that sat out the producing frame still hold older triangles, so
+        // clamp to that frame's recorded worker count.
         let nthreads = self.tl_locals_workers.clamp(1, self.num_threads.max(1));
         for wid in 0..nthreads {
             let lo = self.pool.local(wid);
@@ -1054,9 +1018,7 @@ impl RenderState {
         self.sort_gather = gather;
     }
 
-    // Single-threaded overlays drawn after the cooperative raster completes:
-    // spotlight glare and the tumbling-box wireframe. Uses the frame params that
-    // match the geometry just rasterized (raster_idx).
+    // Spotlight glare + tumbling-box wireframe, drawn after the raster completes.
     fn draw_overlays(&mut self, fb: &mut [u32], w: i32, h: i32, fp: FrameParams) {
         let overlay_t0 = self.profiler.now();
         let format = self.format;
@@ -1151,10 +1113,9 @@ impl RenderState {
         }
     }
 
-    // T&L: transform / light / clip / project a contiguous chunk of the
-    // depth-sorted instances into flat opaque/trans/shadow lists. Mirrors
-    // tl_worker_frame. Free function (no &self) so chunks run on worker threads;
-    // all inputs are shared, read-only, Sync borrows.
+    // T&L: transform / light / clip / project a contiguous chunk of the depth-sorted
+    // instances into flat opaque/trans/shadow lists. Free function (no &self) so
+    // chunks run on worker threads over shared read-only inputs.
     #[allow(clippy::too_many_arguments)]
     fn tl_chunk(
         meshes: &[&Mesh; 7],
@@ -1281,8 +1242,8 @@ impl RenderState {
                 } else {
                     Vec3::new(face.r, face.g, face.b)
                 };
-                // Phong shading is on, so the per-vertex shaded color equals
-                // base_color (compute_vertex_color path only matters when off).
+                // With Phong on, the shaded color is just base_color; the
+                // compute_vertex_color path only matters when it's off.
                 let (s0, s1, s2) = if config::ENABLE_PHONG_SHADING {
                     (base_color, base_color, base_color)
                 } else {
@@ -1447,17 +1408,16 @@ const SHADOW_BOX_EDGES: [[usize; 2]; 12] = [
     [0, 1], [1, 2], [2, 3], [3, 0], [4, 5], [5, 6], [6, 7], [7, 4], [0, 4], [1, 5], [2, 6], [3, 7],
 ];
 
-// ---- Persistent worker pool (faithful port of pool_worker + threading) -------
+// ---- Persistent worker pool -------------------------------------------------
 //
 // Threads are spawned once and parked on a condvar. Each frame, main publishes a
-// `FramePlan` of raw pointers into RenderState's stable, owned buffers and kicks
-// the pool, then waits until every worker reports done before touching those
-// buffers again — so the raw pointers stay valid for the whole frame. Per frame a
-// worker runs: (A) drain the previous frame's shadow tiles, (B) its T&L instance
-// chunk (transform/clip/bin + local sort + scatter-merge), (C) cooperatively
-// drain the rest of the previous frame's raster (color, SSAO, luminaire) via the
-// shared pass state machine. raster(N-1) ‖ T&L(N) ‖ physics(N) (physics runs on
-// the main thread while the pool works).
+// `FramePlan` of raw pointers into RenderState's stable, owned buffers, kicks the
+// pool, then waits until every worker reports done before touching those buffers
+// again — so the pointers stay valid for the whole frame. Per frame a worker runs:
+// (A) drain the previous frame's shadow tiles, (B) its T&L instance chunk
+// (transform/clip/bin + local sort + scatter-merge), (C) cooperatively drain the
+// rest of the previous frame's raster (color, SSAO, luminaire) via the shared pass
+// state machine. raster(N-1) ‖ T&L(N) ‖ physics(N) (physics on the main thread).
 
 #[inline]
 unsafe fn slice_from<'a, T>(p: *const T, len: usize) -> &'a [T] {
@@ -1470,9 +1430,8 @@ unsafe fn slice_from<'a, T>(p: *const T, len: usize) -> &'a [T] {
     }
 }
 
-// Append `src` (already locally sorted) onto `dst` and re-merge into one sorted
-// run. Rust's adaptive sort detects the two existing runs, so this is the
-// std::inplace_merge equivalent. Mirrors tl_worker.cpp append_bin.
+// In-place merge of two adjacent sorted runs (split at `mid`). Copies aside only
+// the smaller run, then merges from the end it can't clobber.
 #[inline]
 fn merge_sorted_runs(
     items: &mut [RenderTriangle],
@@ -1489,8 +1448,8 @@ fn merge_sorted_runs(
     scratch.clear();
 
     if left_len <= right_len {
-        // Copy only the smaller left run aside, then merge front-to-back. The
-        // write cursor never overtakes the unread right run.
+        // Smaller left run aside, merge front-to-back: write cursor never overtakes
+        // the unread right run.
         ensure_vec_capacity(scratch, left_len);
         scratch.extend_from_slice(&items[..left_len]);
         let mut i = 0usize; // scratch / left
@@ -1514,10 +1473,10 @@ fn merge_sorted_runs(
         if i < left_len {
             items[k..k + (left_len - i)].copy_from_slice(&scratch[i..left_len]);
         }
-        // Leftover right-run items are already in place.
+        // Leftover right-run items already in place.
     } else {
-        // Copy only the smaller right run aside, then merge back-to-front. The
-        // write cursor never clobbers unread left-run items.
+        // Smaller right run aside, merge back-to-front: write cursor never clobbers
+        // unread left-run items.
         ensure_vec_capacity(scratch, right_len);
         scratch.extend_from_slice(&items[mid..n]);
         let mut i = mid; // one past current left item
@@ -1541,7 +1500,7 @@ fn merge_sorted_runs(
         if j > 0 {
             items[k - j..k].copy_from_slice(&scratch[..j]);
         }
-        // Leftover left-run items are already in place.
+        // Leftover left-run items already in place.
     }
 }
 
@@ -1564,7 +1523,7 @@ fn append_bin(
 }
 
 // Per-frame plan published by main under the kick mutex. All pointers reference
-// RenderState's owned, stable buffers and are valid until the pool reports done.
+// RenderState's owned buffers and are valid until the pool reports done.
 #[derive(Clone, Copy)]
 struct FramePlan {
     do_raster: bool,
@@ -1592,17 +1551,15 @@ struct FramePlan {
     r_trans_len: usize,
     r_shadow: *const RenderTriangle,
     r_shadow_len: usize,
-    // Previous frame's completed per-tile bins (NTILES Mutex<TileBins>); read
-    // lock-free via Mutex::get_mut under the frame barrier.
+    // Previous frame's completed per-tile bins; read lock-free via get_mut.
     r_bins: *mut std::sync::Mutex<TileBins>,
     r_cone: *const LuminaireConeBuffer,
     r_box: *const ShadowBoxBuffer,
     textures: *const PackedTexture,
     textures_len: usize,
-    // Scatter-merge target: base pointer of this frame's NTILES tile bins,
-    // each locked through the Mutex that owns it.
+    // Scatter-merge target: this frame's tile bins (locked per tile when written).
     w_bins: *mut std::sync::Mutex<TileBins>,
-    // This frame's luminaire cone buffer, built by worker 0 during T&L.
+    // This frame's luminaire cone, built by worker 0 during T&L.
     w_cone: *mut LuminaireConeBuffer,
     meshes: [*const Mesh; 7],
     instances: *const CubeInstance,
@@ -1668,17 +1625,15 @@ impl Default for FramePlan {
 }
 
 struct KickState {
-    // Raster-kick generation: bumped by kick_raster to wake workers for Phase A
-    // (previous frame's raster) before this frame's T&L setup has run.
+    // Bumped by kick_raster to wake workers for Phase A (previous frame's raster).
     frame_target: u64,
-    // T&L-ready generation: bumped by publish_tl once setup has filled the plan's
-    // T&L fields. Workers gate Phase B (T&L) on this so the shadow pre-pass can
-    // overlap the main-thread setup.
+    // Bumped by publish_tl once setup filled the plan's T&L fields; workers gate
+    // Phase B on this so the shadow pre-pass can overlap setup.
     tl_target: u64,
     workers_done: usize,
 }
 
-// Shared state behind an Arc, held by every pool thread + the main RenderPool.
+// Shared state behind an Arc, held by every pool thread + main.
 struct PoolShared {
     nthreads: usize,
     running: std::sync::atomic::AtomicBool,
@@ -1689,12 +1644,10 @@ struct PoolShared {
     plan: std::cell::UnsafeCell<FramePlan>,
     locals: Vec<std::cell::UnsafeCell<WorkerLocal>>,
 }
-// Sound: `plan` is written by main only under the kick mutex and read by
-// workers only while holding it (happens-before + mutual exclusion); each
-// `locals[i]` is touched exclusively by worker i during the frame and by main
-// only after all workers report done; the per-tile bin Mutexes (TriBins)
-// serialize the only shared bin writes; framebuffer tiles are disjoint per the
-// pass state machine.
+// SAFETY: `plan` written/read only under the kick mutex (happens-before); each
+// `locals[i]` touched only by worker i during the frame, by main only after all
+// report done; shared bin writes serialized by the per-tile TriBins mutexes;
+// framebuffer tiles disjoint per the pass state machine.
 unsafe impl Sync for PoolShared {}
 unsafe impl Send for PoolShared {}
 
@@ -1725,11 +1678,9 @@ impl RenderPool {
         RenderPool { shared, handles, target: 0 }
     }
 
-    // Phase 1 of the per-frame kick: publish the raster-side plan (previous
-    // frame's geometry, all inputs already complete) and reset the scheduler,
-    // then wake the pool so the shadow pre-pass starts immediately — before this
-    // frame's T&L setup runs on the main thread. `plan`'s T&L fields are stale
-    // here; workers only touch them after publish_tl flips tl_target.
+    // Phase 1: publish the raster-side plan, reset the scheduler, and wake the pool
+    // so the shadow pre-pass starts before this frame's T&L setup. `plan`'s T&L
+    // fields are stale; workers touch them only after publish_tl flips tl_target.
     fn kick_raster(&mut self, plan: FramePlan) {
         self.shared.sched.reset(plan.do_raster);
         self.target += 1;
@@ -1742,9 +1693,8 @@ impl RenderPool {
         self.shared.cv_pool.notify_all();
     }
 
-    // Phase 2: republish the now-complete plan (T&L fields filled by setup) and
-    // open the T&L gate. Workers parked after the shadow pre-pass proceed to
-    // their T&L chunk, then the rest of the raster passes.
+    // Phase 2: republish the complete plan and open the T&L gate. Workers parked
+    // after the shadow pre-pass proceed to T&L, then the rest of the raster.
     fn publish_tl(&self, plan: FramePlan) {
         let mut k = self.shared.mtx.lock().unwrap();
         unsafe {
@@ -1781,10 +1731,9 @@ impl Drop for RenderPool {
     }
 }
 
-// One persistent pool thread. Parks until main fires the raster kick, drains the
-// previous frame's shadow pre-pass (Phase A) while main runs setup, then waits
-// for the T&L gate before T&L (Phase B) and the rest of the raster (Phase C).
-// Mirrors pool_worker_main (raster_worker shadow-only -> tl_worker -> raster).
+// One persistent pool thread. Parks until the raster kick, drains the previous
+// frame's shadow pre-pass (Phase A) while main runs setup, then waits for the T&L
+// gate before T&L (Phase B) and the rest of the raster (Phase C).
 fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
     let mut last_processed: u64 = 0;
     loop {
@@ -1800,10 +1749,8 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
             }
             last_processed = k.frame_target;
             this_frame = k.frame_target;
-            // Phase A reads only the previous frame's raster inputs (published
-            // by kick_raster). Copy the plan while still holding the kick mutex:
-            // main rewrites the whole plan in publish_tl under this same mutex,
-            // so an unlocked copy here would race with that rewrite.
+            // Copy the plan while holding the kick mutex: publish_tl rewrites it
+            // under the same mutex, so an unlocked copy would race.
             plan_a = unsafe { *shared.plan.get() };
         }
         if worker_id >= plan_a.nthreads.max(1) as usize {
@@ -1823,15 +1770,14 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
         local.tl_ivs.clear();
         local.r_ivs.clear();
 
-        // Phase A: previous frame's shadow map (2D tiles, cross-row scavenge).
-        // Overlaps the main thread's T&L setup for this frame.
+        // Phase A: previous frame's shadow map; overlaps the main thread's setup.
         if plan_a.do_raster {
             ctx_a.raster_shadow_prepass(worker_id, &mut local.r_ivs);
         }
 
         if (worker_id as i32) < plan_a.tl_workers {
-            // T&L-preferred workers wait for publish_tl (setup complete), then
-            // run this frame's T&L before falling through to help raster.
+            // T&L-preferred workers wait for publish_tl, run this frame's T&L, then
+            // fall through to help raster.
             let plan = {
                 let mut k = shared.mtx.lock().unwrap();
                 while shared.running.load(Ordering::Acquire) && k.tl_target < this_frame {
@@ -1848,9 +1794,8 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
                 ctx.raster_rest(worker_id, &mut local.r_ivs);
             }
         } else if plan_a.do_raster {
-            // Raster-preferred workers do not wait for this frame's T&L setup.
-            // They immediately continue draining raster(N-1), matching C++/Zig
-            // workers with worker_id >= k_eff.
+            // Raster-preferred workers skip this frame's T&L gate and keep draining
+            // raster(N-1) immediately.
             ctx_a.raster_rest(worker_id, &mut local.r_ivs);
         }
 
@@ -1862,12 +1807,10 @@ fn pool_worker_main(shared: &PoolShared, worker_id: usize) {
     }
 }
 
-// ---- Cooperative raster scheduler (2D tile grid; port of raster_worker.cpp +
-// threading.zig). ShadowDepth & Color claim tiles via per-row column counters
-// with cross-row scavenging (a worker drains other rows before it ever blocks).
-// SSAO & Luminaire tiles are claimed opportunistically the moment their
-// dependencies complete. A shared `pass` counter advances ShadowDepth ->
-// Color(+SSAO overlap) -> Ssao -> Luminaire.
+// ---- Cooperative raster scheduler (2D tile grid). ShadowDepth & Color claim
+// tiles via per-row column counters with cross-row scavenging; SSAO & Luminaire
+// tiles are claimed opportunistically once their dependencies complete. A shared
+// `pass` counter advances ShadowDepth -> Color(+SSAO overlap) -> Ssao -> Luminaire.
 struct Sched {
     pass: AtomicI32,
     hard_barrier: std::sync::atomic::AtomicBool,
@@ -1894,8 +1837,8 @@ impl Sched {
         }
     }
 
-    // Reset for a new frame (called by main while the pool is parked, so plain
-    // relaxed stores are fine — the kick's mutex release publishes them).
+    // Reset for a new frame; called while the pool is parked, so relaxed stores
+    // suffice (the kick's mutex release publishes them).
     fn reset(&self, do_raster: bool) {
         self.pass.store(if do_raster { PASS_SHADOW } else { RPC }, Ordering::Relaxed);
         for d in &self.tiles_done {
@@ -1922,7 +1865,6 @@ impl Sched {
 }
 
 // Per-frame worker handle: the published plan (Copy) + the shared pool state.
-// All data is reached through the raw pointers in `plan`.
 #[derive(Clone, Copy)]
 struct WorkerCtx<'a> {
     plan: FramePlan,
@@ -1954,10 +1896,9 @@ impl<'a> WorkerCtx<'a> {
     fn textures(&self) -> &[PackedTexture] {
         unsafe { slice_from(self.plan.textures, self.plan.textures_len) }
     }
-    // Previous frame's bins for one tile. The buffer was completed last frame
-    // and is read-only this frame (frame barrier), and each tile is claimed by
-    // exactly one worker per pass, so Mutex::get_mut is sound here and keeps
-    // this path lock-free (no atomic acquire per tile).
+    // SAFETY: previous frame's bins are read-only this frame (frame barrier) and
+    // each tile is claimed by exactly one worker per pass, so get_mut is sound
+    // and keeps this path lock-free.
     #[inline]
     fn r_tile(&self, tile_idx: usize) -> &TileBins {
         unsafe { (*self.plan.r_bins.add(tile_idx)).get_mut().unwrap() }
@@ -2184,8 +2125,8 @@ impl<'a> WorkerCtx<'a> {
         self.do_ssao_tile(c, r);
         r_ivs.push(Interval { start: t0, end: self.ts(), tag: profiler::RASTER_SSAO });
         sched.ssao_done[idx].store(1, Ordering::Release);
-        // This tile's SSAO is done -> opportunistically run its own luminaire cone.
-        // Disabled by the hard barrier so Luminaire waits for its dedicated pass.
+        // SSAO done -> opportunistically run this tile's luminaire (unless the hard
+        // barrier forces Luminaire to its own pass).
         if !self.plan.hard_barrier {
             self.try_run_lum(c, r, r_ivs);
         }
@@ -2331,8 +2272,7 @@ impl<'a> WorkerCtx<'a> {
                     if done >= NTILES as i32 {
                         sched.pass.fetch_max(PASS_SSAO, Ordering::AcqRel);
                     }
-                    // Opportunistically run any SSAO tile this completion unblocked.
-                    // Disabled by the hard barrier so passes serialize cleanly.
+                    // Opportunistically run any SSAO tile this color tile unblocked.
                     if !hard_barrier {
                         for dr in -1..=1 {
                             for dc in -1..=1 {
@@ -2433,11 +2373,9 @@ impl<'a> WorkerCtx<'a> {
             local.tl_ivs.push(Interval { start: s0, end: self.ts(), tag: profiler::TL_LOCAL_SORT });
         }
 
-        // Spotlight luminaire cone T&L: worker 0 only, after the local sort and
-        // before the scatter-merge so it overlaps the other workers' tail-end
-        // per-instance work (mirrors tl_worker.cpp). Output (cone[tl_idx]) is
-        // double-buffered and only read by next frame's raster, so building it
-        // here off the main thread costs nothing on the critical path.
+        // Spotlight luminaire cone: worker 0 only, between local sort and scatter so
+        // it overlaps other workers' tail-end work. Output is double-buffered (read
+        // by next frame's raster), so building it here is off the critical path.
         if worker_id == 0 && !self.plan.w_cone.is_null() {
             let tl = unsafe { &*self.plan.tl };
             let cone = unsafe { &mut *self.plan.w_cone };
@@ -2451,7 +2389,7 @@ impl<'a> WorkerCtx<'a> {
         }
 
         // Scatter-merge this worker's sorted bins into the published bins under
-        // per-tile locks, starting at a staggered tile so workers don't collide.
+        // per-tile locks, from a staggered start tile so workers don't collide.
         let s1 = self.ts();
         let scatter_start = (worker_id * NTILES) / nt;
         for j in 0..NTILES {
@@ -2465,9 +2403,8 @@ impl<'a> WorkerCtx<'a> {
             if so.is_empty() && st.is_empty() && ssd.is_empty() {
                 continue;
             }
-            // Lock the Mutex that owns this tile's three lists; no reference to
-            // the whole bin array is ever formed, so disjoint tiles are merged
-            // concurrently without aliasing.
+            // Lock per tile; no reference to the whole bin array is formed, so
+            // disjoint tiles merge concurrently without aliasing.
             let mut tile = unsafe { &*self.plan.w_bins.add(s) }.lock().unwrap();
             append_bin(&mut tile.opaque, so, config::ENABLE_RGB_TRIANGLE_SORT, true, &mut local.sort_gather);
             append_bin(&mut tile.trans, st, config::ENABLE_RGB_TRIANGLE_SORT, false, &mut local.sort_gather);

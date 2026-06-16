@@ -1,13 +1,7 @@
 #pragma once
 
-// keysort.h — sort large POD structs by a float key without moving the structs
-// during the comparison sort. C++ mirror of src/zig/keysort.zig.
-//
-// RenderTriangle is ~480 bytes. std::sort relocates whole structs (~n*log2(n)
-// moves of 480 bytes). Instead we extract (key, index) pairs (8 bytes each),
-// sort *those* (cache-resident 8-byte moves), then gather the structs into
-// sorted order exactly once. Total large-struct movement drops to ~2n
-// regardless of n, which beats an in-place comparison sort for any n > ~3.
+// Sort large POD structs by a float key. Sorting 8-byte (key,index) pairs and
+// gathering once moves each ~480-byte struct only ~2n times instead of n*log n.
 
 #include <vector>
 #include <cstdint>
@@ -19,9 +13,7 @@ struct KeyIdx {
     uint32_t idx;
 };
 
-// Sort `items` in place by `key_of(item)`, ascending or descending. `keys` and
-// `gather` are caller-owned scratch buffers reused across calls (their contents
-// are clobbered); `gather` must be a vector of the same element type.
+// `keys` and `gather` are caller-owned scratch buffers (clobbered each call).
 template <typename T, typename KeyFn>
 inline void sort_by_key(std::vector<T>& items, bool ascending,
                         std::vector<KeyIdx>& keys, std::vector<T>& gather,

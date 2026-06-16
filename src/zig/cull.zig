@@ -1,5 +1,4 @@
-// cull.zig — conservative sphere/frustum + occlusion tests run before T&L.
-// Mirrors cull.h (header-only).
+// cull — conservative sphere/frustum + occlusion tests run before T&L.
 
 const std = @import("std");
 const la = @import("linalg.zig");

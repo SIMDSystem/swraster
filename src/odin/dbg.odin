@@ -1,7 +1,5 @@
 // dbg.odin — diagnostic print safe on every target.
-//
-// On native we forward to fmt.print. On emscripten we route through
-// emscripten_console_log so multithreaded wasm builds avoid std.Io backends.
+// emscripten route avoids std.Io backends that break under multithreaded wasm.
 
 package main
 

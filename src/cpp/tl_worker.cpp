@@ -22,16 +22,10 @@
 
 using namespace Eigen;
 
-// T&L half of the unified pool. Called once per frame by each T&L-preferred
-// pool worker (worker_id in [0, active_tl_threads)). Transforms / lights /
-// clips / projects / tile-bins this frame's geometry into its private
-// TLThreadOutput, then participates in the phase-1 barrier and the phase-2
-// cross-worker bin merge into the published double-buffer slot. Signals
-// tl_done_counter on the way out so main can merge the flat globals once all
-// T&L-preferred workers are done. The caller (pool_worker_main) then falls
-// through to help raster.
+// T&L half of the pool. Each worker transforms/lights/clips/projects/tile-bins
+// its instance slice into a private TLThreadOutput, then merges its sorted bins
+// into the published double-buffer slot and bumps tl_done_counter.
 void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx, int current_frame) {
-    // Per-pool-worker scratch output (only ids [0, active_tl_threads) reach here).
     auto& output = (*ctx.tl_thread_outputs)[worker_id];
     auto& local_opaque = output.opaque;
     auto& local_trans  = output.trans;
@@ -46,7 +40,6 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
         Uint64 work_start_ts = Platform::PerfCounter();
         Uint64 work_start_cpu_ns = Platform::ThreadCpuNs();
 
-        // Clear local buffers (re-uses capacity).
         local_opaque.clear();
         local_trans.clear();
         local_shadow.clear();
@@ -56,13 +49,11 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             local_shadow_bins[s].clear();
         }
 
-        // Slice the instance list across active workers in thread-id order.
         int num_instances        = (int)tl_shared.sorted_instances->size();
         int instances_per_thread = (num_instances + active_tl_threads - 1) / active_tl_threads;
         int start_idx            = worker_id * instances_per_thread;
         int end_idx              = std::min(start_idx + instances_per_thread, num_instances);
 
-        // Helper closures (capture only tl_shared by ref; no heap, no virtual).
         auto screen_tile_range = [&](float x0, float x1, float x2, float y0, float y1, float y2,
                                      int width, int height,
                                      int& first_col, int& last_col, int& first_strip, int& last_strip) {
@@ -125,9 +116,7 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 default: src_vertices = tl_shared.ground_vertices;   src_faces = tl_shared.ground_faces;    src_bound_radius = ctx.ground_bound_radius;    break;
             }
 
-            // Build model matrix from the *snapshot* slot (no copy from
-            // CubeInstance — physics is concurrently writing the opposite
-            // slot of the ring, the one we're reading here is stable).
+            // Read the pose ring directly; physics writes the opposite slot.
             const InstancePose& pose = pose_snapshot->poses[instance_idx];
             float qx = pose.qx, qy = pose.qy, qz = pose.qz, qw = pose.qw;
             Matrix4f model;
@@ -159,10 +148,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                     tl_shared.light_pos, tl_shared.spot_dir, tl_shared.spot_outer_cos,
                     tl_shared.shadow_near, tl_shared.shadow_far);
 
-            // Small-ball occlusion: short-circuit against the eye-space
-            // occluder list main built for this frame. Stop early once both
-            // camera and shadow are determined occluded — typical balls are
-            // either fully visible or quickly culled.
+            // Small-ball occlusion against the eye-space occluder list; stop
+            // once both camera and shadow are occluded.
             bool small_ball_camera_occluded = false;
             if (inst.type == 4 && tl_shared.occluders_eye &&
                 (camera_visible || shadow_visible)) {
@@ -193,7 +180,6 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
             if (!camera_visible && !shadow_visible) continue;
 
-            // Eye-space near-plane object reject/gate.
             bool needs_near_clip = false;
             if (camera_visible && ENABLE_NEAR_CLIP) {
                 if (center_eye.z() - src_bound_radius > -NEAR_PLANE) {
@@ -206,7 +192,7 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
 
             transform_vertices(*src_vertices, eye_space_vertices, mv);
 
-            // Project to clip space only for the unclipped fast path. Near-intersecting
+            // Project to clip space only on the unclipped fast path; near-clipped
             // objects project after clipping so no w<=0 vertex reaches project_vertex.
             if (camera_visible && !needs_near_clip) {
                 size_t nv = eye_space_vertices.size();
@@ -221,10 +207,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 const Vertex3D& v0_eye = eye_space_vertices[face.v0];
                 const Vertex3D& v1_eye = eye_space_vertices[face.v1];
                 const Vertex3D& v2_eye = eye_space_vertices[face.v2];
-                // Untextured instances use their uniform tint, EXCEPT the
-                // spotlight housing (type 6) which carries per-face colour
-                // (purple outer skin / white inner lining) authored in the
-                // geometry. Textured instances always use the per-face colour.
+                // Untextured uses the instance tint, except the lamp housing
+                // (type 6) which carries per-face colour; textured uses per-face.
                 Vector3f base_color = (inst.texture == nullptr && inst.type != 6)
                     ? Vector3f(inst.color_r, inst.color_g, inst.color_b)
                     : Vector3f(face.r, face.g, face.b);
@@ -271,21 +255,10 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                     : tl_shared.light_dir;
                 bool shadow_backface = face_normal.dot(shadow_light_vec) < 0.0f;
 
-                // Per-triangle spotlight cone reject. Each vertex is
-                // "outside the cone" when its ray from the light is
-                // either behind the light (along<=0) or at a larger
-                // angle than the outer half-cone. If all three vertices
-                // are outside we drop the whole triangle — this kills
-                // a huge fraction of shadow rasterization work for
-                // tessellated objects grazing the cone (each cube /
-                // sphere / smallball loses roughly half its back-faces
-                // before they ever hit the shadow tile bins).
-                //
-                // The ground (type 5) is excluded because its two huge
-                // triangles have all three vertices well outside the
-                // cone yet their interiors host the visible shadow
-                // disc on the floor — culling them here would erase
-                // the shadow entirely.
+                // Per-triangle spotlight cone reject: drop tris with all three
+                // vertices outside the outer half-cone. Excludes the ground
+                // (type 5): its huge tris have all corners outside but their
+                // interiors carry the visible floor shadow.
                 bool cone_culled = false;
                 if (tl_shared.use_spotlight && shadow_visible && shadow_backface &&
                     inst.type != 5) {
@@ -361,12 +334,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
                 if (!camera_visible) continue;
                 bool debug_unlit_red = DEBUG_DRAW_CAMERA_OCCLUDED_RED &&
                     inst.type == 4 && small_ball_camera_occluded;
-                // Ground is a huge background fill. Bias its opaque sort_z so
-                // every other opaque triangle sorts in front of every ground
-                // triangle while ground tris stay ordered among themselves.
-                // Drawing the ground last lets early-Z kill the shadow lookup
-                // + lighting + texture fetch for any ground pixel already
-                // covered by an object on top of it.
+                // Bias ground sort_z so it draws last; early-Z then skips its
+                // shadow/lighting/texture work for any pixel already covered.
                 const float ground_sort_bias = (inst.type == 5) ? 1.0e6f : 0.0f;
 
                 auto add_triangle = [&](VertexVaryings v0, VertexVaryings v1, VertexVaryings v2) {
@@ -457,10 +426,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
         }
 
-        // Close the per-instance T&L interval here, before the local sort,
-        // so the two phase-1 sub-stages (per-instance sweep vs. local sort)
-        // are separately visible on the overlay. The gap between the local
-        // sort and the phase-2 merge is the phase-1 barrier wait below.
+        // Close the per-instance interval before the sort so the overlay shows
+        // the two phase-1 sub-stages separately.
         Uint64 sort_start_ts     = Platform::PerfCounter();
         Uint64 sort_start_cpu_ns = Platform::ThreadCpuNs();
         Uint64 per_instance_cpu_ns = sort_start_cpu_ns > work_start_cpu_ns
@@ -468,10 +435,7 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
         profiler_record_tl(*ctx.profiler, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns,
                            (uint8_t)TLJobTag::PerInstance);
 
-        // Sort by a (sort_z, index) key rather than relocating the ~480-byte
-        // RenderTriangle structs through std::sort: sort the 8-byte keys, then
-        // gather each struct exactly once (see keysort.h). Ascending =
-        // front-to-back, descending = back-to-front.
+        // Key-sort (keysort.h): ascending = front-to-back, descending = back-to-front.
         auto tri_z = [](const RenderTriangle& t) { return t.sort_z; };
         auto& sort_keys   = output.sort_keys;
         auto& sort_gather = output.sort_gather;
@@ -490,9 +454,6 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
         }
 
-        // Close the local-sort interval here; the scatter-merge (dark blue)
-        // begins immediately after, with no barrier in between, so it can run
-        // while other workers are still in their per-instance sweep.
         Uint64 phase1_end_ts = Platform::PerfCounter();
         Uint64 phase1_end_cpu_ns = Platform::ThreadCpuNs();
         Uint64 local_sort_cpu_ns = phase1_end_cpu_ns > sort_start_cpu_ns
@@ -500,10 +461,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
         profiler_record_tl(*ctx.profiler, worker_id, sort_start_ts, phase1_end_ts, local_sort_cpu_ns,
                            (uint8_t)TLJobTag::LocalSort);
 
-        // Spotlight luminaire cone T&L. Runs on thread 0 only, before the
-        // phase-1 barrier so it overlaps the other workers' tail-end
-        // per-instance work. Recorded as a separate Spotlight-tagged
-        // interval so it shows up in darker blue on the overlay.
+        // Spotlight cone T&L on thread 0 only, here so it overlaps other workers'
+        // tail-end per-instance work.
         if (worker_id == 0) {
             LuminaireConeBuffer* cone_buf = tl_shared.cone_buf_write;
             if (cone_buf) {
@@ -530,20 +489,11 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
             }
         }
 
-        // ----- Scatter-merge (no barrier) ------------------------------
-        // The instant this worker has finished its own per-instance sweep and
-        // local sort, it merges *its* sorted local bins straight into the
-        // published slot — concurrent with any slower worker still in its
-        // per-instance transform. There is no global phase barrier, so this
-        // worker's merge (dark blue) overlaps the stragglers' transform (cyan).
-        //
-        // Each published tile bin is guarded by its own lock (tile_bin_locks).
-        // main cleared the whole target slot before the kick (pool was asleep),
-        // so workers only ever append. With each worker's local bin already
-        // sorted from the local-sort step above, a single inplace_merge per
-        // append keeps the published bin sorted as contributions accumulate in
-        // arbitrary worker order. Workers start scanning at a staggered tile so
-        // they don't march through the tiles in lockstep and collide on locks.
+        // Scatter-merge (no barrier): each worker merges its sorted local bins
+        // into the published slot as soon as it's done, overlapping stragglers'
+        // transforms. Per-tile locks; main cleared the slot pre-kick so workers
+        // only append; one inplace_merge keeps each bin sorted. Scanning starts
+        // at a staggered tile so workers don't collide on locks in lockstep.
         Uint64 phase2_start_ts = Platform::PerfCounter();
         Uint64 phase2_start_cpu_ns = Platform::ThreadCpuNs();
 
@@ -584,16 +534,8 @@ void tl_worker_frame(int worker_id, int active_tl_threads, RendererContext& ctx,
         profiler_record_tl(*ctx.profiler, worker_id, phase2_start_ts, Platform::PerfCounter(), phase2_cpu_ns,
                            (uint8_t)TLJobTag::BinMerge);
 
-        // Signal completion. Physics for frame N was already triggered by
-        // main right after the T&L kick (against the OPPOSITE pose-ring
-        // slot from the one this pass just read), so there is nothing
-        // physics-related to do here.
         if (tl_done_counter.fetch_add(1, std::memory_order_release) + 1 >= active_tl_threads) {
-            // Synchronise with main's mtx_main critical section to close the
-            // lost-wakeup window between main checking the predicate and
-            // entering cv_main.wait(). Without this, notify_one() can fire
-            // while main is mid-transition into wait() and be dropped,
-            // hard-deadlocking on native and stalling on web.
+            // Empty lock parks main's wait-side before signalling (lost-wakeup guard).
             { std::lock_guard<std::mutex> lock(mtx_main); }
             cv_main.notify_one();
         }

@@ -1,11 +1,6 @@
-// web_zig_lib.js — JS glue for the Zig wasm build.
-//
-// The C++ web backend embeds this logic inline via MAIN_THREAD_EM_ASM. The Zig
-// backend instead declares swr_js_setup_canvas / swr_js_present as imports
-// (platform.zig) and we satisfy them here through emcc's --js-library. Both are
-// marked __proxy: 'sync' so they run on the browser main thread (the renderer
-// lives on a worker pthread under PROXY_TO_PTHREAD) and block the caller until
-// the DOM work completes — exactly matching the C++ MAIN_THREAD_EM_ASM blit.
+// JS glue satisfying platform.zig's swr_js_* wasm imports via --js-library.
+// __proxy:'sync' runs them on the browser main thread (renderer is on a worker
+// pthread) and blocks until the DOM work completes.
 addToLibrary({
   swr_js_setup_canvas__proxy: 'sync',
   swr_js_setup_canvas__sig: 'vii',
@@ -47,8 +42,7 @@ addToLibrary({
       cache.ctx = canvas.getContext('2d');
       cache.image = cache.ctx.createImageData(w, h);
     }
-    // HEAPU8 is a SharedArrayBuffer view, so the main thread can read the
-    // framebuffer the worker just wrote.
+    // HEAPU8 is a SharedArrayBuffer view: main thread reads the worker's framebuffer.
     cache.image.data.set(HEAPU8.subarray(ptr, ptr + w * h * 4));
     cache.ctx.putImageData(cache.image, 0, 0);
   },

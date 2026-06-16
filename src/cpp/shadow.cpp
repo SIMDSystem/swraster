@@ -69,11 +69,8 @@ float sample_shadow_compare_bilinear_2x2(const ShadowDepth* shadow_depth, int sh
     if (!shadow_depth || shadow_size <= 0) return 1.0f;
     if (r < 0.0f || r > 1.0f) return 1.0f;
 
-    // The four bilinear taps sit at +/-0.5 texel around (fx,fy); together they
-    // touch one 3x3 texel block. Resolve each of the 9 compares once instead of
-    // refetching the 16 overlapping texels the naive 2x2 did (ported from the
-    // Zig/Rust/Odin builds; the old NEON-gated fast path also left the wasm
-    // build on the worst-case scalar fallback). Compares are branchless.
+    // The four bilinear taps span one 3x3 texel block; resolve each of the 9
+    // compares once instead of refetching the 16 overlapping texels of a naive 2x2.
     float sizef = (float)(shadow_size - 1);
     uint32_t r16 = (uint32_t)shadow_depth_to_u16(r);
 
@@ -84,13 +81,10 @@ float sample_shadow_compare_bilinear_2x2(const ShadowDepth* shadow_depth, int sh
     float fxr = fx - (float)nx;
     float fyr = fy - (float)ny;
 
-    // The two taps along each axis share the same fractional weight and select
-    // adjacent 2x2 windows {0,1} and {1,2} of the block.
     float wx = fxr < 0.5f ? fxr + 0.5f : fxr - 0.5f;
     float wy = fyr < 0.5f ? fyr + 0.5f : fyr - 0.5f;
 
-    // Callers gate this sampler on the spotlight cone, so lit pixels land on
-    // the map; the clamp is a branch-free safety backstop.
+    // Clamp is a branch-free backstop; callers gate this on the spotlight cone.
     int max_base = shadow_size - 3;
     int col_base = std::min(std::max(fxr < 0.5f ? nx - 1 : nx, 0), max_base);
     int row_base = std::min(std::max(fyr < 0.5f ? ny - 1 : ny, 0), max_base);
@@ -148,11 +142,7 @@ void draw_shadow_triangle(ShadowDepth* shadow_depth, int shadow_size,
     float area_signed = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
     if (fabsf(area_signed) < 0.0001f) return;
 
-    // The edge functions defined as w0 = (v2.y - v1.y)*(P.x - v2.x) +
-    //   (v1.x - v2.x)*(P.y - v2.y) work out to w0 == -2*signed_area(P, v1, v2),
-    // i.e. they're NEGATIVE inside a CCW triangle (positive signed area) and
-    // POSITIVE inside a CW one. Flip the CCW case so the inside-test is the
-    // single "all w >= 0" check for either winding.
+    // Flip the CCW case so the inside-test is one "all w >= 0" for either winding.
     float A0 = v2.y - v1.y, B0 = v1.x - v2.x;
     float A1 = v0.y - v2.y, B1 = v2.x - v0.x;
     float A2 = v1.y - v0.y, B2 = v0.x - v1.x;
@@ -168,12 +158,8 @@ void draw_shadow_triangle(ShadowDepth* shadow_depth, int shadow_size,
     float w1_row = A1 * (px0 - v0.x) + B1 * (py0 - v0.y);
     float w2_row = A2 * (px0 - v1.x) + B2 * (py0 - v1.y);
 
-    // Inside the (sign-normalized) triangle w0+w1+w2 == |area_signed|. Each
-    // w_i is -2*signed_area(P, v_j, v_k) (then sign-flipped for CCW), and the
-    // three sub-triangle signed areas sum to the parent's signed area — NOT
-    // twice it. So the perspective-correct barycentric weight is
-    //   z = (z0*w0 + z1*w1 + z2*w2) / |area_signed|.
-    // Precomputing per-vertex z weights reduces the inner loop to a 3-term FMA.
+    // w0+w1+w2 == |area_signed| inside, so z = (z0*w0+z1*w1+z2*w2)/|area|;
+    // prescaling the z weights makes the inner loop a 3-term FMA.
     float inv_area = 1.0f / fabsf(area_signed);
     float z0w = v0.z * inv_area;
     float z1w = v1.z * inv_area;
@@ -216,12 +202,7 @@ void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
     float area_signed = (v1.x - v0.x) * (v2.y - v0.y) - (v1.y - v0.y) * (v2.x - v0.x);
     if (fabsf(area_signed) < 0.0001f) return;
 
-    // The edge functions defined as w0 = (v2.y - v1.y)*(P.x - v2.x) +
-    //   (v1.x - v2.x)*(P.y - v2.y) work out to w0 == -2*signed_area(P, v1, v2),
-    // i.e. they're NEGATIVE inside a CCW triangle (positive signed area) and
-    // POSITIVE inside a CW one. Flip the CCW case so the inside-test is the
-    // single "all w >= 0" check for either winding — drops the per-pixel fabs
-    // and the double-direction sign test the previous loop carried.
+    // Flip the CCW case so the inside-test is one "all w >= 0" for either winding.
     float A0 = v2.y - v1.y, B0 = v1.x - v2.x;
     float A1 = v0.y - v2.y, B1 = v2.x - v0.x;
     float A2 = v1.y - v0.y, B2 = v0.x - v1.x;
@@ -231,13 +212,8 @@ void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
         A2 = -A2; B2 = -B2;
     }
 
-    // Seed the row accumulators from shared edge constants + the integer tile
-    // origin: w_i = A_i*x_min + B_i*y_min + K_i, where K_i is the edge function
-    // at the pixel-center of pixel (0,0). Computed once per triangle, so the
-    // edge value at a pixel is the same regardless of which tile evaluates it —
-    // watertight shared edges. Avoids folding the (near-hither, large) vertex
-    // coordinate into a per-tile subtraction, which rounded differently per
-    // tile and cracked shared edges near the shadow near plane.
+    // K_i are edge constants at pixel-center, computed once per triangle so a
+    // pixel's edge value is tile-independent (watertight shared edges).
     float K0 = A0 * (0.5f - v2.x) + B0 * (0.5f - v2.y);
     float K1 = A1 * (0.5f - v0.x) + B1 * (0.5f - v0.y);
     float K2 = A2 * (0.5f - v1.x) + B2 * (0.5f - v1.y);
@@ -245,21 +221,14 @@ void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
     float w1_row = A1 * (float)x_min + B1 * (float)y_min + K1;
     float w2_row = A2 * (float)x_min + B2 * (float)y_min + K2;
 
-    // Inside the (sign-normalized) triangle w0+w1+w2 == |area_signed|. Each
-    // w_i is -2*signed_area(P, v_j, v_k) (then sign-flipped for CCW), and the
-    // three sub-triangle signed areas sum to the parent's signed area — NOT
-    // twice it. So
-    //   z = (z0*w0 + z1*w1 + z2*w2) / |area_signed|
-    //     = z0w*w0 + z1w*w1 + z2w*w2     with z_iw = z_i / |area_signed|
-    // — eliminates the per-pixel fdiv that dominated the hot loop and the
-    // three per-pixel fabs calls the old code carried.
+    // w0+w1+w2 == |area_signed| inside, so z = (z0*w0+z1*w1+z2*w2)/|area|;
+    // prescaling the z weights drops the per-pixel fdiv from the hot loop.
     float inv_area = 1.0f / fabsf(area_signed);
     float z0w = v0.z * inv_area;
     float z1w = v1.z * inv_area;
     float z2w = v2.z * inv_area;
 
     if (screendoor_mask < 0) {
-        // Opaque shadow caster — fast path, no mask check inside the loop.
         for (int y = y_min; y <= y_max; y++) {
             float w0 = w0_row, w1 = w1_row, w2 = w2_row;
             ShadowDepth* row = shadow_depth + y * shadow_size;
@@ -276,9 +245,7 @@ void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,
             w0_row += B0; w1_row += B1; w2_row += B2;
         }
     } else {
-        // Screendoor (stippled) shadow — hoist the LUT word lookup once
-        // per triangle; the per-pixel branch is just a bit-test on a
-        // 16-bit pattern that tiles every 4 pixels in x and y.
+        // Screendoor stipple: a 16-bit pattern tiling every 4 px in x and y.
         static const uint16_t masks[8] = {
             0xA5A5, 0x5A5A, 0x5555, 0xAAAA,
             0x0F0F, 0xF0F0, 0x3C3C, 0xC3C3
@@ -335,11 +302,8 @@ void draw_shadow_line_strip(ShadowDepth* shadow_depth, int shadow_size,
                             const ShadowVertex& v0, const ShadowVertex& v1,
                             int x_tile_min, int x_tile_max,
                             int y_strip_min, int y_strip_max) {
-    // Pre-clip the segment to the tile rect (intersected with the shadow map
-    // bounds) using Liang-Barsky. Shadow-space z is the already-perspective-
-    // divided NDC depth from shadow_vertex_from_varying, so we interpolate it
-    // linearly across the clipped span; that's the same interpolation the
-    // Bresenham loop applies internally, just rebased to the clipped endpoints.
+    // Liang-Barsky pre-clip to the tile rect; shadow-space z is already NDC depth
+    // so it interpolates linearly across the clipped span.
     float clip_xmin = (float)std::max(x_tile_min, 0);
     float clip_ymin = (float)std::max(y_strip_min, 0);
     float clip_xmax = (float)std::min(x_tile_max, shadow_size - 1);

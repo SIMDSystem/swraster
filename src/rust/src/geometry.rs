@@ -1,6 +1,4 @@
-//! geometry.rs — vertex/face types, the Utah teapot control points, and the
-//! primitive generators. Ported from geometry.zig / geometry.cpp. Eigen vectors
-//! become linalg::Vec3/Vec4; std::vector / ArrayList become Vec.
+//! Vertex/face types, Utah teapot control points, and the primitive generators.
 
 use crate::linalg::{Vec3, Vec4};
 use std::collections::HashMap;
@@ -379,7 +377,6 @@ pub fn generate_teapot() -> (RenderVertexList, FaceList) {
         }
     }
 
-    // Face normals.
     let mut face_normals: Vec<Vec3> = Vec::with_capacity(faces.len());
     for f in faces.iter() {
         let v0 = vertices[f.v0 as usize].position.head3();
@@ -390,7 +387,6 @@ pub fn generate_teapot() -> (RenderVertexList, FaceList) {
         face_normals.push(if len > 0.0001 { normal.scale(1.0 / len) } else { Vec3::new(0.0, 0.0, 1.0) });
     }
 
-    // Average normals into vertices.
     let mut sums: Vec<Vec3> = vec![Vec3::zero(); vertices.len()];
     let mut counts: Vec<i32> = vec![0; vertices.len()];
     for (f, fc) in faces.iter().enumerate() {

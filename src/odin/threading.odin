@@ -1,4 +1,4 @@
-// threading.odin — renderer threading scaffolding. Mirrors threading.zig.
+// threading.odin — renderer threading scaffolding.
 
 package main
 
@@ -34,13 +34,13 @@ active_raster_job_thread_count: i32
 active_workers:               i32
 tl_workers:                   i32
 
-// Published under mtx_pool each frame; workers snapshot this whole struct.
-// Buffer slots are derived from frame_num only — frame_pool_target / frame_sequence
-// is a monotonic wake counter and must never be used for ping-pong indexing.
+// Published under mtx_pool each frame; workers snapshot the whole struct.
+// Buffer slots derive from frame_num; frame_pool_target is only a monotonic
+// wake counter — never use it for ping-pong indexing.
 Frame_Pool_Plan :: struct {
-	tl_buf_id:     i32, // T&L writes (globals, strip bins, cone, shadow box, per-frame uniforms)
-	raster_buf_id: i32, // raster reads previous frame's published T&L slot
-	tl_k_eff:      i32, // TL workers this frame (for merge_tl_globals on main)
+	tl_buf_id:     i32, // slot T&L writes this frame
+	raster_buf_id: i32, // slot raster reads (previous frame's published T&L)
+	tl_k_eff:      i32, // TL workers this frame
 	pool_active:   i32,
 	do_raster:     bool,
 }

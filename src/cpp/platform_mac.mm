@@ -1,22 +1,7 @@
-// macOS native backend for the Platform layer (Objective-C++ / Cocoa).
-//
-// The native desktop backend. We own the framebuffer as a small ring of
-// IOSurfaces (shared CPU/GPU memory the window server can composite directly),
-// drive a Cocoa window + layer-backed view, and pump events with a
-// non-blocking nextEventMatchingMask poll so the renderer keeps its own loop.
-//
-// Why IOSurface: an earlier version blitted the buffer through a per-frame
-// CGImage assigned to layer.contents. Core Animation has to COPY/upload that
-// CGImage into a CA-managed texture at commit time, which cost ~3.5ms/frame for
-// a full-screen buffer. An IOSurface is mapped memory the compositor reads in
-// place, so Present() is just a contents pointer swap + commit (zero copy). We
-// render straight into the surface's base address; color addressing already
-// goes through Surface::pitch, so IOSurface's (possibly padded) bytesPerRow is
-// transparent to the renderer. We rotate across NUM_SURFACES so the CPU never
-// writes the surface the window server is currently reading.
-//
-// Only the window/present/event/timing half of the API lives here; the portable
-// BMP loader, FreeSurface, and ThreadCpuNs are shared in platform.cpp.
+// macOS Cocoa backend. The framebuffer is a ring of IOSurfaces (mapped memory
+// the window server composites in place), so Present() is a zero-copy contents
+// swap rather than the ~3.5ms/frame CGImage texture upload it replaced. We
+// rotate NUM_SURFACES so the CPU never writes the surface being read.
 
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 
@@ -35,7 +20,7 @@
 namespace Platform {
 namespace {
 
-constexpr int NUM_SURFACES = 3; // triple buffer: present, +2 free to render/queue
+constexpr int NUM_SURFACES = 3; // triple buffer
 
 NSWindow*      g_window  = nil;
 NSView*        g_view    = nil;
@@ -45,12 +30,11 @@ PixelFormat    g_fb_format{};
 Surface        g_fb{};
 
 IOSurfaceRef   g_surfaces[NUM_SURFACES] = {};
-int            g_render = 0;   // surface index the renderer currently draws into
+int            g_render = 0;   // surface the renderer currently draws into
 
 void request_quit() { g_quit = true; }
 
-// Build the ARGB framebuffer descriptor. We pick host-order 0xAARRGGBB, which is
-// BGRA in little-endian memory — exactly the IOSurface 'BGRA' pixel format, so
+// Host-order 0xAARRGGBB == little-endian BGRA == the IOSurface 'BGRA' format, so
 // the compositor reads our pixels with no swizzle.
 void init_format() {
     g_fb_format = PixelFormat{};
@@ -63,8 +47,7 @@ void init_format() {
     g_fb_format.Amask  = 0xff000000u;
 }
 
-// Point g_fb at surface[idx]'s mapped pixels. bytesPerRow may be padded for
-// alignment; the renderer honours Surface::pitch so this is fine.
+// bytesPerRow may be padded; the renderer honours Surface::pitch.
 void bind_render_surface(int idx) {
     IOSurfaceRef s = g_surfaces[idx];
     g_fb.pixels = IOSurfaceGetBaseAddress(s);
@@ -99,8 +82,8 @@ bool create_surfaces(int w, int h) {
 } // anon
 } // namespace Platform
 
-// Window delegate: a close-button click sets the quit flag and refuses the
-// actual close so the render loop can tear down cleanly on its next iteration.
+// Close button only sets the quit flag and refuses the close, so the render loop
+// tears down on its next iteration.
 @interface SwrWindowDelegate : NSObject <NSWindowDelegate>
 @end
 @implementation SwrWindowDelegate
@@ -173,20 +156,15 @@ void Present() {
     if (!g_view) return;
     @autoreleasepool {
         IOSurfaceRef done = g_surfaces[g_render];
-        // CPU is finished writing this frame; release the lock so the window
-        // server can read it, then hand it to the layer. This is zero-copy: CA
-        // composites from the IOSurface in place, no texture upload.
         IOSurfaceUnlock(done, 0, nullptr);
-        // Explicit transaction: we don't spin AppKit's run loop, so an implicit
-        // transaction would only flush at the next event poll. Commit now so the
-        // frame reaches the window server immediately; disabling actions skips
-        // implicit animation on the contents change.
+        // Explicit commit: we don't spin AppKit's run loop, so an implicit
+        // transaction would only flush at the next poll. setDisableActions skips
+        // the implicit animation on the contents change.
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
         g_view.layer.contents = (id)done;
         [CATransaction commit];
 
-        // Rotate to the next surface and claim it for the next frame's writes.
         g_render = (g_render + 1) % NUM_SURFACES;
         IOSurfaceLock(g_surfaces[g_render], 0, nullptr);
         bind_render_surface(g_render);
@@ -199,9 +177,8 @@ bool IsRenderable() {
 }
 
 namespace {
-// Translate a Cocoa left-button event whose location lies inside the content
-// view into a camera input event. Returns false (caller should sendEvent) when
-// the click is outside the view (title bar etc.) so window controls still work.
+// Returns false for clicks outside the content view (title bar etc.) so the
+// caller forwards them and window controls still work.
 bool fill_mouse_in_view(NSEvent* e, Event& out, bool down) {
     NSPoint p = [e locationInWindow];
     if (!NSPointInRect(p, [g_view frame])) return false;
@@ -231,9 +208,7 @@ bool PollEvent(Event& out) {
                     if ([chars length] > 0) {
                         unichar c = [chars characterAtIndex:0];
                         if (c < 128) {
-                            // Don't sendEvent: keeps AppKit from beeping at an
-                            // unhandled key. The renderer's handler is
-                            // case-insensitive and accepts the symbol variants.
+                            // Don't sendEvent: avoids AppKit's unhandled-key beep.
                             out.type = Event::KeyDown;
                             out.key  = (int)c;
                             return true;

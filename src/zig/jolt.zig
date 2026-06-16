@@ -1,12 +1,6 @@
-// jolt.zig — Zig bindings to Jolt Physics.
-//
-// Jolt is a C++ library with no usable C ABI of its own, so this module binds
-// to a thin C wrapper ("joltc") that we link as a deferred dependency (see
-// build.zig -joltc-lib). The wrapper exposes exactly the surface the renderer
-// uses: world/system lifecycle, the body interface, shape factories, and a
-// static-compound builder. Quaternion construction math that Jolt does as
-// static helpers (sEulerAngles / sRotation / rotate) is reimplemented here in
-// pure Zig so it needs no round-trip through the C boundary.
+// jolt — Zig bindings to Jolt Physics via the "joltc" C wrapper (Jolt has no
+// usable C ABI of its own). Quaternion helpers are reimplemented in Zig to
+// avoid round-trips through the C boundary.
 
 const std = @import("std");
 
@@ -33,8 +27,7 @@ pub const Quat = extern struct {
         return .{ .x = 0, .y = 0, .z = 0, .w = 1 };
     }
 
-    // Jolt's Quat::sEulerAngles: rotation R = Rz * Ry * Rx applied as the
-    // product of per-axis quaternions (x then y then z).
+    // Jolt's Quat::sEulerAngles: R = Rz * Ry * Rx.
     pub fn sEulerAngles(angles: Vec3) Quat {
         const hx = angles.x * 0.5;
         const hy = angles.y * 0.5;
@@ -60,7 +53,6 @@ pub const Quat = extern struct {
         return .{ .x = axis.x * s, .y = axis.y * s, .z = axis.z * s, .w = @cos(h) };
     }
 
-    // Rotate a vector by this quaternion (Quat * Vec3).
     pub fn rotate(q: Quat, v: Vec3) Vec3 {
         const ux = q.x;
         const uy = q.y;
@@ -93,7 +85,6 @@ pub const ObjectLayer = u16;
 pub const NON_MOVING: ObjectLayer = 0;
 pub const MOVING: ObjectLayer = 1;
 
-// Opaque handles into the C wrapper.
 pub const PhysicsSystem = opaque {};
 pub const BodyInterface = opaque {};
 pub const JobSystem = opaque {};
@@ -101,7 +92,7 @@ pub const TempAllocator = opaque {};
 pub const Shape = opaque {};
 pub const CompoundBuilder = opaque {};
 
-// ----- C wrapper surface (joltc) -----
+// joltc C wrapper surface.
 pub extern fn jph_register_callbacks() void;
 pub extern fn jph_factory_create() void;
 pub extern fn jph_factory_destroy() void;

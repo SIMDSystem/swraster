@@ -1,8 +1,4 @@
-//! linalg.rs — minimal float linear algebra (the Eigen replacement), ported
-//! from linalg.zig. Matrices are row-major (m[row][col]); matrix*vector and
-//! matrix*matrix follow standard linear algebra so `projection * v` matches the
-//! C++/Zig behaviour 1:1. Plain scalar f32 math — LLVM autovectorizes the hot
-//! paths and contracts mul+add into FMA on targets that have it.
+//! Minimal float linear algebra. Matrices are row-major (m[row][col]).
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Vec3 {
@@ -111,7 +107,6 @@ impl Vec4 {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Mat3 {
-    /// row-major: m[row][col]
     pub m: [[f32; 3]; 3],
 }
 
@@ -134,7 +129,6 @@ impl Mat3 {
 
 #[derive(Clone, Copy, Debug)]
 pub struct Mat4 {
-    /// row-major: m[row][col]
     pub m: [[f32; 4]; 4],
 }
 
@@ -167,8 +161,7 @@ impl Mat4 {
         self.m[row][col] = v;
     }
 
-    /// Each result row is a linear combination of b's rows weighted by a's row
-    /// entries — the SIMD-friendly GEMM form (no horizontal adds).
+    /// Row-combination GEMM form (no horizontal adds, SIMD-friendly).
     pub fn mul(&self, b: &Mat4) -> Mat4 {
         let mut r = Mat4::default();
         for i in 0..4 {
@@ -203,7 +196,7 @@ impl Mat4 {
         }
     }
 
-    /// General 4x4 inverse (cofactor expansion). Mirrors Eigen's inverse().
+    /// General 4x4 inverse (cofactor expansion).
     pub fn inverse(&self) -> Mat4 {
         let x = &self.m;
         let m = [
@@ -305,8 +298,7 @@ impl Default for Quat {
     }
 }
 
-/// Eigen's Quaternionf::setFromTwoVectors(a, b): shortest-arc rotation mapping
-/// unit vector a onto unit vector b.
+/// Shortest-arc rotation mapping unit vector a onto unit vector b.
 pub fn quat_from_two_vectors(a_in: Vec3, b_in: Vec3) -> Quat {
     let a = a_in.normalized();
     let b = b_in.normalized();

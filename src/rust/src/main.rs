@@ -1,12 +1,7 @@
 #![cfg_attr(target_os = "emscripten", no_main)]
 #![deny(unsafe_op_in_unsafe_fn)]
-//! main.rs — swraster Rust port entry point.
-//!
-//! Brings up a winit window with a softbuffer CPU framebuffer, constructs the
-//! RenderState (geometry, textures, Jolt physics, scene), and drives one
-//! software-rendered frame per redraw. This is the single-threaded vertical
-//! slice of the C++/Zig renderer (main.cpp + render_loop.cpp); the unified
-//! worker pool / physics thread are an optimization layered on later.
+//! swraster Rust port entry point: winit window + IOSurface blitter driving the
+//! multithreaded software renderer.
 
 mod clip;
 mod cull;
@@ -86,8 +81,7 @@ impl ApplicationHandler for App {
             .with_resizable(false);
         let window = event_loop.create_window(attrs).expect("failed to create window");
 
-        // Match the C++/Zig native backends: render into a fixed logical CPU
-        // framebuffer and let the Cocoa layer nearest-scale it to the window.
+        // Fixed logical framebuffer; the Cocoa layer nearest-scales it to the window.
         self.state = Some(RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32));
         self.blitter = Some(CocoaBlitter::new(&window, INITIAL_WIDTH as usize, INITIAL_HEIGHT as usize));
         self.window = Some(window);
@@ -189,8 +183,7 @@ impl ApplicationHandler for App {
                 let mut frame = blitter.framebuffer_mut();
                 state.frame(frame.as_framebuffer_mut(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
 
-                // Bracket the present (compositor blit) so the profiler overlay
-                // can mark it on the next frame's timeline.
+                // Bracket the present so the profiler can mark it next frame.
                 let blit_start = state.prof_now();
                 drop(frame);
                 blitter.present();
@@ -319,13 +312,9 @@ mod web {
         unsafe {
             swr_js_setup_canvas(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
         }
-        // Run the render loop on a dedicated pthread, matching the other
-        // ports' PROXY_TO_PTHREAD shape. The old emscripten_set_main_loop
-        // driver ran every frame on the browser main thread under
-        // requestAnimationFrame: capped at display refresh and contending
-        // with DOM/compositor work. swr_js_present is __proxy:'sync', so the
-        // blit still executes on the main thread; this worker just blocks on
-        // it like the C++/Zig/Odin render threads do.
+        // Render loop on a dedicated pthread (not RAF on the main thread): runs
+        // uncapped, off the compositor. swr_js_present is __proxy:'sync', so the
+        // blit still hops to the main thread.
         std::thread::Builder::new()
             .name("render-loop".into())
             .stack_size(2 * 1024 * 1024)

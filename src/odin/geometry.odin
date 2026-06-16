@@ -1,5 +1,4 @@
-// geometry.odin — vertex/face types, the Utah teapot control points, and the
-// primitive generators. Mirrors geometry.h + geometry.cpp.
+// geometry.odin — vertex/face types, Utah teapot control points, primitive generators.
 
 package main
 

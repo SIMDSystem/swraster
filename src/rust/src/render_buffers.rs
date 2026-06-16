@@ -1,8 +1,5 @@
-//! render_buffers.rs — POD render data shared across the per-frame pipeline.
-//! Ported from render_buffers.zig (the subset the single-threaded renderer
-//! uses: triangles, cone buffer, pose snapshots, shadow box). The elaborate
-//! cross-thread IPC structs (TLSharedData / RasterSharedData / strip bins) are a
-//! parallelism layer and are intentionally omitted here.
+//! POD render data shared across the per-frame pipeline: triangles, cone buffer,
+//! pose snapshots, shadow box.
 
 use crate::clip::VertexVaryings;
 use crate::draw::RasterTriangleSetup;
@@ -14,9 +11,7 @@ pub struct RenderTriangle {
     pub v1: VertexVaryings,
     pub v2: VertexVaryings,
     pub rgb_setup: RasterTriangleSetup,
-    /// Index into the renderer's texture table; -1 = untextured. Using an index
-    /// (rather than a raw pointer) keeps RenderTriangle `Send`/`Sync` so the
-    /// triangle lists can be shared across raster threads.
+    /// Texture-table index (-1 = untextured); an index keeps RenderTriangle Send/Sync.
     pub texture_id: i32,
     pub sort_z: f32,
     pub debug_unlit_red: bool,

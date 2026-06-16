@@ -1,9 +1,6 @@
-// physics_setup.zig — Jolt scaffolding. Mirrors physics_setup.h +
-// physics_setup.cpp. The broad-phase layer interface / filters in the C++ are
-// concrete subclasses of Jolt C++ virtuals; in the Zig port they live inside
-// the joltc C wrapper (a 2-layer NON_MOVING/MOVING scheme that collides
-// everything), so here we only expose the layer constants and the
-// register/Factory lifecycle.
+// physics_setup — Jolt scaffolding: layer constants + register/Factory
+// lifecycle. The broad-phase layer interface/filters live inside the joltc
+// wrapper (2-layer NON_MOVING/MOVING scheme that collides everything).
 
 const jolt = @import("jolt.zig");
 

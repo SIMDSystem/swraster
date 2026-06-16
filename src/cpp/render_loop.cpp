@@ -31,9 +31,7 @@
 using namespace Eigen;
 using namespace JPH;
 
-// ---------------------------------------------------------------------------
-// Animation reset (used at startup of each --threadperf variant).
-// ---------------------------------------------------------------------------
+// Animation reset (start of each --threadperf variant).
 static void reset_animation(RendererContext& ctx,
                             float& sim_time, int& frame_num,
                             Uint64& last_physics_time) {
@@ -71,8 +69,7 @@ static void reset_animation(RendererContext& ctx,
     }
     pp.system->OptimizeBroadPhase();
 
-    // Producer is idle (physics_wait_for_idle above), so we can repopulate
-    // both ring slots without a lock — no concurrent writer.
+    // Producer is idle, so both ring slots can be repopulated without a lock.
     for (auto& snapshot : pp.pose_snapshots) {
         write_instance_pose_snapshot(snapshot, instances, 0.0f, 0);
     }
@@ -93,7 +90,7 @@ static void reset_animation(RendererContext& ctx,
     raster_pass.store(RASTER_PASS_COUNT, std::memory_order_relaxed);
     for (int p = 0; p < RASTER_PASS_COUNT; p++) {
         raster_pass_tiles_done[p].store(0, std::memory_order_relaxed);
-        for (int r = 0; r < NUM_STRIPS * 2; r++) {  // Luminaire uses 2*NUM_STRIPS rows
+        for (int r = 0; r < NUM_STRIPS * 2; r++) {  // Luminaire uses 2*NUM_STRIPS
             raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
         }
     }
@@ -107,16 +104,9 @@ static void reset_animation(RendererContext& ctx,
     }
 }
 
-// ---------------------------------------------------------------------------
-// Merge per-thread T&L globals (the flat opaque/trans/shadow triangle lists)
-// into the published double-buffer slot.
-//
-// The lists are fixed-capacity scratch buffers; we publish their valid
-// length via `count`, so reuse across frames is a free "counter reset" —
-// the underlying vectors are never cleared or resized down. This runs on
-// main post-Present; the much bigger per-tile bin merge is done in
-// parallel by the T&L workers themselves (see tl_worker.cpp phase 2).
-// ---------------------------------------------------------------------------
+// Merge the flat per-thread T&L overflow lists into the published slot. Fixed-
+// capacity buffers published by `count`, so reuse is just a counter reset. The
+// bulk per-tile bin merge is done in parallel by the workers (tl_worker.cpp).
 static void merge_tl_globals(RendererContext& ctx, int tl_buf_idx) {
     size_t count_opaque = 0;
     size_t count_trans = 0;
@@ -154,10 +144,7 @@ static void merge_tl_globals(RendererContext& ctx, int tl_buf_idx) {
     auto front_to_back = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z < b.sort_z; };
     auto back_to_front = [](const RenderTriangle& a, const RenderTriangle& b) { return a.sort_z > b.sort_z; };
 
-    // Only the first k_eff workers ran T&L this frame (see render loop); the
-    // rest never wrote their output slots, so clamp to avoid folding stale data.
-    // active_tl_job_thread_count is exactly this frame's k_eff (published under
-    // mtx_pool before the kick), so it tracks the live g_active_workers count.
+    // Only the first k_eff workers ran T&L; clamp so stale slots aren't folded in.
     int k_eff = active_tl_job_thread_count;
     for (int tid = 0; tid < k_eff; tid++) {
         const auto& out = (*ctx.tl_thread_outputs)[tid];
@@ -189,11 +176,9 @@ static void merge_tl_globals(RendererContext& ctx, int tl_buf_idx) {
     ctx.shadow_buffers[tl_buf_idx].count = count_shadow;
 }
 
-// std::vector::clear() keeps capacity at the peak; on a long-running view
-// that briefly stresses one tile every bin slowly ratchets up. After
-// thousands of frames the cumulative capacity can blow past wasm32's
-// address space. Once every ~4s of wall-time we walk the bins and reclaim
-// any vector whose capacity has drifted to >4x its current size.
+// clear() keeps peak capacity, so bins ratchet up over thousands of frames and
+// can exhaust wasm32's address space. Periodically reclaim any bin grown >4x its
+// current size.
 static void periodic_capacity_shrink(RendererContext& ctx) {
     auto shrink_if_bloated = [](std::vector<RenderTriangle>& v) {
         if (v.capacity() > v.size() * 4 + 32) {
@@ -219,11 +204,7 @@ static void periodic_capacity_shrink(RendererContext& ctx) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Threadperf accounting: write one CSV row, advance to the next variant
-// (resetting animation and switching thread counts), or set running=false
-// when the sweep is complete.
-// ---------------------------------------------------------------------------
+// Write one CSV row, then advance to the next --threadperf variant or finish.
 static void threadperf_advance_variant(RendererContext& ctx,
                                        Uint64 current_time,
                                        float& sim_time, int& frame_num,
@@ -329,39 +310,24 @@ static void threadperf_write_partial_at_exit(RendererContext& ctx) {
     tp.log = nullptr;
 }
 
-// ---------------------------------------------------------------------------
-// Main loop.
-// ---------------------------------------------------------------------------
 void run_render_loop(RendererContext& ctx) {
     PhysicsPipeline& pp  = *ctx.physics;
     ThreadPerfSearch& tp = *ctx.thread_perf;
 
-    // Camera state (interactive orbit cam, owned by the loop).
     bool  running         = true;
     bool  paused              = false;
-    // 'F' toggle: when set, keep recording live profiler intervals even
-    // while physics is paused (paused stops sim advancement but raster
-    // still runs on the last-published pose, so the profiler bars
-    // reflect the cost of those repeated frames).
+    // 'F': keep recording live profiler intervals while physics is paused.
     bool  profiler_unfreeze   = false;
-    // 'T' toggle (only meaningful while the profiler overlay is on, i.e. 'S'
-    // is enabled). When trace_mode is on we keep a rolling ring buffer of
-    // the last 10 frame deltas (the orange-bar position relative to the
-    // previous frame's blit start) and maintain a running sum so the average
-    // is a single fetch + divide per frame. Any single frame whose delta
-    // exceeds 1.3 * average auto-pauses the sim and freezes the profiler so
-    // the spike is captured on-screen for inspection.
+    // 'T' (needs profiler overlay on): watchdog that auto-pauses + freezes when a
+    // frame's delta exceeds 1.3x the rolling 10-frame average, capturing the spike.
     bool          trace_mode        = false;
     constexpr int trace_window_size = 10;
     double        trace_ring[trace_window_size] = {0};
     int           trace_ring_count  = 0;
     int           trace_ring_head   = 0;
     double        trace_ring_sum    = 0.0;
-    // Set on unpause so the watchdog drops the first resumed frame. While
-    // paused the profiler is frozen, so present_history[0] stops advancing;
-    // the first resumed frame's delta therefore spans the entire pause and
-    // would instantly re-trigger the watchdog. We skip that one frame (and
-    // clear the ring) so the baseline rebuilds from fresh post-resume frames.
+    // On unpause, drop the first resumed frame: its delta spans the whole pause
+    // (profiler was frozen) and would falsely trigger the watchdog.
     bool          trace_skip_next   = false;
     [[maybe_unused]] bool  camera_orbiting = false;
     float camera_yaw      = 0.0f;
@@ -371,13 +337,12 @@ void run_render_loop(RendererContext& ctx) {
 
     float    sim_time           = 0.0f;
     int      frame_num          = 1;  // resets per --threadperf variant
-    int      frame_sequence     = 1;  // monotonic, never resets while workers live
+    int      frame_sequence     = 1;  // monotonic
     Uint64   last_physics_time  = Platform::TicksMs();
 
     ctx.fps_counter->start(Platform::TicksMs());
 
-    // Seed the profiler's swap history so the first frame's overlay has
-    // a sane left anchor before any Platform::Present() has returned.
+    // Seed the swap history so the first overlay has a sane left anchor.
     {
         Uint64 now_ts = Platform::PerfCounter();
         ctx.profiler->present_history[0].start_ts = now_ts;
@@ -397,7 +362,6 @@ void run_render_loop(RendererContext& ctx) {
     bool window_renderable = Platform::IsRenderable();
 
     while (running) {
-        // Pump platform events through a small portable Event type.
         while (Platform::PollEvent(event)) {
             switch (event.type) {
                 case Platform::Event::Quit: running = false; break;
@@ -410,9 +374,7 @@ void run_render_loop(RendererContext& ctx) {
                     if (event.key == ' ') {
                         paused = !paused;
                         if (!paused) {
-                            // Resuming: clear the trace watchdog state and drop
-                            // the first resumed frame so the pause-spanning
-                            // delta can't instantly re-trigger a pause.
+                            // Resuming: reset the watchdog and drop the first frame.
                             trace_ring_count = 0;
                             trace_ring_head  = 0;
                             trace_ring_sum   = 0.0;
@@ -431,16 +393,11 @@ void run_render_loop(RendererContext& ctx) {
                         g_quad_path_enabled.store(!was, std::memory_order_relaxed);
                     }
                     if (event.key == 'b' || event.key == 'B') {
-                        // Toggle the hard raster pass-barrier. Off (default) =
-                        // opportunistic SSAO/Luminaire overlap; on = each pass
-                        // drains fully before the next for clean profiling.
                         bool was = raster_hard_barrier.load(std::memory_order_relaxed);
                         raster_hard_barrier.store(!was, std::memory_order_relaxed);
                     }
                     if (event.key == 't' || event.key == 'T') {
-                        // Trace mode only makes sense while the profiler
-                        // overlay is on; ignore otherwise so 't' doesn't
-                        // silently arm a watchdog the user can't see.
+                        // Only arm the watchdog when the overlay is visible.
                         if (ctx.profiler->enabled.load(std::memory_order_relaxed)) {
                             trace_mode = !trace_mode;
                             trace_ring_count = 0;
@@ -449,10 +406,7 @@ void run_render_loop(RendererContext& ctx) {
                             trace_skip_next  = false;
                         }
                     }
-                    // Live worker-pool resize. '=' (or '+') adds a worker, '-'
-                    // (or '_') removes one, clamped to [1, launched capacity].
-                    // The render loop reads g_active_workers once per frame so
-                    // the change lands cleanly at the next frame boundary.
+                    // Live worker-pool resize: +/= adds, -/_ removes (clamped).
                     if (event.key == '+' || event.key == '=' ||
                         event.key == '-' || event.key == '_') {
                         int delta = (event.key == '+' || event.key == '=') ? 1 : -1;
@@ -464,9 +418,7 @@ void run_render_loop(RendererContext& ctx) {
                             g_active_workers.store(next, std::memory_order_relaxed);
                         }
                     }
-                    // Live T&L-preferred count. ']' (or '}') raises it, '[' (or
-                    // '{') lowers it, clamped to [1, launched capacity]. The
-                    // effective K is min(this, active workers).
+                    // Live T&L-preferred count: ]/} raises, [/{ lowers (clamped).
                     if (event.key == '[' || event.key == '{' ||
                         event.key == ']' || event.key == '}') {
                         int delta = (event.key == ']' || event.key == '}') ? 1 : -1;
@@ -533,8 +485,7 @@ void run_render_loop(RendererContext& ctx) {
         float delta_time = (now - last_physics_time) / 1000.0f;
         last_physics_time = now;
 
-        // Benchmark variants use a fixed step so every thread-count candidate
-        // sees the same animation sequence independent of how fast it renders.
+        // Fixed step in benchmark mode so every variant sees the same animation.
         if (tp.enabled) {
             delta_time = 1.0f / 60.0f;
         } else {
@@ -542,16 +493,14 @@ void run_render_loop(RendererContext& ctx) {
             if (paused) delta_time = 0.0f;
         }
 
-        // Pick the pose-ring slot T&L will read this frame, then arm the
-        // next Jolt step against the OPPOSITE slot. Trigger happens
-        // after the T&L kick below so the physics worker can run
-        // concurrently with T&L (different ring slot, no conflict).
+        // Read slot for this frame's T&L; arm the next step against the opposite
+        // slot (triggered after the T&L kick, so physics runs concurrently).
         int pose_read_idx = pp.published_snapshot.load(std::memory_order_acquire);
         sim_time          = pp.pose_snapshots[pose_read_idx].sim_time;
         float time        = sim_time;
         physics_arm_after_tl(pp, delta_time, time + delta_time);
 
-        // Projection (rebuild only on aspect change).
+        // Projection, rebuilt only on aspect change.
         static float last_aspect = 0.0f;
         static Matrix4f projection = Matrix4f::Identity();
         float aspect = (float)fb->w / (float)fb->h;
@@ -595,12 +544,8 @@ void run_render_loop(RendererContext& ctx) {
             spot_dir_eye = (light_target_eye - light_pos_eye).normalized();
             light_dir = spot_dir_eye;
 
-            // Park the render-only spotlight housing at the light, with its
-            // local +Y opening aimed down the beam. We write the pose into the
-            // slot T&L reads this frame (pose_read_idx); the physics worker only
-            // ever writes the opposite ring slot, so this is race-free. This
-            // also lands before the occlusion/sort loop below, so the housing
-            // sorts with a correct eye-space depth.
+            // Park the lamp housing at the light, +Y opening down the beam. Write
+            // into the read slot (pose_read_idx); physics writes the other one.
             if (ctx.lamp_instance_index >= 0) {
                 Vector3f beam = (light_target_world - light_pos_world).normalized();
                 Eigen::Quaternionf q;
@@ -620,17 +565,11 @@ void run_render_loop(RendererContext& ctx) {
             shadow_matrix = build_shadow_tex_matrix(view_matrix, light_dir, shadow_scene_min, shadow_scene_max);
         }
 
-        // Sort instances front-to-back (opaque) / back-to-front (transparent).
-        // Main does only the cheap stuff here:
-        //   * one matrix-vec per instance to get eye-space center z (sort key)
-        //   * harvest type 0/1 occluder eye positions into a small list
-        // T&L workers consume the precomputed occluder list to run the
-        // expensive O(small_balls * occluders) cone test in parallel.
+        // Sort instances and harvest type 0/1 occluder eye positions. Main only
+        // does the cheap per-instance matrix-vec; workers run the occlusion test.
         auto& instance_depths = *ctx.instance_depths;
         auto& instances       = *ctx.instances;
         auto& occluders_eye   = *ctx.occluders_eye;
-        // Both vectors are kept at high-water-mark capacity across frames; clear()
-        // on trivial-T vector is just size=0, no allocator traffic.
         instance_depths.clear();
         occluders_eye.clear();
 
@@ -663,13 +602,8 @@ void run_render_loop(RendererContext& ctx) {
 
         int tl_buf_idx     = frame_num % 2;
         int raster_buf_idx = (frame_num + 1) % 2;
-        // Scatter-merge: each T&L worker appends its sorted local bins directly
-        // into the published slot under per-tile locks, with no per-tile owner
-        // to do a clearing pass. So main clears the target slot here, once,
-        // before waking the pool. Safe because the pool is asleep at this point
-        // and this slot's previous raster consumer finished on the prior frame.
-        // clear() keeps capacity (size=0 for trivially-destructible triangles),
-        // so this is cheap and never reallocates.
+        // Workers append into the published slot, so main clears it once here
+        // before waking the pool (safe: pool asleep, prior raster consumer done).
         {
             auto& ob = ctx.opaque_strip_buffers[tl_buf_idx].bins;
             auto& tb = ctx.trans_strip_buffers [tl_buf_idx].bins;
@@ -737,7 +671,7 @@ void run_render_loop(RendererContext& ctx) {
         ctx.shadow_matrix_buffers[tl_buf_idx] = shadow_matrix;
         ctx.time_buffers         [tl_buf_idx] = time;
 
-        // Tumbling-box shadow-pass overlay (8 box corners projected into shadow space).
+        // Tumbling-box shadow-pass overlay: 8 corners projected into shadow space.
         {
             const float b = ctx.box_half;
             Vector4f corners[8] = {
@@ -764,7 +698,7 @@ void run_render_loop(RendererContext& ctx) {
             }
         }
 
-        // Raster the buffer that T&L populated on the *previous* frame.
+        // Raster the buffer T&L populated last frame.
         bool do_raster = (frame_num > 1);
 
         if (do_raster) {
@@ -804,19 +738,10 @@ void run_render_loop(RendererContext& ctx) {
             rs.frame_index             = (uint32_t)frame_num;
         }
 
-        // Mirror pause into the profiler so the live snapshot freezes on pause.
-        // The intervals still in the per-worker vectors at this point belong
-        // to the *previous* frame (because begin_frame is about to be called
-        // but is a no-op while frozen). The blit window that brackets the
-        // start of that frame's work is present_history[1]; the orange
-        // draw-end marker is the start of present_history[0] (since the
-        // current Present() happens immediately after the orange capture).
+        // Freeze the profiler snapshot on pause (unless 'F' overrides).
         {
             ThreadProfiler& prof = *ctx.profiler;
             bool was_frozen = prof.frozen.load(std::memory_order_relaxed);
-            // 'F' overrides the pause-driven freeze so the profiler keeps
-            // capturing live intervals (and the orange/purple anchors
-            // float with the live frame) even while physics is paused.
             bool want_frozen = paused && !profiler_unfreeze;
             if (want_frozen && !was_frozen) {
                 prof.frozen_blit_start_ts = prof.present_history[1].start_ts;
@@ -825,22 +750,12 @@ void run_render_loop(RendererContext& ctx) {
             }
             prof.frozen.store(want_frozen, std::memory_order_relaxed);
         }
-        // Clear last frame's per-worker profiler logs (safe: workers asleep).
         thread_profiler_begin_frame(*ctx.profiler);
 
-        // ---- Publish the frame's work plan to the unified pool ----
-        // T&L for frame N (this frame's geometry) and raster for frame N-1
-        // (the previous frame's published bins) are data-independent, so the
-        // pool can interleave them freely. The first k_eff workers are
-        // "T&L preferred": they run this frame's T&L (per-instance + bin
-        // merge) first, then fall through to help drain the previous frame's
-        // raster passes. The remaining workers go straight to raster. With
-        // the pool sized to hardware there is no oversubscription, so a
-        // worker that finishes T&L hands its core to raster instead of idling.
-        // Active worker count: the --threadperf sweep drives NUM_RASTER_THREADS
-        // per variant; otherwise it's the live, +/- adjustable g_active_workers
-        // (clamped to the launched capacity). Read once here so the whole frame
-        // sees one consistent value.
+        // Publish the frame plan. This frame's T&L and last frame's raster are
+        // data-independent, so the pool interleaves them. Active/T&L-preferred
+        // counts come from the --threadperf sweep or the live g_* atomics; read
+        // once so the whole frame sees one value.
         int pool_active;
         int tl_pref;
         if (tp.enabled) {
@@ -854,7 +769,6 @@ void run_render_loop(RendererContext& ctx) {
             if (tl_pref < 1) tl_pref = 1;
             if (tl_pref > NUM_RASTER_THREADS) tl_pref = NUM_RASTER_THREADS;
         }
-        // Effective T&L-preferred count: can't exceed the active pool.
         int k_eff = tl_pref < pool_active ? tl_pref : pool_active;
         {
             std::lock_guard<std::mutex> lock(mtx_pool);
@@ -866,7 +780,7 @@ void run_render_loop(RendererContext& ctx) {
             tl_done_counter.store(0, std::memory_order_relaxed);
             for (int p = 0; p < RASTER_PASS_COUNT; p++) {
                 raster_pass_tiles_done[p].store(0, std::memory_order_relaxed);
-                for (int r = 0; r < NUM_STRIPS * 2; r++) { // Luminaire uses 2*NUM_STRIPS rows
+                for (int r = 0; r < NUM_STRIPS * 2; r++) { // Luminaire uses 2*NUM_STRIPS
                     raster_row_next_col[p][r].store(0, std::memory_order_relaxed);
                 }
             }
@@ -883,13 +797,11 @@ void run_render_loop(RendererContext& ctx) {
         }
         cv_pool.notify_all();
 
-        // Wake the physics worker NOW so it runs concurrently with the pool.
-        // It writes pose_snapshots[1 - pose_read_idx] while T&L reads
-        // pose_snapshots[pose_read_idx], so there is no slot conflict.
+        // Wake physics now to run concurrently (it writes the opposite ring slot).
         physics_trigger_after_tl(pp);
 
-        // Wait for the previous frame's raster (all four passes) to drain
-        // before main touches the framebuffer / depth for the post passes.
+        // Wait for the previous frame's raster to drain before main draws the
+        // post passes into the framebuffer.
         Uint64 raster_phase_start = Platform::PerfCounter();
         wait_for_main_thread_predicate([] {
             return raster_pass.load(std::memory_order_acquire) >= RASTER_PASS_COUNT;
@@ -962,7 +874,7 @@ void run_render_loop(RendererContext& ctx) {
             }
         }
 
-        // FPS counter in the top-right corner (safe now: raster is fully drained).
+        // FPS counter (safe now: raster fully drained).
         ctx.fps_counter->draw(pixels, pitch, fb->w, fb->format);
         {
             char label[32];
@@ -970,39 +882,27 @@ void run_render_loop(RendererContext& ctx) {
             draw_text(pixels, pitch, 20, 20, label, 255, 255, 255, fb->format);
         }
 
-        // Concurrency timeline overlay (toggle with 'S'). The orange line
-        // it paints sits exactly at draw_end_ts (captured here, just
-        // before drawing the overlay itself).
+        // Orange line position; captured here, just before drawing the overlay.
         Uint64 draw_end_ts = Platform::PerfCounter();
 
-        // Trace-mode spike watchdog. Use the same anchor as the overlay so
-        // the delta we evaluate is exactly the orange-bar position the user
-        // sees. We need the prior frame's blit-start (the panel's left edge)
-        // — present_history[0] still holds it at this point in the frame
-        // because the Present below is what advances it.
+        // Trace-mode spike watchdog, against the prior frame's blit-start (still
+        // in present_history[0] until the Present below advances it).
         if (trace_mode && !paused && ctx.profiler->enabled.load(std::memory_order_relaxed)) {
             Uint64 prev_blit_start = ctx.profiler->present_history[0].start_ts;
             if (trace_skip_next) {
-                // First frame after a resume: present_history[0] still holds
-                // the pre-pause blit start (frozen during the pause), so this
-                // frame's delta spans the whole pause. Drop it entirely — no
-                // trigger, no record — and resync on the next frame once
-                // present_history has advanced.
+                // First frame after resume: delta spans the pause, so drop it.
                 trace_skip_next = false;
             } else if (prev_blit_start != 0) {
                 double delta_ms = perf_ms(prev_blit_start, draw_end_ts);
                 if (trace_ring_count >= trace_window_size) {
                     double avg_ms = trace_ring_sum * (1.0 / trace_window_size);
-                    // Spec: trigger when delta > 1.3 * average.
                     if (delta_ms > 1.3 * avg_ms) {
                         paused = true;
                         profiler_unfreeze = false;
                     }
                 }
                 if (!paused) {
-                    // Ring-buffer insert with O(1) sum maintenance: subtract the
-                    // slot we're overwriting (only once it's been filled once),
-                    // then add the new sample.
+                    // Ring insert with O(1) running sum.
                     if (trace_ring_count >= trace_window_size) {
                         trace_ring_sum -= trace_ring[trace_ring_head];
                     }
@@ -1018,8 +918,7 @@ void run_render_loop(RendererContext& ctx) {
                              ctx.screen_width, ctx.screen_height, fb->format,
                              draw_end_ts);
 
-        // Bracket the blit so the profiler can show both its start and
-        // end as two purple lines on the next frame's overlay.
+        // Bracket the blit for the next overlay's two purple lines.
         Uint64 present_start_ts = Platform::PerfCounter();
         Platform::Present();
         Uint64 present_end_ts   = Platform::PerfCounter();
@@ -1031,11 +930,8 @@ void run_render_loop(RendererContext& ctx) {
                 prof.present_history[0].end_ts   = present_end_ts;
             }
         }
-        // Wait for the whole pool to finish the frame (T&L bin merge + all
-        // raster passes) before we touch the shared buffers it wrote and set
-        // up the next frame's plan. raster already drained above; this also
-        // covers any T&L-preferred worker still finishing its merge after the
-        // present overlapped it.
+        // Wait for the whole pool to finish before reusing its buffers; catches
+        // any T&L worker still merging after the present overlapped it.
         {
             int expected_workers = pool_active;
             Uint64 tl_wait_start = Platform::PerfCounter();
@@ -1049,8 +945,7 @@ void run_render_loop(RendererContext& ctx) {
             tp.raster_ms_this_variant += perf_ms(raster_phase_start, raster_phase_end);
         }
 
-        // Bins were merged in parallel by the workers themselves; main only
-        // does the small globals merge (capacity-fixed, counter-reset lists).
+        // Bins merged in parallel by the workers; main does only the small globals merge.
         merge_tl_globals(ctx, tl_buf_idx);
 
         if ((frame_num & 0xff) == 0) periodic_capacity_shrink(ctx);

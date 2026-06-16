@@ -1,25 +1,18 @@
 #pragma once
-// Header-only conservative sphere/frustum intersection tests used by the
-// per-instance culling pass that runs before T&L. Sphere-based tests are
-// cheap, and the false-positive rate is fine because we follow up with
-// triangle-level clipping inside T&L.
+// Conservative sphere/frustum intersection tests for the pre-T&L culling pass.
 
 #include <cmath>
 #include <Eigen/Dense>
 
-// One eye-space occluder, precomputed by main once per frame and consumed
-// concurrently by every T&L worker doing small-ball occlusion checks.
-// `inner_radius` is the conservative inner sphere radius (smaller than the
-// instance's true bounding radius) used by the cone-angle tests below.
+// `inner_radius` is intentionally smaller than the true bounding radius so the
+// cone-angle occlusion tests below stay conservative.
 struct OccluderEye {
     Eigen::Vector3f eye_pos;
     float           inner_radius;
 };
 
-// Point-source occlusion test (camera or spotlight): is point `p`
-// completely inside the cone subtended by the occluder sphere from
-// `viewer`, accounting for the bounded extent of `p` itself? Both `p` and
-// `occ` are in eye space.
+// Point-source (camera/spotlight) occlusion: is eye-space `p` (with its own
+// bounded extent) fully inside the cone the occluder sphere subtends from `viewer`?
 static inline bool point_occluded_by_sphere(const Eigen::Vector3f& viewer, const Eigen::Vector3f& p,
                                             const Eigen::Vector3f& occ, float occ_inner_radius,
                                             float p_radius) {
@@ -40,8 +33,8 @@ static inline bool point_occluded_by_sphere(const Eigen::Vector3f& viewer, const
     return cos_to_center >= cos_limit;
 }
 
-// Directional-light occlusion test: is point `p` inside the infinite
-// cylinder cast behind the occluder along `-light_axis`?
+// Directional-light occlusion: is `p` inside the infinite cylinder cast behind
+// the occluder along `-light_axis`?
 static inline bool directional_occluded_by_sphere(const Eigen::Vector3f& light_axis,
                                                   const Eigen::Vector3f& p,
                                                   const Eigen::Vector3f& occ, float occ_inner_radius,

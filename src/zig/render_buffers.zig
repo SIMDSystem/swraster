@@ -1,5 +1,5 @@
-// render_buffers.zig — per-frame IPC buffers between T&L workers, raster
-// workers, and main. Mirrors render_buffers.h. POD only.
+// render_buffers — per-frame IPC buffers between T&L workers, raster workers,
+// and main. POD only.
 
 const std = @import("std");
 const la = @import("linalg.zig");
@@ -91,8 +91,7 @@ pub const InstanceDepth = struct {
 pub const TLSharedData = struct {
     instances: ?*const std.ArrayList(scene.CubeInstance) = null,
     sorted_instances: ?*const std.ArrayList(InstanceDepth) = null,
-    // Per-frame republished copy of RendererContext.meshes, indexed by
-    // @intFromEnum(scene.InstanceType).
+    // Per-frame republished copy of RendererContext.meshes.
     meshes: [7]MeshRef = undefined,
     opaque_triangles: ?*RenderTriangleList = null,
     trans_triangles: ?*RenderTriangleList = null,
@@ -131,15 +130,10 @@ pub const TLThreadOutput = struct {
     opaque_bins: []RenderTriangleList = &.{},
     trans_bins: []RenderTriangleList = &.{},
     shadow_bins: []RenderTriangleList = &.{},
-    // Reusable scratch for the O(n) two-run merge in the scatter-merge phase
-    // and as the gather buffer for the key-sort. Per-worker so it never
-    // contends.
+    // Per-worker reusable scratch (merge + key-sort gather; no contention).
     merge_scratch: RenderTriangleList = undefined,
-    // (key, index) scratch for the local key-sort; per-worker, reused.
     sort_keys: std.ArrayList(keysort.KeyIdx) = undefined,
-    // Persistent per-worker transform scratch, reused across frames (the C++
-    // build constructs these per frame). transformVertices resizes+overwrites
-    // both fully, so retaining the buffers just avoids re-allocation.
+    // Per-worker transform scratch, retained across frames to avoid re-alloc.
     eye_scratch: RenderVertexList = undefined,
     clip_scratch: RenderVertexList = undefined,
 };

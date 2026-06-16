@@ -1,5 +1,4 @@
-//! cull.rs — conservative sphere/frustum + occlusion tests run before T&L.
-//! Ported from cull.zig / cull.h.
+//! Conservative sphere/frustum + occlusion tests run before T&L.
 
 use crate::linalg::Vec3;
 

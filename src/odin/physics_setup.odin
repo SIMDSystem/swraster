@@ -1,7 +1,4 @@
-// physics_setup.odin — Jolt scaffolding. Mirrors physics_setup.h/cpp.
-//
-// Broad-phase layer filters live inside the joltc C wrapper; here we only
-// expose layer constants and the register/factory lifecycle.
+// physics_setup.odin — Jolt layer constants and register/factory lifecycle.
 
 package main
 

@@ -1,30 +1,11 @@
 #pragma once
 
-// Per-thread concurrency overlay.
-//
-// Each worker (physics + the unified pool) records busy intervals as
-// PerfCounter tick pairs into a per-thread vector. Once a frame finishes, the
-// renderer draws a small 2D timeline pinned to the top-left of the framebuffer:
-//
-//   top red bars  = physics worker busy intervals (its own thread, own row)
-//   rows below    = one row per active pool worker. Because a pool worker runs
-//                   its T&L then its raster on the same physical thread, both
-//                   its T&L bars (cyan/blue) and raster bars (yellow/green/
-//                   purple) share that one row, mutually exclusive in time.
-//                   Idle workers get no row; the panel is only as tall as the
-//                   workers that did work.
-//
-// The panel is left-anchored. The previous frame's Platform::Present()
-// blit window is shown by two vertical purple lines on the left:
-//
-//   purple line 1 = previous Present() start (= left margin of panel)
-//   purple line 2 = previous Present() return (= start of this frame's work)
-//
-// The current frame's end-of-debug-draw is marked by a floating orange
-// vertical line on the right (= the PerfCounter tick captured right
-// before this overlay is itself drawn). Bars run left → right at 100
-// pixels per millisecond. The whole thing is gated by an atomic flag so
-// production runs pay nothing; press S in the renderer to toggle it.
+// Per-thread concurrency overlay (toggle with S). Workers record busy intervals
+// as PerfCounter tick pairs; the renderer draws a timeline panel: one row per
+// active pool worker (T&L and raster bars share the row since they run on the
+// same thread), physics on top. Two left purple lines bracket the previous
+// Present() blit; a floating orange line marks end-of-debug-draw. Gated by an
+// atomic so disabled runs pay nothing.
 
 #include <atomic>
 #include <cstdint>
@@ -38,17 +19,12 @@ struct PixelFormat;
 struct ProfilerInterval {
     Uint64  start_ts;
     Uint64  end_ts;
-    // CPU time actually consumed by the recording thread between
-    // start_ts and end_ts, in nanoseconds. The overlay draws each
-    // bar at width = cpu_ns mapped through pixels_per_ms (anchored at
-    // start_ts) so kernel preemption shows up as an uncolored gap to
-    // the right of the bar instead of a misleading "busy" stretch.
+    // CPU ns actually consumed; the bar width uses this (not wall time) so
+    // kernel preemption shows as an uncolored gap rather than a busy stretch.
     Uint64  cpu_ns  = 0;
-    uint8_t tag     = 0; // For raster: cast of RasterJobMode. Unused for T&L / physics.
+    uint8_t tag     = 0; // raster: RasterJobMode; unused for T&L/physics
 };
 
-// A single Platform::Present() blit window: the tick range from the
-// moment the renderer calls Platform::Present() to the moment it returns.
 struct PresentBlit {
     Uint64 start_ts = 0;
     Uint64 end_ts   = 0;
@@ -57,39 +33,28 @@ struct PresentBlit {
 struct ThreadProfiler {
     std::atomic<bool> enabled{false};
 
-    // When set, the recorders are no-ops, begin_frame is a no-op, and the
-    // drawer pins the panel to the frozen_* snapshot below instead of the
-    // live timestamps. The renderer sets this when the animation is
-    // paused so the most recent live frame's timeline stays on screen.
+    // When set (animation paused), recorders/begin_frame are no-ops and the
+    // drawer pins to the frozen_* snapshot so the last frame's timeline stays up.
     std::atomic<bool> frozen{false};
     Uint64            frozen_blit_start_ts = 0; // left purple line 1
     Uint64            frozen_blit_end_ts   = 0; // left purple line 2
     Uint64            frozen_draw_end_ts   = 0; // floating orange line
 
-    // Most-recent and previous-recent Platform::Present() blit windows.
-    // [0] is the latest (start_ts = previous Present() call; end_ts =
-    // when it returned, which is also when this frame's work began);
-    // [1] is the one before. Rotated by the renderer after each Present.
-    // The drawer uses [0] for the live anchors and captures both into
-    // the frozen_blit_* fields on freeze.
+    // [0] latest Present() blit window, [1] the one before; rotated each Present.
+    // The drawer anchors on [0] and snapshots both into frozen_blit_* on freeze.
     PresentBlit present_history[2];
 
-    // T&L and raster workers own their slots exclusively. Main reads/clears
-    // them only while the workers are asleep, so no lock is needed.
+    // Workers own their slots; main reads/clears them only while workers are
+    // asleep, so no lock is needed.
     std::vector<std::vector<ProfilerInterval>> tl_intervals;     // [thread_id]
     std::vector<std::vector<ProfilerInterval>> raster_intervals; // [thread_id]
 
-    // Physics is an async producer; protect its log with a mutex.
+    // Physics is async; protect its log with a mutex.
     std::mutex                    physics_mtx;
     std::vector<ProfilerInterval> physics_intervals;
 
-    // Double-buffered previous-frame snapshot: live arrays are ping-ponged
-    // with these at begin_frame, so the drawer can paint two consecutive
-    // frames side-by-side on a single wallclock-aligned timeline (older
-    // frame on the left, newer on the right). prev_blit_start/end_ts
-    // and prev_draw_end_ts are the markers that belonged to the older
-    // frame at the time IT was drawn — captured at the same begin_frame
-    // call that snapshots its intervals.
+    // Previous-frame snapshot, ping-ponged at begin_frame so the drawer can
+    // paint two consecutive frames on one aligned timeline.
     std::vector<std::vector<ProfilerInterval>> tl_intervals_prev;
     std::vector<std::vector<ProfilerInterval>> raster_intervals_prev;
     std::vector<ProfilerInterval>              physics_intervals_prev;
@@ -97,11 +62,10 @@ struct ThreadProfiler {
     Uint64                                     prev_blit_end_ts   = 0;
     Uint64                                     prev_draw_end_ts   = 0;
 
-    // Most-recent value passed to thread_profiler_draw, captured so the
-    // next frame's begin_frame can promote it into prev_draw_end_ts.
+    // Last draw_end_ts, promoted into prev_draw_end_ts next begin_frame.
     Uint64                                     last_draw_end_ts   = 0;
 
-    // Visual layout (in framebuffer pixels).
+    // Visual layout (framebuffer pixels).
     int   right_margin_px     = 40;
     int   left_margin_px      = 40;
     int   top_y               = 30;
@@ -113,33 +77,17 @@ struct ThreadProfiler {
 // Size the per-worker vectors. Call once after thread counts are decided.
 void thread_profiler_init(ThreadProfiler& p, int launched_tl_threads, int launched_raster_threads);
 
-// Clear T&L and raster interval vectors. Safe only when those workers are
-// asleep (i.e. before the next frame's cv_tl / cv_raster notify). Physics
-// log is trimmed (not cleared) to a fixed retention.
+// Clear the interval vectors; safe only while those workers are asleep. The
+// physics log is trimmed, not cleared.
 void thread_profiler_begin_frame(ThreadProfiler& p);
 
-// Per-worker recorders. Inlined and gated on the atomic flag so disabled
-// builds pay one relaxed load per call site.
-// T&L tag values for the profiler overlay, one per functionally-distinct
-// T&L sub-pass:
-//   PerInstance (default) — phase-1 per-instance sweep: vertex transforms,
-//                           lighting, clip, project, shadow + RGB triangle
-//                           emission, per-tile bin assignment. Painted cyan.
-//   Spotlight             — once-per-frame spotlight luminaire cone fan
-//                           T&L on thread 0. Folded into the cyan family.
-//   LocalSort             — phase-1 tail: each worker sorts its own local
-//                           bins + overflow lists. Painted light blue.
-//   BinMerge              — phase-2 bin merge: each worker clears the
-//                           bins it owns and concatenates all workers'
-//                           local-bin contributions via inplace_merge.
-//                           Painted dark blue. The gap between the
-//                           light-blue local sort and the dark-blue merge
-//                           is the phase-1 barrier spin-wait.
+// T&L overlay tags, one color per sub-pass. The gap between LocalSort and
+// BinMerge is the phase-1 barrier spin-wait.
 enum class TLJobTag : uint8_t {
-    PerInstance = 0, // phase-1 per-instance T&L (transform/light/clip/project/bin-assign)
-    Spotlight   = 1, // once-per-frame spotlight luminaire cone fan T&L (thread 0)
-    BinMerge    = 2, // phase-2 cross-worker bin merge (inplace_merge into published bins)
-    LocalSort   = 3, // phase-1 tail: each worker sorts its own local bins + overflow lists
+    PerInstance = 0, // phase-1 per-instance T&L (cyan)
+    Spotlight   = 1, // once-per-frame cone-fan T&L on thread 0 (cyan family)
+    BinMerge    = 2, // phase-2 cross-worker bin merge (dark blue)
+    LocalSort   = 3, // phase-1 tail: per-worker local sort (light blue)
 };
 
 inline void profiler_record_tl(ThreadProfiler& p, int thread_id,
@@ -172,12 +120,8 @@ inline void profiler_record_physics(ThreadProfiler& p,
     }
 }
 
-// Render the timeline overlay onto the framebuffer. draw_end_ts is the
-// PerfCounter tick the floating orange right line maps to (= the moment
-// the renderer captures right before calling this function, i.e. the
-// end of all debug drawing this frame). The two left purple lines come
-// from present_history[0] (start_ts and end_ts) and bracket the previous
-// blit; the panel's left margin is pinned to present_history[0].start_ts.
+// Render the timeline overlay. draw_end_ts maps to the floating orange right
+// line (captured just before this call); the panel anchors on present_history[0].
 void thread_profiler_draw(ThreadProfiler& p,
                           uint8_t* pixels, int pitch,
                           int surface_w, int surface_h,

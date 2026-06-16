@@ -1,17 +1,13 @@
-// platform.zig — thin portable platform layer (windowing/input/blit/BMP/timing).
-//
-// Mirrors platform.h + platform.cpp. The public API dispatches at comptime to
-// the macOS Cocoa backend (platform_mac.zig) or the emscripten web backend
-// (below). The shared helpers — the BMP loader, FreeSurface, and the per-thread
-// CPU clock — are defined once here, exactly as in platform.cpp.
+// platform — portable platform layer (windowing/input/blit/BMP/timing). The
+// public API dispatches at comptime to the macOS Cocoa backend or the
+// emscripten web backend (below).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const sync = @import("sync.zig");
 
-// libc stdio used directly (Zig 0.16 routes std.fs through the std.Io model,
-// which would otherwise require threading an `Io` handle through every file
-// call). We link libc, so the C runtime functions are always available.
+// libc stdio directly: Zig 0.16's std.fs would require threading an `Io` handle
+// through every file call.
 extern fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
 
 pub const PixelFormat = extern struct {
@@ -66,7 +62,6 @@ const mac = if (is_mac) @import("platform_mac.zig") else struct {};
 // ===========================================================================
 pub fn threadCpuNs() u64 {
     var ts: std.c.timespec = undefined;
-    // CLOCK_THREAD_CPUTIME_ID: CPU time consumed by the calling thread.
     if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
@@ -74,8 +69,7 @@ pub fn threadCpuNs() u64 {
 // ===========================================================================
 //  Shared: portable BMP loader (24/32 bpp uncompressed -> RGBA8)
 // ===========================================================================
-// All loaded surfaces share this one format descriptor (var, not const: a
-// Surface holds a mutable *PixelFormat).
+// Shared by all loaded surfaces; var because Surface holds a mutable *PixelFormat.
 var bmp_rgba_format: PixelFormat = .{
     .BytesPerPixel = 4,
     .Rshift = 0,
@@ -112,8 +106,7 @@ pub fn loadBmp(path: [*:0]const u8) ?*Surface {
 
     if (fseek(file, @intCast(data_off), 0) != 0) return null;
 
-    // Decode straight into the malloc'd pixel buffer the Surface will own
-    // (FreeSurface releases it with free(), so it must come from malloc).
+    // Must be malloc'd: freeSurface releases owned pixels with free().
     const px_len: usize = @as(usize, @intCast(width)) * @as(usize, @intCast(height)) * 4;
     const pix = std.c.malloc(px_len) orelse return null;
     const px = @as([*]u8, @ptrCast(pix))[0..px_len];
@@ -132,10 +125,10 @@ pub fn loadBmp(path: [*:0]const u8) ?*Surface {
         while (x < @as(usize, @intCast(width))) : (x += 1) {
             const s = row[x * bytes_pp ..];
             const di = x * 4;
-            d[di + 0] = s[2]; // R (BMP is BGR)
-            d[di + 1] = s[1]; // G
-            d[di + 2] = s[0]; // B
-            d[di + 3] = 255; // A
+            d[di + 0] = s[2]; // BMP is BGR
+            d[di + 1] = s[1];
+            d[di + 2] = s[0];
+            d[di + 3] = 255;
         }
     }
 
@@ -218,8 +211,7 @@ pub fn delay(ms: u32) void {
 // ===========================================================================
 const web = struct {
     extern fn emscripten_get_now() f64;
-    // The page shell (web_shell.html) supplies these via EM_JS-style imports;
-    // declared here so the swr_push_* exports and present blit link cleanly.
+    // Supplied by the page shell (web_shell.html).
     extern fn swr_js_setup_canvas(w: c_int, h: c_int) void;
     extern fn swr_js_present(ptr: [*]const u8, w: c_int, h: c_int) void;
 
@@ -300,8 +292,7 @@ const web = struct {
     }
     extern fn usleep(usec: c_uint) c_int;
     fn delay(ms: u32) void {
-        // Runs on a renderer pthread (PROXY_TO_PTHREAD), so a blocking libc
-        // usleep is fine and keeps the browser main thread free.
+        // On a renderer pthread (PROXY_TO_PTHREAD), so blocking usleep is fine.
         _ = usleep(ms * 1000);
     }
 
@@ -326,7 +317,7 @@ const web = struct {
 
 comptime {
     if (is_web) {
-        // Force the exports to be referenced so they survive dead-code elim.
+        // Reference an export so the swr_push_* set survives dead-code elim.
         _ = &web.swr_push_key;
     }
 }

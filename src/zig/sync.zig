@@ -1,10 +1,7 @@
-// sync.zig — pthread-backed Mutex/Condition.
+// sync — pthread-backed Mutex/Condition.
 //
-// Zig 0.16 removed std.Thread.Mutex / std.Thread.Condition and moved blocking
-// synchronization into the std.Io model (std.Io.Mutex/Condition require an `Io`
-// handle threaded through every call site). This port links libc, so we provide
-// classic pthread-backed primitives with the pre-0.16 API instead, keeping the
-// renderer's threading code unchanged.
+// Zig 0.16 moved blocking sync into std.Io (requires an `Io` handle at every
+// call site); we link libc, so we keep the simpler pre-0.16 pthread API.
 
 const std = @import("std");
 const c = std.c;

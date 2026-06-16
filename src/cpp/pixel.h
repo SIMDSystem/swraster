@@ -1,8 +1,5 @@
 #pragma once
-// Pixel packing/unpacking inlines and the bitmap-font number renderer used for
-// the on-screen FPS readout. Header-only inlines stay header-only so the
-// triangle rasterizer hot path can keep them inlined; the font tables live in
-// pixel.cpp.
+// Pixel pack/unpack inlines and the bitmap-font text renderer.
 
 #include <cstdint>
 #include <algorithm>

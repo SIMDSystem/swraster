@@ -1,6 +1,4 @@
-// keysort.odin — sort large POD structs by a f32 key without moving them during sort.
-//
-// Extract (key, index) pairs, sort those (8-byte swaps), then gather structs once.
+// keysort.odin — sort large structs by f32 key via (key,index) pairs, gather once.
 
 package main
 

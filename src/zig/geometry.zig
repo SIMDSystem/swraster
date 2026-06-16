@@ -1,6 +1,4 @@
-// geometry.zig — vertex/face types, the Utah teapot control points, and the
-// primitive generators. Mirrors geometry.h + geometry.cpp. Eigen vectors are
-// replaced by linalg.Vec3/Vec4; std::vector by std.ArrayList.
+// geometry — vertex/face types, Utah teapot control points, primitive generators.
 
 const std = @import("std");
 const la = @import("linalg.zig");

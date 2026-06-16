@@ -1,23 +1,12 @@
-// linalg.zig — minimal float linear algebra, the Eigen replacement.
-//
-// Eigen is a C++ template library and cannot be consumed from Zig, so this
-// module reimplements exactly the Vector3f / Vector4f / Matrix3f / Matrix4f /
-// Quaternionf surface the rasterizer uses. Matrices are stored row-major
-// (data[row][col]); matrix*vector and matrix*matrix follow standard linear
-// algebra so `projection * v` reproduces Eigen's behaviour 1:1.
+// linalg — minimal float linear algebra. Matrices are row-major (m[row][col]).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const math = std.math;
 
-// Fused multiply-add that stays fast on every target. wasm has no hardware FMA,
-// so @mulAdd there lowers to fmaf libcalls (and a @Vector @mulAdd scalarizes
-// into several) — ruinous in per-pixel/per-vertex hot loops. On wasm we emit a
-// plain mul+add (one v128 mul + one v128 add); natively we keep the real
-// NEON/AVX FMA. The tiny rounding difference is irrelevant for shading/transform.
+// wasm has no hardware FMA, so @mulAdd there lowers to (scalarized) fmaf
+// libcalls — ruinous in hot loops. Plain mul+add on wasm, real FMA natively.
 pub inline fn mulAdd(comptime T: type, a: T, b: T, c: T) T {
-    // Plain mul+add on wasm (no @mulAdd → no fmaf libcall; wasm has no vector
-    // FMA anyway), real NEON/AVX FMA natively.
     if (builtin.target.os.tag == .emscripten) return a * b + c;
     return @mulAdd(T, a, b, c);
 }
@@ -155,9 +144,8 @@ pub const Mat4 = struct {
         a.m[row][col] = v;
     }
     pub fn mul(a: Mat4, b: Mat4) Mat4 {
-        // Each result row is a linear combination of b's rows, weighted by a's
-        // row entries. This keeps every lane busy (no horizontal adds) and uses
-        // fused multiply-add — the SIMD-friendly GEMM form Eigen would emit.
+        // Broadcast-FMA form: each result row is a combination of b's rows, so
+        // no horizontal adds and every lane stays busy.
         const b0: @Vector(4, f32) = b.m[0];
         const b1: @Vector(4, f32) = b.m[1];
         const b2: @Vector(4, f32) = b.m[2];
@@ -197,7 +185,7 @@ pub const Mat4 = struct {
         } };
     }
 
-    // General 4x4 inverse (cofactor expansion). Mirrors Eigen's Matrix4f::inverse().
+    // General 4x4 inverse via cofactor expansion.
     pub fn inverse(a: Mat4) Mat4 {
         const x = a.m;
         var inv: [16]f32 = undefined;
@@ -295,8 +283,7 @@ test "simd math matches scalar reference" {
     try expectApproxEqAbs(lhs.w, rhs.w, 1e-2);
 }
 
-// Eigen's Quaternionf::setFromTwoVectors(a, b): the shortest-arc rotation that
-// maps unit vector a onto unit vector b.
+// Shortest-arc rotation mapping unit vector a onto unit vector b.
 pub fn quatFromTwoVectors(a_in: Vec3, b_in: Vec3) Quat {
     const a = a_in.normalized();
     const b = b_in.normalized();

@@ -1,11 +1,9 @@
-// scene.odin — scene description + builders. Mirrors scene.zig.
+// scene.odin — scene description + builders.
 
 package main
 
 import "core:math"
 
-// Mesh/material kind for a scene instance. enum i32 keeps the field layout
-// byte-identical to the C++ `int type` (and the other three ports).
 Instance_Type :: enum i32 {
 	Cube      = 0,
 	Sphere    = 1,

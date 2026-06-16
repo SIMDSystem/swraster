@@ -1,5 +1,5 @@
-// render_loop.zig — the per-frame loop body, animation reset, T&L globals merge,
-// and the --threadperf harness. Mirrors render_loop.h + render_loop.cpp.
+// render_loop — per-frame loop body, animation reset, T&L globals merge, and
+// the --threadperf harness.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -19,7 +19,7 @@ const renderer_context = @import("renderer_context.zig");
 const jolt = @import("jolt.zig");
 const merge = @import("merge.zig");
 
-// std.c does not export fflush in 0.16; declare the libc symbol directly.
+// std.c omits fflush in 0.16.
 extern "c" fn fflush(stream: ?*std.c.FILE) c_int;
 
 const Vec3 = la.Vec3;
@@ -105,8 +105,7 @@ fn resetAnimation(ctx: *RendererContext, sim_time: *f32, frame_num: *i32, last_p
 }
 
 var merge_warned = false;
-// mergeTlGlobals runs single-threaded (the render loop), so one reusable
-// scratch for the O(n) two-run merges is enough and avoids per-frame allocs.
+// mergeTlGlobals is single-threaded, so one reusable merge scratch suffices.
 var g_merge_scratch: RenderTriangleList = .empty;
 
 fn appendLimited(dst: *RenderTriangleList, dst_count: *usize, src: []const RenderTriangle, dropped: *usize, keep_sorted: bool, scratch: *RenderTriangleList, comptime less: fn (void, RenderTriangle, RenderTriangle) bool) void {
@@ -116,10 +115,7 @@ fn appendLimited(dst: *RenderTriangleList, dst_count: *usize, src: []const Rende
     @memcpy(dst.items[mid..][0..write_count], src[0..write_count]);
     dst_count.* += write_count;
     if (keep_sorted and write_count > 0 and mid > 0) {
-        // C++ std::inplace_merge: both runs are already sorted, so a single
-        // O(n) merge suffices. Re-sorting the whole concatenation here (esp.
-        // with the stable block sort, which also stack-allocs ~240 KB) was a
-        // major source of the Zig slowdown.
+        // Both runs already sorted: single O(n) merge, not a re-sort.
         merge.mergeSortedRuns(RenderTriangle, dst.items[0..dst_count.*], mid, scratch, {}, less);
     }
     dropped.* += src.len - write_count;
@@ -267,7 +263,6 @@ fn threadperfWritePartialAtExit(ctx: *RendererContext) void {
     tp.log = null;
 }
 
-// File-scope state replacing C++ static locals.
 var last_aspect: f32 = 0.0;
 var ll_projection: Mat4 = Mat4.identity();
 

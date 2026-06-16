@@ -1,8 +1,5 @@
-//! jolt.rs — Rust bindings to Jolt Physics via the `joltc` C wrapper (the same
-//! wrapper the C++/Zig ports link). build.rs compiles joltc.cpp + physics_setup.cpp
-//! and links the prebuilt libJolt.a. Quaternion helpers Jolt exposes as static
-//! methods (sEulerAngles / sRotation / rotate) are reimplemented here so they
-//! need no round-trip through the C boundary.
+//! Rust bindings to Jolt Physics via the `joltc` C wrapper. Quaternion helpers
+//! are reimplemented here to avoid a round-trip through the C boundary.
 
 use std::os::raw::c_int;
 

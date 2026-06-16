@@ -1,4 +1,4 @@
-// fps.odin — on-screen FPS indicator. Mirrors fps.h (header-only POD).
+// fps.odin — on-screen FPS indicator.
 
 package main
 
@@ -14,7 +14,7 @@ fps_counter_start :: proc(self: ^Fps_Counter, now_ms: u64) {
 	self.fps = 0
 }
 
-// Returns true if the displayed FPS value rolled over this call.
+// Returns true on the 1Hz rollover when fps was refreshed.
 fps_counter_tick :: proc(self: ^Fps_Counter, now_ms: u64) -> bool {
 	self.frame_count += 1
 	if now_ms - self.last_fps_time >= 1000 {

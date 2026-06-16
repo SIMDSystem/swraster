@@ -1,12 +1,7 @@
 #pragma once
-// Thin portable platform layer. The renderer talks to this header only. No
-// third-party windowing dependency: we own the pixel format + framebuffer
-// surface types outright, and each backend (macOS Cocoa, web <canvas>) fills
-// an RGBA8 buffer we hand to the renderer and blits it in Present().
-//
-// PixelFormat is a self-describing channel layout (masks/shifts/loss) so the
-// rasterizer's pack/unpack stay backend-agnostic — a backend picks whatever
-// byte order its present path wants and the renderer just follows the masks.
+// Portable platform layer (no third-party windowing). Each backend (macOS
+// Cocoa, web <canvas>) fills an RGBA8 framebuffer and blits it in Present().
+// PixelFormat carries masks/shifts/loss so pack/unpack stay backend-agnostic.
 
 #include <cstdint>
 
@@ -36,11 +31,11 @@ struct Event {
     enum Type {
         None,
         Quit,
-        KeyDown,           // key field carries the ASCII code ('space' for now)
-        MouseButton,       // button = 1 for left; pressed = true/false
-        MouseMotion,       // xrel/yrel deltas
+        KeyDown,           // key = ASCII code
+        MouseButton,       // button = 1 for left
+        MouseMotion,       // xrel/yrel
         MouseWheel,        // wheel_y
-        VisibilityChanged  // visible flag
+        VisibilityChanged  // visible
     } type = None;
     int  key      = 0;
     int  button   = 0;
@@ -54,8 +49,7 @@ struct Event {
 bool Init(int w, int h, const char* title);
 void Shutdown();
 
-// The renderer's RGBA8 framebuffer surface. We own this buffer on every
-// backend; Present() blits it to the platform's window/canvas.
+// The renderer's RGBA8 framebuffer; Present() blits it to the window/canvas.
 Surface* GetFramebuffer();
 void     Present();
 
@@ -65,10 +59,7 @@ bool PollEvent(Event& out);
 Uint64 TicksMs();
 Uint64 PerfCounter();
 Uint64 PerfFrequency();
-// Calling-thread CPU time in nanoseconds (user+sys). Used by the profiler
-// to subtract out time the kernel scheduled the thread off-core, so an
-// interval that looks "busy" in wall time but was actually preempted is
-// drawn shorter than its wall duration.
+// Calling-thread CPU time (ns, user+sys); excludes time preempted off-core.
 Uint64 ThreadCpuNs();
 void   Delay(Uint32 ms);
 

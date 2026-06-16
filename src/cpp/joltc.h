@@ -1,11 +1,5 @@
-// joltc.h — thin C ABI over Jolt Physics.
-//
-// Jolt is a C++ library with no C ABI of its own. The Zig port (jolt.zig) binds
-// to exactly the surface declared here; joltc.cpp implements it on top of the
-// vendored third_party/JoltPhysics, reusing the layer/filter/callback scaffolding
-// in physics_setup.{h,cpp}. The struct layouts below mirror jolt.zig's extern
-// structs (homogeneous float aggregates), so they pass by value across the
-// Zig <-> C boundary with the platform C ABI.
+// Thin C ABI over Jolt Physics. The struct layouts are homogeneous float
+// aggregates so they pass by value across the C boundary with the platform ABI.
 
 #ifndef SWRASTER_JOLTC_H
 #define SWRASTER_JOLTC_H

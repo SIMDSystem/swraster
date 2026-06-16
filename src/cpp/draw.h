@@ -1,8 +1,6 @@
 #pragma once
-// Color-buffer rasterizer + the secondary passes that share its strip-clipped
-// dispatch model (spotlight cone, SSAO, luminaire). The hot inner loops are
-// in draw.cpp; this header just exposes the entry points and the precomputed
-// per-triangle setup used by the rasterizer.
+// Color-buffer rasterizer plus the secondary passes (spotlight cone, SSAO,
+// luminaire) that share its strip-clipped dispatch.
 
 #include <atomic>
 
@@ -12,10 +10,9 @@
 #include "texture.h"
 #include "clip.h"
 
-struct LuminaireConeBuffer; // defined in render_buffers.h, used by pointer here
+struct LuminaireConeBuffer;
 
-// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
-// comparison against the 4-wide quad path.
+// Q-key A/B toggle: force the scalar path instead of the 4-wide quad path.
 extern std::atomic<bool> g_quad_path_enabled;
 
 enum class TriangleShader {
@@ -24,22 +21,16 @@ enum class TriangleShader {
     LuminaireCone
 };
 
-// Precomputed per-triangle screen-space + interpolant constants. The rasterizer
-// can rebuild this on the fly, but we precompute it once on the T&L thread so
-// the raster threads avoid the redundant work when the same triangle ends up
-// in multiple bins.
+// Precomputed per-triangle screen-space + interpolant constants, built once on
+// the T&L thread so raster threads don't redo it per bin.
 struct RasterTriangleSetup {
     bool valid = false;
     int  x_min = 0, x_max = -1, y_min = 0, y_max = -1;
     float area = 0.0f;
     float A0 = 0.0f, B0 = 0.0f, A1 = 0.0f, B1 = 0.0f, A2 = 0.0f, B2 = 0.0f;
-    // Edge functions evaluated once at a single shared origin (pixel-center of
-    // pixel (0,0)): w_i(x,y) = A_i*x + B_i*y + K_i. Every tile seeds its row
-    // accumulator from these common constants plus the integer tile origin, so
-    // the edge value at a given pixel is independent of which tile drew it.
-    // This avoids folding the (possibly huge, near-hither) vertex coordinate
-    // into a per-tile subtraction, which rounded differently per tile and
-    // cracked shared edges (e.g. the ground quad) near the near plane.
+    // Edge constants at a shared origin: w_i = A_i*x + B_i*y + K_i. Tile-origin
+    // seeding makes a pixel's edge value tile-independent; folding the vertex
+    // coordinate per-tile instead rounded differently and cracked shared edges.
     float K0 = 0.0f, K1 = 0.0f, K2 = 0.0f;
     float u0_w  = 0.0f, u1_w  = 0.0f, u2_w  = 0.0f;
     float v0_w  = 0.0f, v1_w  = 0.0f, v2_w  = 0.0f;
@@ -64,13 +55,8 @@ RasterTriangleSetup build_raster_triangle_setup(const VertexVaryings& v0,
 // Single-pixel utility used by debug overlays.
 void draw_pixel(uint8_t* pixels, int pitch, int x, int y, uint32_t color, int w, int h);
 
-// Liang-Barsky parametric clip of a 2D line segment p0->p1 against an inclusive
-// axis-aligned rect [xmin, xmax] x [ymin, ymax]. On success, t_a/t_b are the
-// parametric endpoints in [0,1] of the portion of the segment inside the rect;
-// returns false if the segment is entirely outside. The caller uses t_a/t_b to
-// re-interpolate per-vertex attributes (linear for screen-space z, perspective-
-// correct for inv_w-weighted eye-space attributes) before rasterizing the
-// clipped segment.
+// Liang-Barsky clip of segment p0->p1 against inclusive rect. On success t_a/t_b
+// are the in-rect parametric endpoints in [0,1]; false if fully outside.
 static inline bool clip_line_to_rect(float x0, float y0, float x1, float y1,
                                      float xmin, float ymin, float xmax, float ymax,
                                      float& t_a, float& t_b) {
@@ -98,10 +84,7 @@ static inline bool clip_line_to_rect(float x0, float y0, float x1, float y1,
     return true;
 }
 
-// Depth-tested line drawers (Bresenham) used for the wireframe overlays and
-// for the line-style spotlight ray fallback. Each pre-clips its segment to its
-// drawable rect (screen for these RGB drawers, per-tile rect for the shadow
-// strip drawer in shadow.cpp) so the Bresenham loop only walks visible pixels.
+// Depth-tested Bresenham line drawers; each pre-clips to its drawable rect.
 void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
                      int x0, int y0, float z0, int x1, int y1, float z1,
                      uint32_t color, int w, int h);
@@ -118,15 +101,14 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                                   bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                   const Eigen::Matrix4f& shadow_matrix);
 
-// Soft additive disk for the spotlight bulb. Depth-tested but not depth-writing.
+// Soft additive disk for the spotlight bulb; depth-tested, not depth-writing.
 void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
                               int screen_width, int screen_height, PixelFormat* format,
                               const Eigen::Matrix4f& projection,
                               const Eigen::Vector3f& light_pos);
 
-// The big one. Strip-clipped barycentric rasterizer with perspective-correct
-// interpolation, optional Phong shading, shadow PCF, and a few alternate
-// shaders selected via TriangleShader.
+// Strip-clipped barycentric rasterizer: perspective-correct interpolation,
+// optional Phong + shadow PCF, alternate shaders via TriangleShader.
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                      float* normal_buffer, float* linear_z,
                                      int screen_width, int screen_height,
@@ -143,13 +125,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                                      TriangleShader shader = TriangleShader::Lit,
                                      const RasterTriangleSetup* precomputed_setup = nullptr);
 
-// T&L for the spotlight luminaire cone fan. Computes LUMINAIRE_CONE_SEGMENTS
-// triangles' worth of post-projection VertexVaryings (apex + two rim
-// vertices each, perspective-correct shading inputs filled in) into
-// `out.tris`. Sets `out.valid = false` if the spotlight is disabled or
-// no cone vertex was projectable; otherwise sets `valid = true`. Runs once
-// per frame on a single T&L worker — the result is consumed by every
-// raster tile in the Luminaire pass.
+// T&L for the spotlight luminaire cone fan into `out.tris`; `out.valid` is set
+// false if no cone vertex was projectable. Runs once per frame on one T&L worker.
 void build_luminaire_cone_tl(LuminaireConeBuffer& out,
                              const Eigen::Matrix4f& projection,
                              const Eigen::Vector3f& light_pos,
@@ -157,11 +134,8 @@ void build_luminaire_cone_tl(LuminaireConeBuffer& out,
                              float spot_outer_cos,
                              int screen_width, int screen_height);
 
-// Volumetric cone (depth-tested additive) drawn into the color buffer.
-// Consumes the pre-T&L'd cone fan in `cone` (see build_luminaire_cone_tl)
-// and rasterizes the cone triangles clipped to the tile rect. The light
-// position / direction / cone angle are still needed by the per-pixel
-// LuminaireCone shader for the rim falloff.
+// Volumetric cone (depth-tested additive); rasterizes the pre-T&L'd fan clipped
+// to the tile rect. Light pos/dir/angle feed the per-pixel rim falloff.
 void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                int screen_width, int screen_height, PixelFormat* format,
                                const LuminaireConeBuffer& cone,
@@ -170,13 +144,9 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                int x_tile_min, int x_tile_max,
                                int y_strip_min, int y_strip_max);
 
-// Screen-space ambient occlusion modulated multiplicatively over the color
-// buffer using the live depth buffer as input. frame_index drives temporal
-// jitter of the sample kernel. The four projection coefficients (proj(0,0),
-// proj(1,1), proj(2,2), proj(2,3)) are taken from the *actual* camera
-// projection so the NDC-z -> linear-eye-depth inversion and the eye-space
-// position reconstruction are exact (perspective-correct) rather than
-// re-derived from hardcoded FOV/near/far that could drift out of sync.
+// Screen-space ambient occlusion, multiplied over the color buffer. frame_index
+// drives temporal jitter. proj00/proj11 come from the live camera projection so
+// eye-space reconstruction stays exact rather than re-derived from FOV/near/far.
 void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
                       const float* normal_buffer,
                       int screen_width, int screen_height, PixelFormat* format,

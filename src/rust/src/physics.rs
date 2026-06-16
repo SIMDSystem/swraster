@@ -1,8 +1,5 @@
-//! physics.rs — physics pipeline over Jolt (joltc). Ported from
-//! physics_pipeline.zig. The C++/Zig run physics on a side thread double-buffered
-//! against the renderer; this Rust port steps it synchronously each frame (the
-//! same Jolt calls, same kinematic-wall tumbling and pose export), which is
-//! simpler and deterministic. A side thread can be layered on later.
+//! Physics pipeline over Jolt (joltc): kinematic-wall tumbling + pose export.
+//! Stepped synchronously each frame (concurrently with the worker pool's raster/T&L).
 
 use crate::jolt::{self, Quat, Vec3};
 use crate::render_buffers::{InstancePose, PoseSnapshot};
@@ -17,13 +14,8 @@ pub struct PhysicsPipeline {
     pub sequence: u64,
 }
 
-// The pipeline owns raw Jolt handles (not auto-Send). Send is needed because
-// the owning RenderState moves onto a spawned render-loop thread on the
-// emscripten build; physics itself always steps synchronously on whichever
-// thread calls RenderState::frame, so the handles are only ever used from one
-// thread at a time. The system/body-interface/allocator/job-system handles are
-// created once at startup and deliberately live for the program lifetime
-// (never destroyed), so no Drop ordering concerns apply.
+// SAFETY: raw Jolt handles, but step() only ever runs on the one thread calling
+// RenderState::frame (needed so RenderState can move to the emscripten render thread).
 unsafe impl Send for PhysicsPipeline {}
 
 impl PhysicsPipeline {
@@ -36,8 +28,7 @@ impl PhysicsPipeline {
         Self { system, body_interface, temp_allocator, job_system, sim_time: 0.0, sequence: 0 }
     }
 
-    /// Advance the simulation by `delta_time` and export instance poses into
-    /// `out_snapshot`. Mirrors physics_step_to_snapshot.
+    /// Advance the simulation and export instance poses into `out_snapshot`.
     pub fn step(
         &mut self,
         delta_time: f32,

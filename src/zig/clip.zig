@@ -1,5 +1,4 @@
-// clip.zig — vertex transform, near-plane clipping, screen-space projection,
-// and the matrix builders. Mirrors clip.h + clip.cpp.
+// clip — vertex transform, near-plane clipping, screen projection, matrix builders.
 
 const std = @import("std");
 const la = @import("linalg.zig");

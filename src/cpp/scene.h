@@ -1,13 +1,6 @@
 #pragma once
 
-// Scene description + builders.
-//
-// CubeInstance + InitialInstanceState are the per-object state that
-// physics, animation and rendering all share. The helpers below are the
-// one-shot scene-construction routines main() calls at startup: build
-// compound collision shapes, build the tumbling container, generate
-// ground geometry, populate the instance list, and snapshot the initial
-// physics state for animation reset.
+// Scene state structs and the one-shot construction routines main() calls at startup.
 
 #include <vector>
 #include <cstdint>
@@ -21,13 +14,12 @@
 #include "texture.h"
 
 namespace JPH { class BodyInterface; }
-struct PoseSnapshot; // defined in render_buffers.h
+struct PoseSnapshot;
 
-// Per-instance scene state. Pose (tx/ty/tz, qx/qy/qz/qw) is owned by the
-// physics producer thread and mirrored here each frame for the renderer.
+// Pose is owned by the physics thread and mirrored here each frame.
 struct CubeInstance {
     float tx, ty, tz;
-    float rot_speed_x, rot_speed_y, rot_speed_z; // legacy — physics drives rotation now
+    float rot_speed_x, rot_speed_y, rot_speed_z; // legacy; physics drives rotation
     float qx, qy, qz, qw;
     const PackedTexture* texture;
     int   type; // 0=Cube 1=Sphere 2=Torus 3=Teapot 4=SmallBall 5=Ground
@@ -36,8 +28,7 @@ struct CubeInstance {
     JPH::BodyID body_id;
 };
 
-// Snapshot of each instance's pose + velocity at scene start so animation
-// reset (e.g. between --threadperf variants) can rewind physics state.
+// Pose + velocity at scene start, for animation reset between --threadperf variants.
 struct InitialInstanceState {
     float tx, ty, tz;
     float qx, qy, qz, qw;
@@ -65,8 +56,8 @@ JPH::ShapeRefC build_torus_compound_shape(float major_radius, float minor_radius
 
 JPH::ShapeRefC build_teapot_compound_shape(float scale, int tess);
 
-// Populate `instances` (reserved by caller) with 40 main objects + 400 small
-// balls + 1 ground. Bodies are created and added to the physics world.
+// Populate `instances` with 40 main objects + 400 small balls + 1 ground,
+// creating and adding their physics bodies.
 void populate_scene_instances(JPH::BodyInterface& body_interface,
                               const PackedTexture* tex_main_cube,
                               const PackedTexture* tex_main_sphere,
@@ -82,7 +73,7 @@ std::vector<InitialInstanceState>
 capture_initial_instance_states(const std::vector<CubeInstance>& instances,
                                 JPH::BodyInterface& body_interface);
 
-// Copy live instance poses into the snapshot slot; called by physics worker.
+// Copy live instance poses into the snapshot slot.
 void write_instance_pose_snapshot(PoseSnapshot& snapshot,
                                   const std::vector<CubeInstance>& instances,
                                   float snapshot_time, uint64_t sequence);

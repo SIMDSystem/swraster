@@ -49,27 +49,21 @@ int NUM_TILE_BINS;
 void init_thread_counts() {
     int hw = (int)std::thread::hardware_concurrency();
     if (hw < 2) hw = 2;
-    // One unified pool. NUM_RASTER_THREADS is the *capacity* (how many threads
-    // we launch, hard-capped at 20); g_active_workers is how many actually run
-    // each frame (live, -/=). g_tl_workers is how many of those prefer T&L
-    // (live, [/]). We launch headroom above the core count so '=' can push past
-    // hardware concurrency, but start active at the core count with every active
-    // worker T&L-preferred. Per-worker T&L scratch, the globals merge, and the
-    // profiler lanes all size off the capacity, so every thread that can ever
-    // run is captured. DEFAULT_RASTER_THREADS / DEFAULT_TL_THREADS are unused
-    // now (kept for the --threadperf sweep, which overrides these per variant).
+    // NUM_RASTER_THREADS is the launched capacity (capped at 20, with headroom
+    // above core count so '=' can oversubscribe); g_active_workers/g_tl_workers
+    // are the live-adjustable active and T&L-preferred counts. All scratch sizes
+    // off capacity. DEFAULT_*_THREADS survive only for the --threadperf sweep.
     constexpr int POOL_CAPACITY_MAX = 20;
     int cap = 2 * hw;
     if (cap > POOL_CAPACITY_MAX) cap = POOL_CAPACITY_MAX;
-    NUM_RASTER_THREADS = cap;                              // launched capacity ceiling
-    NUM_TL_THREADS     = NUM_RASTER_THREADS;              // sizing: capacity covers all
+    NUM_RASTER_THREADS = cap;
+    NUM_TL_THREADS     = NUM_RASTER_THREADS;
     int start_active = 16 < cap ? 16 : cap;
-    g_active_workers.store(start_active, std::memory_order_relaxed); // start at 16/16
-    g_tl_workers.store(start_active, std::memory_order_relaxed);     // all active prefer T&L initially
+    g_active_workers.store(start_active, std::memory_order_relaxed);
+    g_tl_workers.store(start_active, std::memory_order_relaxed);
     NUM_STRIPS         = 16;
     NUM_TILE_BINS      = NUM_STRIPS * TILE_X_SPLITS;
-    // One lock per tile bin for the scatter-merge (vector move-assign works
-    // even though std::mutex isn't movable — it only transfers the buffer).
+    // vector move-assign is fine for non-movable std::mutex: it transfers the buffer.
     tile_bin_locks = std::vector<std::mutex>(NUM_TILE_BINS);
 }
 

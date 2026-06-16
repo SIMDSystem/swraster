@@ -1,8 +1,7 @@
-//! draw.rs — color-buffer rasterizer + spotlight cone / luminaire / SSAO passes.
-//! Ported from draw.zig / draw.{h,cpp}. The hot triangle inner loop is kept flat
-//! for the optimizer, as in the C++/Zig. Shared framebuffer/G-buffer access uses
-//! raw pointers (pitch is in u32 elements): raster workers write disjoint tiles
-//! of the same buffers concurrently, exactly like the originals.
+//! Color-buffer rasterizer + spotlight cone / luminaire / SSAO passes. The hot
+//! triangle inner loop is kept flat for the optimizer. Shared framebuffer/G-buffer
+//! access uses raw pointers (pitch in u32 elements): raster workers write disjoint
+//! tiles concurrently.
 
 use crate::clip::{self, VertexVaryings};
 use crate::linalg::{Mat4, Vec3, Vec4};
@@ -209,9 +208,8 @@ impl F32x4 {
             Self(f32x4_abs(self.0))
         }
     }
-    // pmin/pmax (compare+select semantics) instead of f32x4.min/max: the
-    // NaN-correct forms expand to ~10 instructions on x86 hosts, while pmin
-    // is a single minps (and a 2-op select on ARM). Our lanes are never NaN.
+    // pmin/pmax, not NaN-correct min/max: the NaN-correct forms expand to ~10
+    // instructions on x86 hosts vs a single minps. Our lanes are never NaN.
     #[inline(always)]
     unsafe fn min(self, rhs: Self) -> Self {
         unsafe {
@@ -320,8 +318,7 @@ unsafe fn interp3_attrs4(b0: f32, b1: f32, b2: f32, a0: [f32; 4], a1: [f32; 4], 
     }
 }
 
-/// a0*w0 + a1*w1 + a2*w2 as mul + 2 fused ops (the contraction Zig's
-/// fast-math float mode performs implicitly; Rust is strict-IEEE).
+/// a0*w0 + a1*w1 + a2*w2 as mul + 2 fused ops (explicit; Rust is strict-IEEE).
 #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
 #[inline(always)]
 unsafe fn interp3v(a0: f32, w0: F32x4, a1: f32, w1: F32x4, a2: f32, w2: F32x4) -> F32x4 {
@@ -1359,9 +1356,8 @@ pub unsafe fn draw_triangle_barycentric_strip(
 
             let mut x = x_min;
             while x <= x_max {
-                // 4-wide maskless quad fast path: same policy as Zig's @Vector path.
-                // Take it only when all four lanes are covered and all four pass
-                // depth, so no write mask is needed; otherwise fall through scalar.
+                // 4-wide maskless quad fast path: taken only when all four lanes
+                // are covered and pass depth (no write mask); else fall through scalar.
                 if quad_enabled && shader == TriangleShader::Lit && x + 3 <= x_max {
                     #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
                     {
@@ -1754,10 +1750,8 @@ pub unsafe fn draw_spotlight_cone_strip(
 
 const KERNEL_SIZE: usize = 8;
 
-// The 8-tap probe kernel: the exact f32 output of the original runtime
-// xorshift(0x9e3779b9) builder, baked as constants so LLVM can fold them and
-// no OnceLock acquire sits in front of every access. Laid out as two 4-lane
-// groups for the 4-wide tap loop.
+// 8-tap probe kernel, baked as constants (was a runtime xorshift builder) so
+// LLVM folds them and no per-access acquire is needed. Two 4-lane groups.
 const SSAO_KERNEL_X: [f32; KERNEL_SIZE] = [
     -0.0683465824, 0.00404883549, -0.0776575431, -0.210358173,
     0.210788339, 0.4452205, 0.272752583, -0.395155162,
@@ -1870,9 +1864,7 @@ pub unsafe fn apply_ssao_strip(
                     radius = max_world;
                 }
 
-                // 4-wide masked tap loop: two groups of four independent probes.
-                // All arithmetic runs branchless under lane masks; the only scalar
-                // step is the depth gather (four indexed loads).
+                // 4-wide masked tap loop; only the depth gather is scalar.
                 let mut occlusion = 0.0f32;
                 #[cfg(any(target_arch = "aarch64", target_arch = "wasm32"))]
                 {

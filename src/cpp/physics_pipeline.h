@@ -1,17 +1,8 @@
 #pragma once
 
-// Async physics producer pipeline.
-//
-// The physics worker thread sleeps on `cv` until main arms + triggers a
-// job (physics_arm_after_tl / physics_trigger_after_tl). Each step
-// writes its result into the *opposite* slot of a 2-slot pose ring;
-// concurrently, T&L for the current frame reads from the slot that
-// physics last published. The two never touch the same slot at the
-// same time, so physics is free to run in parallel with T&L instead of
-// being gated on T&L completion.
-//
-// Everything in here is plain data + free functions. Lifetime: stack-
-// allocate one PhysicsPipeline in main() before spawning the worker.
+// Async physics producer. The worker writes the opposite slot of a 2-slot pose
+// ring while T&L reads the published slot, so physics runs parallel to T&L.
+// Stack-allocate one PhysicsPipeline in main() before spawning the worker.
 
 #include <atomic>
 #include <condition_variable>
@@ -43,11 +34,7 @@ struct PhysicsPipeline {
     const std::vector<WallData>*  walls          = nullptr;
     ThreadProfiler*               profiler       = nullptr;
 
-    // Two-slot pose ring + publication. The physics worker writes to
-    // slot `1 - published_snapshot` while T&L reads slot
-    // `published_snapshot`; the producer flips the atomic once the
-    // write is committed. No copy back to instances — T&L reads the
-    // ring directly via TLSharedData::pose_snapshot.
+    // Two-slot pose ring. T&L reads it directly via TLSharedData::pose_snapshot.
     PoseSnapshot          pose_snapshots[2];
     std::atomic<int>      published_snapshot{0};
     std::atomic<uint64_t> published_sequence{0};
@@ -75,33 +62,24 @@ struct PhysicsPipeline {
 // Block main until the producer is idle (no job pending, no job active).
 void physics_wait_for_idle(PhysicsPipeline& pp);
 
-// Return the current read-slot's sim_time. T&L reads the ring directly
-// via TLSharedData::pose_snapshot so there is no per-instance copy.
+// Current read-slot's sim_time.
 float physics_current_sim_time(const PhysicsPipeline& pp);
 
-// Arm the next physics step. Caller must follow with physics_trigger_after_tl
-// to wake the worker.
+// Arm the next step; follow with physics_trigger_after_tl to wake the worker.
 void physics_arm_after_tl(PhysicsPipeline& pp, float delta_time, float target_time);
 
-// Wake the physics worker. Safe to call from main as soon as the T&L kick
-// has been issued — physics writes the opposite slot of the pose ring, so
-// it does not conflict with T&L reading the published slot.
+// Wake the worker. Safe right after the T&L kick: physics writes the opposite slot.
 void physics_trigger_after_tl(PhysicsPipeline& pp);
 
-// Synchronous physics step + pose capture into out_snapshot. Used by the
-// physics worker; also exposed for the initial snapshot warmup.
+// Synchronous step + pose capture; also used for the initial snapshot warmup.
 void physics_step_to_snapshot(PhysicsPipeline& pp,
                               float delta_time, float target_time,
                               uint64_t sequence, PoseSnapshot& out_snapshot);
 
-// Reset all pipeline state to "no animation in flight". Called from the
-// renderer's reset_animation path between --threadperf variants. Caller
-// must not hold pp.mtx.
+// Reset to "no animation in flight" (between --threadperf variants). Caller must not hold pp.mtx.
 void physics_reset_pipeline_state(PhysicsPipeline& pp);
 
-// Thread entry point. Runs until pp.thread_running becomes false and no
-// pending job remains.
 void physics_worker_thread(PhysicsPipeline& pp);
 
-// Cleanly stop the producer thread. Caller must call thread.join() after.
+// Stop the producer thread; caller must thread.join() after.
 void physics_request_shutdown(PhysicsPipeline& pp);

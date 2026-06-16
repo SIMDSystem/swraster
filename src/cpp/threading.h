@@ -1,13 +1,8 @@
 #pragma once
 
-// Renderer threading scaffolding.
-//
-// Two worker pools (T&L and raster) are launched once and kept alive for the
-// lifetime of the process. Main wakes them by bumping frame_*_target and
-// notifying the matching condvar; workers signal completion by atomically
-// counting down a done counter and waking cv_main. The scheme is intentionally
-// flat (no job system) because the dispatch surface is small and predictable
-// and we want straight-line code paths for the rasterizer hot loop.
+// Renderer threading scaffolding. One persistent worker pool, woken per frame
+// by bumping frame_pool_target; workers count down a done counter and wake
+// cv_main. Flat by design (no job system) for predictable hot-loop dispatch.
 
 #include <atomic>
 #include <mutex>
@@ -19,21 +14,13 @@
 #include <vector>
 
 #include "platform.h"
-#include "render_config.h"  // TILE_X_SPLITS, NUM_STRIPS
+#include "render_config.h"
 
 // ---------------------------------------------------------------------------
 // Unified worker pool
 // ---------------------------------------------------------------------------
-// One homogeneous pool replaces the old split T&L / raster pools. Sizing the
-// pool to (roughly) hardware concurrency removes the oversubscription that
-// made the old design fight the OS scheduler. Each frame, main publishes a
-// work plan and wakes every worker once. Workers self-orchestrate via a
-// userspace policy (no OS priority games): worker ids [0, K) are "T&L
-// preferred" — they run the frame's T&L (per-instance + bin merge) first,
-// then fall through to help raster; the remaining workers go straight to
-// raster. Both then drain the previous frame's raster passes from a shared
-// pass state machine, so a T&L worker that finishes hands its core to raster
-// instead of idling. K = active_tl_job_thread_count.
+// Worker ids [0, K) prefer T&L (run this frame's T&L first, then help raster);
+// the rest go straight to raster. K = active_tl_job_thread_count.
 extern std::atomic<bool>      pool_threads_running;
 extern std::mutex             mtx_pool;
 extern std::condition_variable cv_pool;
@@ -45,40 +32,26 @@ extern int active_raster_job_thread_count; // active pool size this frame
 extern int active_raster_buf_id;           // buffer slot the pool rasters this frame
 extern bool pool_do_raster;                // false on the first frame (nothing to raster yet)
 
-// Runtime-adjustable active worker count. The pool is *launched* with
-// NUM_RASTER_THREADS threads (the capacity ceiling), but only the first
-// g_active_workers of them participate each frame; the rest sit the frame out.
-// Starts at the core count and is nudged live with -/= (clamped to
-// [1, NUM_RASTER_THREADS]). Read once per frame by the render loop, so changes
-// take effect cleanly at the next frame boundary.
+// Active worker count: only the first g_active_workers of the launched pool run
+// each frame. Live -/= (clamped [1, NUM_RASTER_THREADS]); read once per frame.
 extern std::atomic<int> g_active_workers;
 
-// Runtime-adjustable T&L-preferred worker count (K). Of the g_active_workers
-// running a frame, the first K run this frame's T&L before falling through to
-// raster; the rest go straight to raster. Adjusted live with [ / ] (clamped to
-// [1, NUM_RASTER_THREADS]); the effective K is min(g_tl_workers, active). Read
-// once per frame by the render loop.
+// T&L-preferred worker count K; effective K = min(g_tl_workers, active).
+// Live [ / ] (clamped [1, NUM_RASTER_THREADS]); read once per frame.
 extern std::atomic<int> g_tl_workers;
 
 enum class RasterJobMode { ShadowDepth = 0, Color = 1, Ssao = 2, Luminaire = 3 };
 constexpr int RASTER_PASS_COUNT = 4;
 
-// Raster pass state machine, driven entirely inside the pool. raster_pass is
-// the index of the pass currently claimable (0..3); RASTER_PASS_COUNT means
-// all passes are done. A pass is gated on the previous one fully draining
-// (shadow depth must complete before color samples the shadow map; SSAO sits
-// between color and the spotlight luminaire). The worker that completes the
-// last tile of a pass advances raster_pass and wakes anyone blocked waiting
-// for the next pass.
+// Raster pass state machine. raster_pass is the claimable pass (0..3;
+// RASTER_PASS_COUNT = all done); each pass gates on the previous fully draining.
+// The worker finishing a pass's last tile advances it and wakes waiters.
 extern std::atomic<int> raster_pass;
 extern std::atomic<int> raster_pass_tiles_done[RASTER_PASS_COUNT];
 
-// Hard pass-barrier toggle (the 'b' key). When false (default) the raster pipe
-// runs opportunistically: SSAO overlaps the Color pass (each tile pulls its own
-// SSAO once its 8 neighbors' Color tiles are done) and Luminaire overlaps SSAO
-// (each completed SSAO tile runs its own two cone tiles). When true, every pass
-// drains fully before the next begins — SSAO runs only in the SSAO pass and
-// Luminaire only in the Luminaire pass — for clean, strictly-ordered profiling.
+// 'b' key: when false (default) passes overlap opportunistically (SSAO into
+// Color's tail, Luminaire into SSAO's); when true each pass drains fully before
+// the next, for strictly-ordered profiling.
 extern std::atomic<bool> raster_hard_barrier;
 
 // ---------------------------------------------------------------------------
@@ -89,65 +62,35 @@ extern std::condition_variable cv_main;
 
 extern std::atomic<int> tl_done_counter;        // T&L-preferred workers done with T&L
 
-// Per-tile bin locks for the scatter-merge. As soon as a T&L worker finishes
-// its own per-instance sweep + local sort, it merges its sorted local bins
-// directly into the published slot under the matching tile lock — so a fast
-// worker's merge (dark blue) overlaps a slower worker's transform (cyan), with
-// no phase barrier between them. main clears the target slot before the kick
-// (the pool is asleep then), so workers only ever append. One lock per tile;
-// sized to NUM_TILE_BINS in init_thread_counts().
+// Per-tile bin locks for the scatter-merge: a worker merges its sorted local
+// bins into the published slot under the matching lock, overlapping other
+// workers' transforms. Main clears the slot pre-kick so workers only append.
 extern std::vector<std::mutex> tile_bin_locks;
 
-// Per-(pass,row) dynamic claim counters. Each row's counter walks
-// 0..TILE_X_SPLITS; when it reaches TILE_X_SPLITS the row is exhausted.
-// Workers stay sticky on a row until it's drained, then advance, keeping a
-// core's framebuffer / depth / shadow scanlines hot in L1/L2. Indexed by pass
-// so advancing a pass never has to reset a counter another worker might be
-// mid-fetch_add on — every pass owns its own row counters, all zeroed once at
-// frame setup. Sized to a fixed upper bound (no heap).
-// MAX_RASTER_STRIPS must be >= 2 * NUM_STRIPS because the Luminaire pass
-// doubles the strip count for finer-grain work stealing.
+// Per-(pass,row) claim counters walking 0..TILE_X_SPLITS. Workers stay sticky
+// on a row to keep scanlines hot in L1/L2. Per-pass so advancing a pass never
+// resets a counter another worker is mid-fetch_add on.
+// MAX_RASTER_STRIPS must be >= 2*NUM_STRIPS (Luminaire doubles the strip count).
 constexpr int MAX_RASTER_STRIPS = 96;
 extern std::atomic<int> raster_row_next_col[RASTER_PASS_COUNT][MAX_RASTER_STRIPS];
 
 // ---------------------------------------------------------------------------
-// Color/SSAO overlap
+// Color/SSAO/Luminaire overlap
 // ---------------------------------------------------------------------------
-// SSAO no longer waits on a hard barrier after the whole Color pass. Color and
-// SSAO share the same TILE_X_SPLITS x NUM_STRIPS tile grid, and an SSAO pixel
-// reads the depth buffer no further than one tile away, so an SSAO tile is
-// safe to run as soon as its own Color tile and its in-bounds 8-neighbor Color
-// tiles are finished (off-edge neighbors count as ready). Workers therefore
-// fold SSAO into the tail of the Color pass: each Color tile, on completion,
-// sets its color_tile_done flag and opportunistically runs any now-unblocked
-// SSAO tiles in its 3x3 neighborhood; idle workers drain any other eligible
-// SSAO tiles. ssao_tile_claimed arbitrates one worker per SSAO tile.
-// color_tile_done / ssao_tile_claimed are indexed [strip * TILE_X_SPLITS + col]
-// on the coarse NUM_STRIPS grid; reset each frame.
-//
-// The same cascade continues into the Luminaire pass: the spotlight cone stays
-// within its own tile (reads depth, writes only its tile's pixels, no depth
-// write), so a Luminaire tile may run as soon as *its* tile's SSAO is done —
-// no neighbor checks. Luminaire uses the finer 2*NUM_STRIPS grid; a fine tile
-// (col, fstrip) maps to coarse SSAO tile (col, fstrip>>1). ssao_tile_done gates
-// it; lum_tile_claimed arbitrates one worker per fine tile. So each completed
-// SSAO tile opportunistically launches the two Luminaire fine tiles above it.
-// Single-buffered, reset each frame before the raster kick. These gate the
-// single RGB framebuffer (rs.pixels / depth_buffer), which is written one frame
-// at a time — main waits for raster to finish before kicking the next frame, so
-// only one frame's raster is ever in flight. (Only the T&L triangle buffers are
-// double-buffered, so T&L of frame N can run concurrently with raster of N-1.)
+// An SSAO tile may run once its Color tile and its 8 Color neighbors are done
+// (SSAO reads depth at most one tile away), so SSAO folds into Color's tail;
+// ssao_tile_claimed arbitrates one worker per tile. A Luminaire fine tile (on
+// the 2*NUM_STRIPS grid) runs once its own SSAO tile is done — no neighbor
+// checks, since the cone stays within its tile. All single-buffered, reset each
+// frame: only one frame's raster is in flight (only T&L buffers are doubled).
 constexpr int MAX_RASTER_TILES = MAX_RASTER_STRIPS * TILE_X_SPLITS;
 extern std::atomic<uint8_t> color_tile_done[MAX_RASTER_TILES];
 extern std::atomic<uint8_t> ssao_tile_claimed[MAX_RASTER_TILES];
 extern std::atomic<uint8_t> ssao_tile_done[MAX_RASTER_TILES];   // coarse grid
 extern std::atomic<uint8_t> lum_tile_claimed[MAX_RASTER_TILES]; // fine grid
 
-// Wait for a predicate that worker threads will eventually set true. On native
-// we use a plain condition variable. On Emscripten's PROXY_TO_PTHREAD build,
-// main runs on a worker pthread whose futex implementation can occasionally
-// drop a wake (silently, with ASSERTIONS=0). To stay robust we mix a short
-// timed wait with a cheap predicate recheck.
+// On Emscripten PROXY_TO_PTHREAD, main's futex can silently drop a wake, so mix
+// a short timed wait with a predicate recheck; native uses a plain condvar.
 template <typename Predicate>
 static inline void wait_for_main_thread_predicate(Predicate&& predicate) {
 #ifndef __EMSCRIPTEN__

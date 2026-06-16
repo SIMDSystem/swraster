@@ -1,4 +1,4 @@
-// physics_pipeline.odin — async physics producer. Mirrors physics_pipeline.zig.
+// physics_pipeline.odin — async physics producer.
 
 package main
 

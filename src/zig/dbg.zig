@@ -1,11 +1,7 @@
-// dbg.zig — diagnostic print that is safe on every target.
+// dbg — target-safe diagnostic print.
 //
-// On native we just forward to std.debug.print. On emscripten we must NOT use
-// std.debug.print: it locks stderr through std.Options.debug_io, which in Zig
-// 0.16 resolves to std.Io.Threaded — and that backend (plus its panic/log/
-// page-allocator dependencies) does not compile for the multithreaded
-// wasm32-emscripten target. Routing through emscripten_console_log keeps the
-// renderer's logging intact and sends it to the browser console.
+// On emscripten, std.debug.print is unusable: Zig 0.16 routes it through
+// std.Io.Threaded, which doesn't compile for multithreaded wasm32-emscripten.
 
 const std = @import("std");
 const builtin = @import("builtin");

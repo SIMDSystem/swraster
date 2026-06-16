@@ -16,7 +16,7 @@
 #endif
 
 #include "platform.h"
-#include "threading.h" // perf_ms, process_cpu_ms
+#include "threading.h"
 #include "thread_profiler.h"
 
 using namespace JPH;
@@ -68,7 +68,7 @@ void physics_step_to_snapshot(PhysicsPipeline& pp,
     Uint64 sync_end     = phase_start;
     double cpu_start_ms = process_cpu_ms();
 
-    // Walls rotate as a kinematic group around the world origin.
+    // Walls rotate as a kinematic group around the origin.
     Quat box_rot = Quat::sEulerAngles(Vec3(target_time * 0.8f,
                                            target_time * 0.6f,
                                            target_time * 0.4f));
@@ -159,10 +159,8 @@ void physics_worker_thread(PhysicsPipeline& pp) {
             delta_time    = pp.job_delta;
             target_time   = pp.job_target_time;
             sequence      = pp.job_sequence;
-            // Ping-pong: write to the slot that is NOT currently published
-            // (and therefore not currently being read by T&L). The pair of
-            // atomics is consistent here because publication only happens
-            // from this worker thread, one step at a time.
+            // Write the unpublished slot (T&L reads the other one). Safe because
+            // only this thread publishes, one step at a time.
             snapshot_idx  = 1 - pp.published_snapshot.load(std::memory_order_acquire);
         }
 
@@ -176,8 +174,6 @@ void physics_worker_thread(PhysicsPipeline& pp) {
             profiler_record_physics(*pp.profiler, work_start_ts, Platform::PerfCounter(), cpu_ns);
         }
 
-        // Publish the slot we just wrote; T&L will pick it up on its next
-        // frame via TLSharedData::pose_snapshot.
         pp.published_snapshot.store(snapshot_idx, std::memory_order_release);
         pp.published_sequence.store(sequence,     std::memory_order_release);
         {

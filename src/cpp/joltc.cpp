@@ -1,9 +1,5 @@
-// joltc.cpp — implementation of the C ABI declared in joltc.h.
-//
-// A faithful, thin bridge between the Zig port's jph_* calls and the vendored
-// Jolt C++ API. The Jolt setup logic (layer interfaces, broad-phase filters,
-// trace/assert callbacks, Factory/Types lifetime) is reused verbatim from
-// physics_setup.{h,cpp}; this file only adapts call conventions and types.
+// C ABI bridge to the vendored Jolt C++ API; setup scaffolding lives in
+// physics_setup.{h,cpp}.
 
 #include "joltc.h"
 #include "physics_setup.h"
@@ -46,8 +42,8 @@ inline JPHQuat fromQuat(QuatArg q) { return JPHQuat{q.GetX(), q.GetY(), q.GetZ()
 inline BodyID toBodyID(JPHBodyID id) { return BodyID(id.id); }
 inline JPHBodyID fromBodyID(BodyID id) { return JPHBodyID{id.GetIndexAndSequenceNumber()}; }
 
-// Bundles the broad-phase/layer scaffolding with the system so they share its
-// lifetime (Jolt keeps references to them for the life of the PhysicsSystem).
+// Bundles the layer scaffolding with the system: Jolt holds references to them
+// for the system's whole lifetime.
 struct PhysicsSystemWrapper {
     BPLayerInterfaceImpl              broad_phase_layer_interface;
     ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
@@ -55,15 +51,13 @@ struct PhysicsSystemWrapper {
     PhysicsSystem                     system;
 };
 
-// Static compound builder handle.
 struct CompoundBuilderWrapper {
     StaticCompoundShapeSettings settings;
 };
 
 JoltScope *g_scope = nullptr;
 
-// Promote a freshly created shape to an owning reference and hand back a raw
-// pointer (the Zig side treats shapes as opaque, ref-counted handles).
+// AddRef a fresh shape and return it as an opaque, owning handle.
 void *own_shape(const Shape *shape) {
     if (shape == nullptr) return nullptr;
     shape->AddRef();

@@ -1,4 +1,4 @@
-// tl_worker.odin — T&L half of the unified pool. Mirrors tl_worker.h + tl_worker.cpp.
+// tl_worker.odin — T&L half of the unified pool.
 
 package main
 
@@ -429,6 +429,7 @@ tl_worker_frame :: proc(worker_id, active_tl_threads: i32, ctx: ^Renderer_Contex
 	profiler_record_tl(ctx.profiler, worker_id, phase2_start_ts, perf_counter(), phase2_cpu_ns, u8(TL_Job_Tag.BinMerge))
 
 	if sync.atomic_add_explicit(&tl_done_counter, 1, .Release) + 1 >= active_tl_threads {
+		// empty lock parks main if it saw the stale count before we signal (lost-wakeup guard).
 		mutex_lock(&mtx_main)
 		mutex_unlock(&mtx_main)
 		condition_signal(&cv_main)

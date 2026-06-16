@@ -1,5 +1,4 @@
-// render_loop.odin — the per-frame loop body, animation reset, T&L globals merge,
-// and the --threadperf harness. Mirrors render_loop.h + render_loop.cpp.
+// render_loop.odin — per-frame loop body, animation reset, T&L globals merge, --threadperf harness.
 
 package main
 
@@ -20,10 +19,8 @@ init_global_merge_scratch :: proc() {
 reset_animation :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame_num: ^i32, frame_sequence: ^i32, last_physics_time: ^u64) {
 	pp := ctx.physics
 	physics_wait_for_idle(pp)
-	// No pool drain here (mirrors Zig): both call sites already have the pool
-	// idle — at startup no frame has been published yet (waiting here deadlocks,
-	// pool_workers_done can never advance), and on variant advance the frame
-	// loop's wait_for_pool_workers_done has already completed.
+	// No pool drain: both callers already have the pool idle. At startup no frame
+	// is published yet, so waiting here would deadlock (pool_workers_done never advances).
 	sim_time^ = 0.0
 	frame_num^ = 1
 	frame_sequence^ = frame_num^
@@ -91,7 +88,7 @@ reset_animation :: proc(ctx: ^Renderer_Context, sim_time: ^f32, frame_num: ^i32,
 	}
 }
 
-// C++ vector.size()-style fixed slots: copy into dst[dst_count..], never append/realloc.
+// Fixed slots: copy into dst[dst_count..], never append/realloc.
 append_limited :: proc(
 	dst: ^Render_Triangle_List,
 	slot_cap: int,
@@ -757,8 +754,7 @@ run_render_loop :: proc(ctx: ^Renderer_Context) {
 		current_time := ticks_ms()
 		fps_counter_tick(ctx.fps_counter, current_time)
 
-		// Standard per-frame-loop reset of the default temp arena (tprintf
-		// label etc.); without it the arena grows for the process lifetime.
+		// Per-frame temp arena reset; without it the arena grows for the process lifetime.
 		free_all(context.temp_allocator)
 
 		if tp.enabled {

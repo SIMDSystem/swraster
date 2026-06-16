@@ -20,7 +20,7 @@ std::unique_ptr<PackedTexture> make_packed_texture(Surface* src) {
     if (!src || !src->pixels || !src->format) return nullptr;
     auto tex = std::make_unique<PackedTexture>();
 
-    // Unpack into a canonical 0x00RRGGBB layout regardless of the source surface format.
+    // Unpack to canonical 0x00RRGGBB regardless of source format.
     PackedTextureLevel source;
     source.w = src->w;
     source.h = src->h;
@@ -48,8 +48,7 @@ std::unique_ptr<PackedTexture> make_packed_texture(Surface* src) {
         }
     }
 
-    // Resample base to the largest power-of-two dims that fit; mip wrap then
-    // collapses to a bitwise AND in the sampler.
+    // Power-of-two base so mip wrap is a bitwise AND in the sampler.
     PackedTextureLevel base;
     base.w = is_power_of_two(source.w) ? source.w : previous_power_of_two(source.w);
     base.h = is_power_of_two(source.h) ? source.h : previous_power_of_two(source.h);

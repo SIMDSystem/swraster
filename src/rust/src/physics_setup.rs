@@ -1,7 +1,5 @@
-//! physics_setup.rs — Jolt scaffolding. Ported from physics_setup.zig. The
-//! broad-phase layer interface / filters live inside the joltc C wrapper (a
-//! 2-layer NON_MOVING/MOVING scheme that collides everything), so here we only
-//! expose the layer constants and the register/factory lifecycle.
+//! Jolt scaffolding: layer constants + register/factory lifecycle. The broad-phase
+//! layer interface and filters live inside the joltc C wrapper.
 
 use crate::jolt::{self, ObjectLayer};
 
@@ -27,9 +25,7 @@ impl JoltScope {
         JoltScope
     }
 
-    /// Create the factory and intentionally leak it for the program lifetime:
-    /// the Jolt factory must outlive every physics object, and this program
-    /// never tears physics down.
+    /// Leak the factory for the program lifetime: it must outlive every physics object.
     pub fn leak() {
         std::mem::forget(JoltScope::new());
     }

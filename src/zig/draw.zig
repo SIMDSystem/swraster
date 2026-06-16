@@ -1,6 +1,4 @@
-// draw.zig — color-buffer rasterizer + spotlight cone / luminaire / SSAO
-// passes. Mirrors draw.h + draw.cpp. The hot triangle inner loop is kept flat
-// for the optimizer, exactly as in the C++.
+// draw — color rasterizer + SSAO / spotlight / luminaire passes.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,10 +24,9 @@ const LuminaireConeBuffer = buffers.LuminaireConeBuffer;
 
 pub const TriangleShader = enum { Lit, DebugUnlitRed, LuminaireCone };
 
-// On wasm, @min/@max lower to f32x4.min/max — NaN-propagating forms that
-// expand to ~10 instructions on x86 hosts. The select form lowers to
-// pmin/pmax (single op). Our lanes are never NaN. Native is untouched
-// (@min/@max -> NEON fmin/fmax). Same policy as the Odin/Rust/C++ ports.
+// Deliberate optimization: on wasm @min/@max lower to NaN-propagating
+// f32x4.min/max (~10 ops); the select form lowers to single-op pmin/pmax. Our
+// lanes are never NaN. Native keeps @min/@max (NEON fmin/fmax).
 inline fn min4(a: @Vector(4, f32), b: @Vector(4, f32)) @Vector(4, f32) {
     if (comptime builtin.target.os.tag == .emscripten) {
         return @select(f32, a < b, a, b);
@@ -44,9 +41,7 @@ inline fn max4(a: @Vector(4, f32), b: @Vector(4, f32)) @Vector(4, f32) {
     return @max(a, b);
 }
 
-// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
-// comparison against the 4-wide quad path. Both paths still use SIMD linalg,
-// vectorized bilinear sampling, and FMA float-mode; this only gates the quad.
+// Q-key toggle to force the scalar path for A/B perf comparison vs the quad path.
 pub var g_quad_path_enabled = std.atomic.Value(bool).init(true);
 
 pub const RasterTriangleSetup = struct {
@@ -391,8 +386,7 @@ pub fn drawSpotlightLuminaire(pixels: [*]u8, pitch: i32, depth_buffer: [*]f32, s
     }
 }
 
-// Per-fragment inputs for the Lit shader, already interpolated. The quad path
-// fills these four lanes at a time with SIMD; the scalar path fills one.
+// Interpolated per-fragment inputs for the Lit shader.
 const LitFrag = struct {
     u: f32,
     v: f32,
@@ -435,9 +429,7 @@ const LitCtx = struct {
     perspective_correct_normals: bool,
 };
 
-// Shared Lit back-end: texture + Phong + alpha + buffer writes for one pixel.
-// Called per pixel from the scalar path and per lane from the quad path, so
-// both produce identical output. Texture/shadow are gathers, kept scalar.
+// Shared Lit back-end for one pixel; called per-pixel (scalar) and per-lane (quad).
 inline fn shadeLitFragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth: [*]f32, x: i32, y: i32, z: f32, inv_w: f32, f: LitFrag) void {
     @setFloatMode(.optimized);
     const u = f.u - @floor(f.u);
@@ -479,11 +471,9 @@ inline fn shadeLitFragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth
         var ey = f.ey;
         var ez = f.ez;
 
-        // Spotlight cone modulation is computed before the shadow lookup: beyond
-        // the outer soft edge light_scale is zero, so there is nothing to light
-        // and nothing to shadow. We skip the shadow map entirely out there, which
-        // also guarantees that every pixel we *do* sample lands inside the cone's
-        // shadow frustum (no image-edge case to handle in the PCF).
+        // Cone modulation before the shadow lookup: beyond the outer edge
+        // light_scale is 0, so we skip the shadow map — which also guarantees
+        // every sampled pixel is inside the cone's frustum (no PCF edge case).
         var lx = ctx.light_dir.x;
         var ly = ctx.light_dir.y;
         var lz = ctx.light_dir.z;
@@ -535,10 +525,7 @@ inline fn shadeLitFragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth
                         const hhx = hx * inv_h_len;
                         const hhy = hy * inv_h_len;
                         const hhz = hz * inv_h_len;
-                        // x^48 by squaring (x^48 = x^32 * x^16): 6 muls instead
-                        // of a per-pixel general pow()/powf — same result, and
-                        // far cheaper than the musl pow Zig inlines for a
-                        // constant integer exponent.
+                        // x^48 = x^32 * x^16 by squaring: 6 muls, not a per-pixel pow().
                         const sd = @max(0.0, nx * hhx + ny * hhy + nz * hhz);
                         const sd2 = sd * sd;
                         const sd4 = sd2 * sd2;
@@ -592,9 +579,8 @@ inline fn shadeLitFragment(ctx: *const LitCtx, row_pixels: [*]Pixel32, row_depth
 }
 
 pub fn drawTriangleBarycentricStrip(noalias pixels: [*]u8, pitch: i32, noalias depth_buffer: [*]f32, noalias normal_buffer: ?[*]f32, noalias linear_z: ?[*]f32, screen_width: i32, screen_height: i32, v0: VertexVaryings, v1: VertexVaryings, v2: VertexVaryings, format: *const PixelFormat, noalias texture: ?*const PackedTexture, light_dir: Vec3, light_pos: Vec3, spot_dir: Vec3, use_spotlight: bool, spot_inner_cos: f32, spot_outer_cos: f32, noalias shadow_depth: ?[*]const ShadowDepth, shadow_size: i32, x_tile_min: i32, x_tile_max: i32, y_strip_min: i32, y_strip_max: i32, depth_write: bool, shader: TriangleShader, precomputed_setup: ?*const RasterTriangleSetup) void {
-    // Allow FMA contraction + reassociation across the whole per-pixel loop.
-    // This restores the -ffast-math style codegen Eigen relied on; barycentric
-    // interpolation (a*w0 + b*w1 + c*w2) collapses into mul + fma chains.
+    // .optimized: FMA contraction + reassociation collapse the barycentric
+    // interpolation into mul/fma chains across the whole per-pixel loop.
     @setFloatMode(.optimized);
     var fallback_setup: RasterTriangleSetup = undefined;
     var setup: *const RasterTriangleSetup = undefined;
@@ -782,10 +768,8 @@ pub fn drawTriangleBarycentricStrip(noalias pixels: [*]u8, pitch: i32, noalias d
 
         var x = x_min;
         while (x <= x_max) {
-            // 4-wide maskless quad path: take it only when all four lanes are
-            // covered (consistent edge sign) and all four pass the depth test,
-            // so no write mask is needed. Mixed coverage, any depth reject, or a
-            // non-Lit shader drops through to the scalar path for this pixel.
+            // 4-wide maskless quad path: only when all 4 lanes are covered and
+            // pass depth (no write mask needed). Anything else falls to scalar.
             if (quad_enabled and shader == .Lit and x + 3 <= x_max) {
                 const w0v = @as(@Vector(4, f32), @splat(w0)) + @as(@Vector(4, f32), @splat(A0)) * lane_idx;
                 const w1v = @as(@Vector(4, f32), @splat(w1)) + @as(@Vector(4, f32), @splat(A1)) * lane_idx;
@@ -866,7 +850,7 @@ pub fn drawTriangleBarycentricStrip(noalias pixels: [*]u8, pitch: i32, noalias d
                 }
             }
 
-            // Scalar single-pixel path (covers partial quads + non-Lit shaders).
+            // Scalar single-pixel path (partial quads + non-Lit shaders).
             scalar: {
                 if ((w0 < 0 or w1 < 0 or w2 < 0) and (w0 > 0 or w1 > 0 or w2 > 0)) break :scalar;
 
@@ -1159,11 +1143,8 @@ pub fn applySsaoStrip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]co
             const max_world = @as(f32, @floatFromInt(ssao_max_radius_px)) * eye_depth / focal_px;
             if (radius > max_world) radius = max_world;
 
-            // 4-wide masked tap loop: two groups of four independent probes.
-            // All arithmetic runs branchless under lane masks; the only scalar
-            // step is the depth gather (four indexed loads). Lowers to NEON
-            // natively and simd128 on wasm — wasm in particular pays heavily
-            // for the scalar per-tap branches this replaces.
+            // 4-wide masked tap loop: two groups of 4 probes, branchless under
+            // lane masks; only the depth gather stays scalar.
             var occlusion: f32 = 0.0;
             const F4 = @Vector(4, f32);
             const vzero4: F4 = @splat(0.0);
@@ -1191,7 +1172,7 @@ pub fn applySsaoStrip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]co
                 const spz = czv + oz * rv;
                 const valid = spz < @as(F4, @splat(-0.0001));
                 if (@reduce(.Or, valid)) {
-                    const inv_cw = @as(F4, @splat(-1.0)) / spz; // masked lanes may be garbage; never selected
+                    const inv_cw = @as(F4, @splat(-1.0)) / spz; // masked lanes garbage, never selected
                     const s_ndc_x = (@as(F4, @splat(proj00)) * spx) * inv_cw;
                     const s_ndc_y = (@as(F4, @splat(proj11)) * spy) * inv_cw;
                     // round(((s+1)*0.5*extent) - 0.5 + 0.5) == floor((s+1)*half_extent)
@@ -1211,8 +1192,7 @@ pub fn applySsaoStrip(noalias pixels: [*]u8, pitch: i32, noalias linear_z: [*]co
                         const spza: [4]f32 = spz;
                         var gz: [4]f32 = undefined;
                         inline for (0..4) |l| {
-                            // Off-screen/behind lanes get geom_z == spz, which
-                            // the biased compare below always rejects.
+                            // Off-screen lanes get geom_z == spz; biased compare rejects them.
                             gz[l] = if (ma[l])
                                 -linear_z[@intCast(@as(i32, @intFromFloat(sya[l])) * screen_width + @as(i32, @intFromFloat(sxa[l])))]
                             else

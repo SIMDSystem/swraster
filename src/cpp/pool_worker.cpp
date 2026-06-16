@@ -8,11 +8,6 @@
 #include "tl_worker.h"
 #include "raster_worker.h"
 
-// See pool_worker.h. The frame plan is published by render_loop.cpp under
-// mtx_pool, then cv_pool.notify_all() wakes the pool. By the time main
-// republishes, it has waited on pool_workers_done == active pool size, so
-// every worker is back here blocked on the frame-kick predicate (never mid
-// inter-pass wait), and the kick wakes only frame-kick waiters.
 void pool_worker_main(int worker_id, RendererContext& ctx) {
     int last_frame_processed = 0;
 
@@ -33,37 +28,23 @@ void pool_worker_main(int worker_id, RendererContext& ctx) {
             pool_active          = active_raster_job_thread_count;
         }
 
-        // Workers beyond the active pool size sit this frame out (used by the
-        // --threadperf sweep, which shrinks the active pool without
-        // relaunching threads). They still observe future wakeups.
+        // Workers beyond the active pool sit out (the --threadperf sweep shrinks
+        // the pool without relaunching threads), but still see future wakeups.
         if (worker_id >= pool_active) continue;
 
-        // Shadow-depth pre-pass: every active worker first drains the previous
-        // frame's shadow-map raster (non-blocking — it returns the moment no
-        // shadow tile is left to claim). The Color pass hard-depends on the
-        // finished shadow map, so prioritizing it here lets Color start the
-        // instant T&L frees a worker, overlapping the remaining T&L instead of
-        // serializing behind the shadow dependency. No-op on frame 0 / when
-        // there's nothing to raster.
+        // Shadow-depth pre-pass (non-blocking): Color hard-depends on the shadow
+        // map, so finishing it first lets Color overlap the remaining T&L.
         raster_worker_frame(worker_id, ctx, /*shadow_only=*/true);
 
-        // T&L-preferred workers run this frame's T&L (per-instance sweep,
-        // phase-1 barrier, phase-2 bin merge), signalling tl_done_counter on
-        // the way out. The barrier inside only waits on the k_eff workers that
-        // actually reach it.
         if (worker_id < k_eff) {
             tl_worker_frame(worker_id, k_eff, ctx, current_frame);
         }
 
-        // Every active worker then drains the rest of the previous frame's
-        // raster passes (Color -> SSAO -> Luminaire), helping finish any shadow
-        // tiles still outstanding from the pre-pass first.
+        // Drain the rest of the previous frame's passes (Color -> SSAO -> Luminaire).
         raster_worker_frame(worker_id, ctx);
 
-        // This worker is done with the frame.
         if (pool_workers_done.fetch_add(1, std::memory_order_acq_rel) + 1 >= pool_active) {
-            // Empty critical section on mtx_main closes the predicate-check /
-            // wait() race so main's wakeup can't be dropped.
+            // Empty lock parks main's wait-side before we signal (lost-wakeup guard).
             { std::lock_guard<std::mutex> lock(mtx_main); }
             cv_main.notify_one();
         }

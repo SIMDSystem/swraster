@@ -1,13 +1,6 @@
-// merge.odin — O(n) merge of two already-sorted runs (std::inplace_merge equivalent).
-//
-// Used by the T&L scatter-merge and global fold. Only the smaller run is copied
-// into scratch, so it never needs more than items.len / 2 elements.
-//
-// Buffer policy (matches Zig clearRetainingCapacity / ensureTotalCapacity):
-//   - [dynamic]T is Odin's native growable buffer; reserve/append/clear use context.allocator.
-//   - Pre-reserve capacity once at init (see render_config.odin caps).
-//   - Per frame: reset length with clear() only — never shrink/free backing storage.
-//   - append() may realloc (relocating .data); caps are sized so the frame loop never hits that.
+// merge.odin — in-place O(n) merge of two sorted runs; only the smaller run is
+// copied to scratch. Per-frame buffers clear() (retain capacity) rather than free;
+// init caps (render_config.odin) are sized so per-frame append never reallocs.
 
 package main
 
@@ -86,7 +79,6 @@ append_render_triangle :: proc(list: ^Render_Triangle_List, tri: Render_Triangle
 	append(list, tri)
 }
 
-// Reset active length; retain capacity (Zig: clearRetainingCapacity).
 clear_render_triangle_list :: proc(list: ^Render_Triangle_List) {
 	clear(list)
 }
@@ -95,12 +87,10 @@ append_render_triangles :: proc(list: ^Render_Triangle_List, src: []Render_Trian
 	append(list, ..src)
 }
 
-// Grow capacity only — never shrinks.
 ensure_render_triangle_capacity :: proc(list: ^Render_Triangle_List, n: int) {
 	if cap(list^) < n do reserve(list, n)
 }
 
-// Init / rare resize: commit length after ensure (global IPC slots).
 init_render_triangle_slots :: proc(list: ^Render_Triangle_List, n: int) {
 	ensure_render_triangle_capacity(list, n)
 	resize(list, n)
@@ -118,7 +108,6 @@ ensure_instance_depth_capacity :: proc(list: ^[dynamic]Instance_Depth, n: int) {
 	if cap(list^) < n do reserve(list, n)
 }
 
-// Reset active length; retain capacity.
 clear_instance_depths :: proc(list: ^[dynamic]Instance_Depth) {
 	clear(list)
 }

@@ -1,7 +1,6 @@
-// render_config.zig — shared compile-time configuration + small POD typedefs.
-// Mirrors render_config.h. The runtime-set thread counts (NUM_*) live here as
-// `pub var` (the C++ originals were `extern int` set by initThreadCounts);
-// threading.zig writes them at startup, everyone else reads them.
+// render_config — shared compile-time config + small POD typedefs. The NUM_*
+// thread counts are `pub var`: threading.zig writes them at startup, everyone
+// else reads them.
 
 pub const NEAR_PLANE: f32 = 1.0;
 pub const CAMERA_FAR_PLANE: f32 = 200.0;
@@ -44,9 +43,8 @@ pub var NUM_RASTER_THREADS: i32 = 0;
 pub var NUM_STRIPS: i32 = 0;
 pub var NUM_TILE_BINS: i32 = 0;
 
-// Divides [0,extent) into `splits` contiguous tiles. Tile `idx` covers pixels
-// [lo, hi] inclusive. The single floor-division formula every framebuffer pass
-// shares so they can never disagree on a tile boundary.
+// The single tile-boundary formula every framebuffer pass shares, so they can
+// never disagree. Tile `idx` covers pixels [lo, hi] inclusive.
 pub const TileSpan = struct { lo: i32, hi: i32 };
 
 pub inline fn tileSpan(extent: i32, splits: i32, idx: i32) TileSpan {

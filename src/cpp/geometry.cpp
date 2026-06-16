@@ -9,8 +9,7 @@ using namespace Eigen;
 #define M_PI 3.14159265358979323846
 #endif
 
-// Utah Teapot Bezier patch control points (32 patches, 4x4 control points each)
-// Shared between geometry.cpp (rendering) and main.cpp (collision)
+// Utah Teapot Bezier control points (32 patches, 4x4 each).
 const float teapot_data[32][4][4][3] = {
     // Lid patches (0-3)
     {{{1.4,2.25,0.0},{1.3375,2.38125,0.0},{1.4375,2.38125,0.0},{1.5,2.25,0.0}},{{1.4,2.25,0.784},{1.3375,2.38125,0.749},{1.4375,2.38125,0.805},{1.5,2.25,0.84}},{{0.784,2.25,1.4},{0.749,2.38125,1.3375},{0.805,2.38125,1.4375},{0.84,2.25,1.5}},{{0.0,2.25,1.4},{0.0,2.38125,1.3375},{0.0,2.38125,1.4375},{0.0,2.25,1.5}}},
@@ -119,24 +118,20 @@ void generate_cube(RenderVertexList& vertices, std::vector<Face>& faces) {
 void generate_sphere(float radius, int slices, int stacks, RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
-    
-    // Generate vertices
+
     for (int i = 0; i <= stacks; ++i) {
         float v = (float)i / (float)stacks;
         float phi = v * M_PI;
-        
+
         for (int j = 0; j <= slices; ++j) {
             float u = (float)j / (float)slices;
             float theta = u * 2.0f * M_PI;
-            
-            // Standard spherical coordinates (y-up)
+
             float x = -cosf(theta) * sinf(phi);
             float y = -cosf(phi);
             float z = sinf(theta) * sinf(phi);
             
-            // Implicit Normal: Unit sphere position IS the normal
-            // We use this property directly to avoid extra normalization or cross products
-            Vector3f normal(x, y, z);
+            Vector3f normal(x, y, z); // unit-sphere position is the normal
             
             Vertex3D vert(x * radius, y * radius, z * radius);
             vert.normal = normal; 
@@ -147,25 +142,22 @@ void generate_sphere(float radius, int slices, int stacks, RenderVertexList& ver
         }
     }
     
-    // Generate faces (quads split into 2 triangles)
     for (int i = 0; i < stacks; ++i) {
         for (int j = 0; j < slices; ++j) {
             int first = (i * (slices + 1)) + j;
             int second = first + slices + 1;
 
-            // Triangle 1
             Face f1;
             f1.v0 = first;
-            f1.v1 = first + 1; // Swapped
-            f1.v2 = second;    // Swapped
+            f1.v1 = first + 1;
+            f1.v2 = second;
             f1.r = 1.0f; f1.g = 1.0f; f1.b = 1.0f; f1.a = 1.0f;
             faces.push_back(f1);
 
-            // Triangle 2
             Face f2;
             f2.v0 = second;
-            f2.v1 = first + 1;  // Swapped
-            f2.v2 = second + 1; // Swapped
+            f2.v1 = first + 1;
+            f2.v2 = second + 1;
             f2.r = 1.0f; f2.g = 1.0f; f2.b = 1.0f; f2.a = 1.0f;
             faces.push_back(f2);
         }
@@ -178,14 +170,10 @@ void generate_spotlight_housing(float radius, int slices, int stacks,
     vertices.clear();
     faces.clear();
 
-    // Two-sided shell built as two stacked vertex blocks sharing the same
-    // UV-sphere layout (poles along Y, y = -cos(phi) so phi = PI is the +Y
-    // pole; the opening is carved around +Y, the local beam axis):
-    //   block 0 [0, vcount)        outward normals -> outer skin   (purple)
-    //   block 1 [vcount, 2*vcount) inward  normals -> inner lining (white)
-    // The renderer back-face culls, so emitting both blocks (the inner one
-    // reverse-wound) makes the housing visible from outside AND through the
-    // mouth, with no two-sided rasterizer support needed.
+    // Two-sided shell via two vertex blocks: block 0 outward-normal outer skin,
+    // block 1 inward-normal reverse-wound inner lining. Backface culling then
+    // shows the housing from outside and through the mouth with no two-sided
+    // rasterizer support. UV-sphere with the opening carved around +Y.
     const int ring   = slices + 1;
     const int vcount = (stacks + 1) * ring;
     for (int block = 0; block < 2; ++block) {
@@ -208,29 +196,25 @@ void generate_spotlight_housing(float radius, int slices, int stacks,
         }
     }
 
-    // Purple outer skin, white inner lining (carried as per-face colour; the
-    // T&L lamp path reads face colour rather than the uniform instance tint).
+    // Per-face colour (the lamp T&L path reads face colour, not the instance tint).
     const float out_r = 0.55f, out_g = 0.08f, out_b = 0.85f;
     const float in_r  = 1.0f,  in_g  = 1.0f,  in_b  = 1.0f;
 
-    // Drop every quad whose entire span lies inside the opening cone around the
-    // +Y pole. A vertex's angle from +Y has cosine equal to its unit y, so the
-    // opening is { y > cos(open_half_angle) }. The topmost (max-y) row of quad i
-    // is row i+1, so the quad survives only when row i+1 is at or below the rim.
+    // Drop quads inside the opening cone: a vertex's cos-angle from +Y equals
+    // its unit y, so the opening is { y > cos(half_angle) }.
     float open_cos = cosf(opening_half_angle_deg * (float)M_PI / 180.0f);
     for (int i = 0; i < stacks; ++i) {
         float phi_top = (float)(i + 1) / (float)stacks * (float)M_PI;
         float y_top   = -cosf(phi_top);
-        if (y_top > open_cos) continue; // quad falls within the carved opening
+        if (y_top > open_cos) continue;
         for (int j = 0; j < slices; ++j) {
             int first  = (i * ring) + j;
             int second = first + ring;
 
-            // Outer skin: outward normals, original winding -> purple.
             faces.push_back(Face{first,  first + 1, second,     out_r, out_g, out_b, 1.0f});
             faces.push_back(Face{second, first + 1, second + 1, out_r, out_g, out_b, 1.0f});
 
-            // Inner lining: inward-normal block, reverse winding -> white.
+            // Inner lining: reverse-wound block.
             int fi = first + vcount, si = second + vcount;
             faces.push_back(Face{fi, si,     fi + 1, in_r, in_g, in_b, 1.0f});
             faces.push_back(Face{si, si + 1, fi + 1, in_r, in_g, in_b, 1.0f});
@@ -248,46 +232,39 @@ void generate_torus(float main_radius, float tube_radius, int slices, int stacks
         float sin_u = sinf(u);
 
         for (int j = 0; j <= stacks; ++j) {
-            // Shift v by PI to move seam 180 degrees
-            float v = ((float)j / stacks * 2.0f * M_PI) + M_PI;
+            float v = ((float)j / stacks * 2.0f * M_PI) + M_PI; // +PI shifts the seam
             float cos_v = cosf(v);
             float sin_v = sinf(v);
 
-            // Position
             float r = main_radius + tube_radius * cos_v;
             float x = r * cos_u;
             float z = r * sin_u;
             float y = tube_radius * sin_v;
 
-            // Normal (implicit)
-            // Rotate the tube cross-section normal (cos_v, sin_v) by the main ring angle u
             float nx = cos_v * cos_u;
             float ny = sin_v;
             float nz = cos_v * sin_u;
             
             Vertex3D vert(x, y, z);
             vert.normal = Vector3f(nx, ny, nz);
-            vert.u = ((float)i / slices) * 2.0f; // Double U coords
+            vert.u = ((float)i / slices) * 2.0f;
             vert.v = (float)j / stacks;
-            
+
             vertices.push_back(vert);
         }
     }
-    
-    // Faces
+
     for (int i = 0; i < slices; ++i) {
         for (int j = 0; j < stacks; ++j) {
             int first = (i * (stacks + 1)) + j;
             int second = first + stacks + 1;
-            
-            // Faces with shared vertices (Winding reversed to fix inside-out)
+
             faces.push_back({first, first + 1, second, 1, 1, 1, 0.5f});
             faces.push_back({second, first + 1, second + 1, 1, 1, 1, 0.5f});
         }
     }
 }
 
-// Evaluate a cubic Bezier curve
 static Vector3f bezier_curve(const Vector3f p[4], float t) {
     float t2 = t * t;
     float t3 = t2 * t;
@@ -298,7 +275,6 @@ static Vector3f bezier_curve(const Vector3f p[4], float t) {
     return mt3 * p[0] + 3.0f * mt2 * t * p[1] + 3.0f * mt * t2 * p[2] + t3 * p[3];
 }
 
-// Evaluate a cubic Bezier patch at (u, v)
 static Vector3f bezier_patch(const Vector3f patch[4][4], float u, float v) {
     Vector3f u_curve[4];
     for (int i = 0; i < 4; i++) {
@@ -312,18 +288,14 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
     vertices.clear();
     faces.clear();
     
-    // Utah Teapot - Original data from Martin Newell and Jim Blinn
-    // 32 cubic Bezier patches (28 original + 4 bottom patches added later)
-    // Scale: Classic teapot is ~3.0 units tall, scale to fit our scene
     const float scale = 0.5f;
-    const int tessellation = 8; // Triangles per patch edge
-    
-    // Map to share vertices at patch boundaries: position -> vertex_index
+    const int tessellation = 8;
+
+    // Quantized position -> vertex index, to share vertices at patch boundaries.
     std::map<std::tuple<int, int, int>, int> vertex_map;
     const float tolerance = 0.001f;
     const float inv_tolerance = 1.0f / tolerance;
-    
-    // Step 1: Generate all vertices and faces (without normals)
+
     for (int patch_idx = 0; patch_idx < 32; patch_idx++) {
         Vector3f patch[4][4];
         for (int i = 0; i < 4; i++) {
@@ -336,7 +308,6 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
             }
         }
         
-        // Tessellate this patch into triangles
         std::vector<int> patch_vertex_indices;
         
         for (int i = 0; i <= tessellation; i++) {
@@ -345,8 +316,7 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
                 float v = (float)j / tessellation;
                 
                 Vector3f pos = bezier_patch(patch, u, v);
-                
-                // Quantize position for vertex sharing
+
                 int qx = (int)(pos.x() * inv_tolerance);
                 int qy = (int)(pos.y() * inv_tolerance);
                 int qz = (int)(pos.z() * inv_tolerance);
@@ -354,12 +324,10 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
                 
                 auto it = vertex_map.find(key);
                 if (it != vertex_map.end()) {
-                    // Vertex exists - reuse it
                     patch_vertex_indices.push_back(it->second);
                 } else {
-                    // New vertex
                     Vertex3D vert(pos.x(), pos.y(), pos.z());
-                    vert.normal = Vector3f(0, 0, 0); // Will be computed from faces
+                    vert.normal = Vector3f(0, 0, 0); // computed from faces below
                     vert.u = u;
                     vert.v = v;
                     int vertex_idx = vertices.size();
@@ -370,7 +338,6 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
             }
         }
         
-        // Generate faces for this patch
         for (int i = 0; i < tessellation; i++) {
             for (int j = 0; j < tessellation; j++) {
                 int base = i * (tessellation + 1) + j;
@@ -381,14 +348,13 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
                 int v2_idx = patch_vertex_indices[base + 1];
                 int v3_idx = patch_vertex_indices[next_row + 1];
                 
-                // Two triangles per quad (winding order for correct facing)
                 faces.push_back({v0_idx, v1_idx, v2_idx, 1, 1, 1, 1.0f});
                 faces.push_back({v2_idx, v1_idx, v3_idx, 1, 1, 1, 1.0f});
             }
         }
     }
     
-    // Step 2: Compute face normals from triangle cross products
+    // Smooth normals: average adjacent face normals per shared vertex.
     std::vector<Vector3f> face_normals(faces.size());
     for (size_t f = 0; f < faces.size(); f++) {
         const Face& face = faces[f];
@@ -403,11 +369,10 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
         if (len > 0.0001f) {
             face_normals[f] = normal / len;
         } else {
-            face_normals[f] = Vector3f(0, 0, 1); // Fallback
+            face_normals[f] = Vector3f(0, 0, 1);
         }
     }
-    
-    // Step 3: For each vertex, average normals from all adjacent triangles
+
     std::vector<Vector3f> vertex_normal_sums(vertices.size(), Vector3f(0, 0, 0));
     std::vector<int> vertex_normal_counts(vertices.size(), 0);
     
@@ -424,17 +389,16 @@ void generate_teapot(RenderVertexList& vertices, std::vector<Face>& faces) {
         vertex_normal_counts[face.v2]++;
     }
     
-    // Step 4: Normalize vertex normals
     for (size_t v = 0; v < vertices.size(); v++) {
         if (vertex_normal_counts[v] > 0) {
             float len = vertex_normal_sums[v].norm();
             if (len > 0.0001f) {
                 vertices[v].normal = vertex_normal_sums[v] / len;
             } else {
-                vertices[v].normal = Vector3f(0, 0, 1); // Fallback
+                vertices[v].normal = Vector3f(0, 0, 1);
             }
         } else {
-            vertices[v].normal = Vector3f(0, 0, 1); // Fallback
+            vertices[v].normal = Vector3f(0, 0, 1);
         }
     }
 }

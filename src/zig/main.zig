@@ -1,9 +1,5 @@
-// main.zig — software rasterizer entry point. Mirrors main.cpp.
-//
-// Brings up the platform, loads textures, generates geometry, initializes Jolt
-// (through the joltc C wrapper), builds the scene, allocates the IPC buffers,
-// wires up the RendererContext, spawns the unified worker pool + physics
-// thread, and hands control to runRenderLoop.
+// main — software rasterizer entry point: brings up platform, scene, physics,
+// and IPC buffers, spawns the worker pool + physics thread, runs the render loop.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -38,10 +34,8 @@ const ShadowDepth = config.ShadowDepth;
 const is_mac = builtin.target.os.tag == .macos;
 const is_web = builtin.target.os.tag == .emscripten;
 
-// On emscripten the std default panic/log machinery pulls in std.Io.Threaded
-// and std.heap.WasmAllocator (via stack-trace capture), neither of which
-// compiles for multithreaded wasm32-emscripten in Zig 0.16. Override both with
-// console-backed implementations so nothing references those backends.
+// Default panic/log pull in std.Io.Threaded + WasmAllocator, which don't
+// compile for multithreaded wasm32-emscripten; route to the console instead.
 extern fn emscripten_console_error(str: [*:0]const u8) void;
 
 fn webPanic(msg: []const u8, _: ?usize) noreturn {
@@ -86,13 +80,11 @@ fn loadTexture(basename: [:0]const u8) ?*Surface {
         var size: u32 = buf.len;
         if (_NSGetExecutablePath(&buf, &size) == 0) {
             const exe = std.mem.sliceTo(&buf, 0);
-            // 1. Inside a .app bundle: Contents/Resources.
+            // Inside a .app bundle: Contents/Resources.
             if (std.mem.indexOf(u8, exe, ".app/Contents/MacOS/")) |pos| {
                 if (tryLoad(alloc, "{s}.app/Contents/Resources/{s}", .{ exe[0..pos], basename })) |s| return s;
             }
-            // 2. Relative to the executable's directory (CWD-independent). The
-            // binary may sit at <repo>/build/bin/raster, <repo>/build/raster,
-            // or <repo>/raster, so walk a few levels up looking for assets/.
+            // Else walk up from the exe dir looking for assets/ (CWD-independent).
             if (std.fs.path.dirname(exe)) |exe_dir| {
                 if (tryLoad(alloc, "{s}/assets/{s}", .{ exe_dir, basename })) |s| return s;
                 if (tryLoad(alloc, "{s}/../assets/{s}", .{ exe_dir, basename })) |s| return s;
@@ -189,7 +181,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const ground_half: f32 = 48.0;
     scene.buildGroundGeometry(ground_half, &ground_vertices, &ground_faces);
 
-    // Mesh table, indexed by @intFromEnum(scene.InstanceType): cube=0 .. lamp=6.
+    // Indexed by @intFromEnum(scene.InstanceType): cube=0 .. lamp=6.
     const meshes = [7]renderer_context.MeshRef{
         .{ .vertices = &cube_vertices, .faces = &cube_faces, .bound_radius = scene.computeBoundRadius(&cube_vertices) },
         .{ .vertices = &sphere_vertices, .faces = &sphere_faces, .bound_radius = scene.computeBoundRadius(&sphere_vertices) },
@@ -359,8 +351,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var fps_counter = fps.FpsCounter{};
 
     // ----- 8. RendererContext -----
-    // Built in one shot: every field is live before any worker thread can
-    // observe the context, so the struct carries no optionals.
     var ctx = renderer_context.RendererContext{
         .fb = fb,
         .screen_width = screen_width,

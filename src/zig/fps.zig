@@ -1,4 +1,4 @@
-// fps.zig — on-screen FPS indicator. Mirrors fps.h (header-only POD).
+// fps — on-screen FPS indicator.
 
 const platform = @import("platform.zig");
 const pixel = @import("pixel.zig");
@@ -15,7 +15,7 @@ pub const FpsCounter = struct {
         self.fps = 0;
     }
 
-    // Returns true if the displayed FPS value rolled over this call.
+    // Returns true when the displayed FPS value updates.
     pub fn tick(self: *FpsCounter, now_ms: u64) bool {
         self.frame_count += 1;
         if (now_ms - self.last_fps_time >= 1000) {

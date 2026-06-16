@@ -1,7 +1,5 @@
-//! texture.rs — packed RGB textures with software mip chains plus the hot-path
-//! bilinear/anisotropic samplers. Ported from texture.zig / texture.{h,cpp}.
-//! Includes a small portable 24/32-bpp BMP loader (the C++/Zig kept this in the
-//! platform layer; here it lives with the texture code it feeds).
+//! Packed RGB textures with software mip chains, hot-path bilinear/anisotropic
+//! samplers, and a small 24/32-bpp BMP loader.
 
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;

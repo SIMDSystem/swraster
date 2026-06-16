@@ -1,4 +1,4 @@
-// thread_profiler.odin — per-thread concurrency overlay. Mirrors thread_profiler.zig.
+// thread_profiler.odin — per-thread concurrency overlay.
 
 package main
 
@@ -128,7 +128,6 @@ profiler_record_physics :: proc(p: ^Thread_Profiler, start, end, cpu_ns: u64) {
 		for i in 0 ..< 64 {
 			p.physics_intervals[i] = p.physics_intervals[i + drop]
 		}
-		// Shorten active length only; capacity is retained.
 		resize(&p.physics_intervals, 64)
 	}
 }

@@ -1,4 +1,4 @@
-// main.odin — software rasterizer entry point. Mirrors main.cpp.
+// main.odin — software rasterizer entry point.
 
 package main
 
@@ -384,7 +384,6 @@ main :: proc() {
 	thread_handle_join(physics_worker)
 	platform_shutdown()
 
-	// Native: exits via os.exit(0), skipping Odin's @(fini) cleanup (see
-	// os_args_native.odin). Wasm: no-op, main returns normally.
+	// Native: os.exit(0), skipping @(fini) cleanup (see os_args_native.odin). Wasm: no-op.
 	program_exit()
 }

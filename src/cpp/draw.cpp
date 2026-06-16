@@ -9,7 +9,7 @@
 
 #include "pixel.h"
 #include "shadow.h"
-#include "render_buffers.h" // LuminaireConeBuffer for build_luminaire_cone_tl / draw_spotlight_cone_strip
+#include "render_buffers.h"
 
 using namespace Eigen;
 
@@ -36,10 +36,8 @@ RasterTriangleSetup build_raster_triangle_setup(const VertexVaryings& v0,
     setup.A1 = v0.y - v2.y; setup.B1 = v2.x - v0.x;
     setup.A2 = v1.y - v0.y; setup.B2 = v0.x - v1.x;
 
-    // Edge values at the shared origin (pixel-center of pixel (0,0) = (0.5,0.5)),
-    // so per-tile seeding is w_i(x_min,y_min) = A_i*x_min + B_i*y_min + K_i with
-    // x_min/y_min the integer tile origin. Computed once per triangle; the huge
-    // (near-hither) vertex coordinate is absorbed here, not re-subtracted per tile.
+    // Edge constants anchored at pixel-center (0.5,0.5), computed once per
+    // triangle so any tile gets identical edge values (watertight shared edges).
     setup.K0 = setup.A0 * (0.5f - v2.x) + setup.B0 * (0.5f - v2.y);
     setup.K1 = setup.A1 * (0.5f - v0.x) + setup.B1 * (0.5f - v0.y);
     setup.K2 = setup.A2 * (0.5f - v1.x) + setup.B2 * (0.5f - v1.y);
@@ -75,7 +73,7 @@ void draw_pixel(uint8_t* pixels, int pitch, int x, int y, uint32_t color, int w,
 void draw_line_depth(uint8_t* pixels, int pitch, float* depth_buffer,
                      int x0, int y0, float z0, int x1, int y1, float z1,
                      uint32_t color, int w, int h) {
-    // Pre-clip the segment to the screen rect. z is linear in screen-space NDC.
+    // Pre-clip to screen rect; NDC z is linear in screen space.
     {
         float t_a, t_b;
         if (!clip_line_to_rect((float)x0, (float)y0, (float)x1, (float)y1,
@@ -120,11 +118,8 @@ void draw_lit_shadowed_line_depth(uint8_t* pixels, int pitch, float* depth_buffe
                                   const Vector3f& light_pos, const Vector3f& spot_dir,
                                   bool use_spotlight, float spot_inner_cos, float spot_outer_cos,
                                   const Matrix4f& shadow_matrix) {
-    // Pre-clip to the screen rect with perspective-correct re-interpolation of
-    // inv_w-weighted eye-space position. Screen-space NDC z is linear in screen
-    // space, so it interpolates linearly. After this block the Bresenham loop
-    // runs on clipped endpoints with parametric t in [0,1] across the visible
-    // span; its internal inv_w / p_eye reconstruction remains perspective-correct.
+    // Pre-clip to screen rect; eye-space position is re-interpolated
+    // perspective-correctly (inv_w-weighted), NDC z linearly.
     Vector3f p0_eye = p0_eye_in;
     Vector3f p1_eye = p1_eye_in;
     {
@@ -206,10 +201,8 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     float lx, ly, lz;
     if (!project_eye_point(projection, light_pos, screen_width, screen_height, lx, ly, lz)) return;
 
-    // Size the glare in 3D rather than as a fixed pixel radius: project a point
-    // offset from the light by a world radius slightly smaller than the
-    // spotlight housing sphere (radius 0.5), so the glow tracks the lamp's
-    // apparent size and shrinks with distance.
+    // Glare sized in 3D (just inside the housing sphere of radius 0.5) so it
+    // tracks the lamp's apparent size and shrinks with distance.
     constexpr float glare_radius_3d = 0.42f;
     float ex, ey, ez;
     if (!project_eye_point(projection, light_pos + Vector3f(glare_radius_3d, 0.0f, 0.0f),
@@ -219,7 +212,6 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     float disk_radius = fabsf(ex - lx);
     if (disk_radius < 1.0f) disk_radius = 1.0f;
 
-    // Depth-tested additive Gaussian lamp disk.
     int x_min = std::max(0, (int)floorf(lx - disk_radius));
     int x_max = std::min(screen_width  - 1, (int)ceilf(lx + disk_radius));
     int y_min = std::max(0, (int)floorf(ly - disk_radius));
@@ -230,10 +222,8 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
         float dy = (float)y + 0.5f - ly;
         for (int x = x_min; x <= x_max; x++) {
             size_t idx = (size_t)y * screen_width + x;
-            // Same depth function as the scene and the cone
-            // (draw_triangle_barycentric_strip): keep only fragments strictly
-            // in front of the stored surface, no bias. A positive NDC bias here
-            // let the glare bleed through occluding geometry.
+            // Strict in-front test, no bias: any positive NDC bias bled the
+            // glare through occluding geometry.
             if (lz >= depth_buffer[idx]) continue;
             float dx = (float)x + 0.5f - lx;
             float d2 = dx * dx + dy * dy;
@@ -244,13 +234,11 @@ void draw_spotlight_luminaire(uint8_t* pixels, int pitch, float* depth_buffer,
     }
 }
 
-// Runtime toggle (Q key) to force the scalar single-pixel path for A/B perf
-// comparison against the 4-wide quad path.
+// Q-key A/B toggle: force the scalar path instead of the 4-wide quad path.
 std::atomic<bool> g_quad_path_enabled{true};
 
-// Strip-clipped barycentric rasterizer with optional Phong shading and PCF shadows.
-// This is the renderer's main pixel shader; it's kept in one flat function
-// so the inner loop stays predictable to the optimizer.
+// Main strip-clipped barycentric rasterizer; flat single function to keep the
+// inner loop predictable to the optimizer.
 void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_buffer,
                                      float* normal_buffer, float* linear_z,
                                      int screen_width, int screen_height,
@@ -284,25 +272,18 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
 
     if (y_min > y_max || x_min > x_max) return;
 
-    // Edge function incremental coefficients
-    // w0 corresponds to edge v1->v2, w1 to v2->v0, w2 to v0->v1
-    // A = dw/dx (per x-step), B = dw/dy (per y-step)
+    // Edge functions w0:v1->v2, w1:v2->v0, w2:v0->v1; A=dw/dx, B=dw/dy.
     float A0 = setup->A0, B0 = setup->B0;
     float A1 = setup->A1, B1 = setup->B1;
     float A2 = setup->A2, B2 = setup->B2;
 
-    // Seed the row accumulators from the triangle's shared edge constants and
-    // the integer tile origin: w_i = A_i*x_min + B_i*y_min + K_i. K_i already
-    // includes the pixel-center (+0.5) offset and the vertex anchor, computed
-    // once per triangle, so the edge value at a pixel is the same no matter
-    // which tile evaluates it (watertight shared edges near the near plane).
     float fx0 = (float)x_min;
     float fy0 = (float)y_min;
     float w0_row = A0 * fx0 + B0 * fy0 + setup->K0;
     float w1_row = A1 * fx0 + B1 * fy0 + setup->K1;
     float w2_row = A2 * fx0 + B2 * fy0 + setup->K2;
 
-    // Per-vertex attributes pre-multiplied by 1/w for perspective-correct interpolation.
+    // Attributes pre-multiplied by 1/w for perspective-correct interpolation.
     float u0_w  = setup->u0_w,  u1_w  = setup->u1_w,  u2_w  = setup->u2_w;
     float v0_w  = setup->v0_w,  v1_w  = setup->v1_w,  v2_w  = setup->v2_w;
     float nx0_w = setup->nx0_w, nx1_w = setup->nx1_w, nx2_w = setup->nx2_w;
@@ -386,10 +367,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         const PackedTextureLevel& level = texture->levels[mip_level];
         tex_level = &level;
     }
-    // ---- Shared Lit back-end: texture + Phong + alpha + buffer writes for
-    // one pixel. Called per pixel from the scalar path and per lane from the
-    // quad path so both produce identical output (mirrors shade_lit_fragment
-    // in the Zig/Rust/Odin ports).
+    // Shared Lit back-end for one pixel; called per-pixel (scalar) and per-lane
+    // (quad) so both paths produce identical output.
     auto shade_lit = [&](Pixel32* row_pixels, float* row_depth, int x, int y,
                          float z, float inv_w, float uu, float vv,
                          float r_attr, float g_attr, float b_attr, float alpha,
@@ -458,7 +437,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 if (ndotl > 0.0f && light_scale > 0.0f) {
                     float v_len2 = ex * ex + ey * ey + ez * ez;
                     if (v_len2 > 0.000001f) {
-                        float inv_v_len = -1.0f / sqrtf(v_len2); // eye-space point -> eye at origin
+                        float inv_v_len = -1.0f / sqrtf(v_len2); // negate: eye at origin
                         ex *= inv_v_len; ey *= inv_v_len; ez *= inv_v_len;
                     }
 
@@ -469,9 +448,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                     if (h_len2 > 0.000001f) {
                         float inv_h_len = 1.0f / sqrtf(h_len2);
                         hx *= inv_h_len; hy *= inv_h_len; hz *= inv_h_len;
-                        // x^48 by squaring (x^48 = x^32 * x^16): 6 muls instead
-                        // of the powf libcall this used to be (double-precision
-                        // musl pow on the wasm build).
+                        // x^48 = x^32 * x^16 by squaring: 6 muls, no powf libcall.
                         float sd   = fmaxf(0.0f, nx * hx + ny * hy + nz * hz);
                         float sd2  = sd * sd;
                         float sd4  = sd2 * sd2;
@@ -504,9 +481,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         row_pixels[x] = pack_rgb_fast(format, (uint8_t)final_r, (uint8_t)final_g, (uint8_t)final_b);
         if (depth_write) {
             row_depth[x] = z;
-            // Final linear eye-space depth for SSAO: eye_depth = 1/inv_w.
+            // SSAO G-buffer: linear eye depth = 1/inv_w, plus smooth normal.
             if (linear_z) linear_z[(size_t)y * screen_width + x] = 1.0f / inv_w;
-            // Smooth eye-space shading normal for SSAO (no faceting).
             if (normal_buffer) {
                 float nnx = fnx, nny = fny, nnz = fnz;
                 float nl2 = nnx * nnx + nny * nny + nnz * nnz;
@@ -520,11 +496,8 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
         }
     };
 
-    // ---- 4-wide maskless quad path setup (google/highway: lowers to NEON
-    // natively and wasm simd128 on the web build). A quad is taken only when
-    // all four lanes are covered (consistent edge sign) and all four pass the
-    // depth test, so no write mask is needed; anything else falls through to
-    // the scalar pixel below.
+    // 4-wide maskless quad path: taken only when all four lanes are covered and
+    // pass depth (so no write mask); otherwise falls through to the scalar pixel.
     namespace hs = hwy_static;
     const hs::FixedTag<float, 4> df;
     const auto vzero4 = hs::Zero(df);
@@ -603,13 +576,12 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 }
             }
 
-            // Inside test (handles both CW and CCW winding).
+            // Inside test (both windings).
             if (__builtin_expect((w0 < 0 || w1 < 0 || w2 < 0) && (w0 > 0 || w1 > 0 || w2 > 0), 0)) {
                 w0 += A0; w1 += A1; w2 += A2;
                 continue;
             }
 
-            // Depth interpolation with unnormalized barycentrics.
             float aw0 = fabsf(w0), aw1 = fabsf(w1), aw2 = fabsf(w2);
             float w_sum = aw0 + aw1 + aw2;
             float z = (v0.z * aw0 + v1.z * aw1 + v2.z * aw2) / w_sum;
@@ -629,9 +601,7 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
                 w0 += A0; w1 += A1; w2 += A2;
                 continue;
             }
-            // One reciprocal instead of a divide per varying (the rewrite
-            // fast-math performs in the Zig build; clang won't do it for
-            // strict IEEE).
+            // One reciprocal, reused for every varying.
             float persp = 1.0f / inv_w;
             if (shader == TriangleShader::LuminaireCone) {
                 float ex = (ex0_w * b0 + ex1_w * b1 + ex2_w * b2) * persp;
@@ -726,15 +696,12 @@ void build_luminaire_cone_tl(LuminaireConeBuffer& out,
         return true;
     };
 
-    // Build all LUMINAIRE_CONE_SEGMENTS triangles. Any segment that fails
-    // to project (apex or rim behind the near plane) leaves its slot in
-    // an inert state — we flag the whole buffer valid only if at least
-    // one triangle survived, and the raster pass skips inert slots via
-    // the inv_w check inside draw_triangle_barycentric_strip.
+    // Segments that fail to project (apex/rim behind near) stay inert; buffer
+    // is valid if any survived, and the raster pass skips inert slots by inv_w.
     int emitted = 0;
     for (int i = 0; i < LUMINAIRE_CONE_SEGMENTS; i++) {
         LuminaireConeTri& tri = out.tris[i];
-        // Inert default: degenerate (zero-area) so the rasterizer rejects.
+        // Inert default: zero-area so the rasterizer rejects it.
         tri.v0 = VertexVaryings{};
         tri.v1 = VertexVaryings{};
         tri.v2 = VertexVaryings{};
@@ -773,9 +740,6 @@ void draw_spotlight_cone_strip(uint8_t* pixels, int pitch, float* depth_buffer,
     const size_t n = cone.tris.size();
     for (size_t i = 0; i < n; i++) {
         const LuminaireConeTri& tri = cone.tris[i];
-        // Inert (failed-projection) slots have zero inv_w on all vertices —
-        // draw_triangle_barycentric_strip's degenerate-area check rejects
-        // them cheaply, so no extra guard needed here.
         draw_triangle_barycentric_strip(pixels, pitch, depth_buffer, nullptr, nullptr,
                                         screen_width, screen_height,
                                         tri.v0, tri.v1, tri.v2,
@@ -794,20 +758,10 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
                       int x_tile_min, int x_tile_max, int y_strip_min, int y_strip_max,
                       uint32_t frame_index,
                       float proj00, float proj11) {
-    // Canonical hemisphere SSAO (the LearnOpenGL / Crytek-lineage estimator):
-    // for each pixel we reconstruct its eye-space position P and read the
-    // *smooth* eye-space shading normal N stashed by the Color pass (using the
-    // depth-derivative normal here is what "polygonized" low-poly surfaces).
-    // We place a kernel of points in the unit hemisphere around N, scaled by a
-    // world-space radius, PROJECT each back to the screen, read the depth there
-    // and ask "is the real surface in front of my sample point?". A smoothstep
-    // range check fades out occluders that are too far in depth (kills halos).
-    //
-    // Depth comes from the linear eye-Z G-buffer the Color pass already wrote
-    // (= 1/inv_w per pixel), so SSAO reads eye depth directly — no NDC->eye
-    // linearization, no per-tile scratch copy. The kernel reaches at most
-    // ssao_max_radius_px (capped below), which is why an SSAO tile only needs
-    // its 8 Color-neighbours done to overlap the Color pass.
+    // Hemisphere SSAO. Uses the *smooth* eye-space normal from the Color pass
+    // (the depth-derivative normal polygonized low-poly surfaces) and reads eye
+    // depth straight from the linear-Z G-buffer (= 1/inv_w). Kernel reach is
+    // capped at ssao_max_radius_px so a tile only needs its 8 neighbours done.
     constexpr int   kernel_size  = 8;
     constexpr float world_radius = 0.7f;   // hemisphere radius, world units
     constexpr float depth_bias   = 0.03f;  // world units, kills self-occlusion acne
@@ -817,8 +771,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
     constexpr float min_eye_clamp      = world_radius * 1.5f;
     constexpr float sky_z              = LINEAR_Z_SKY * 0.5f; // >= this => background
 
-    // Hemisphere kernel in tangent space (+z = normal), points clustered toward
-    // the centre (more weight on near occluders) via a squared-distance ramp.
+    // Tangent-space hemisphere kernel (+z = normal), clustered toward the centre
+    // to weight near occluders.
     struct KernelTable { float x[kernel_size], y[kernel_size], z[kernel_size]; };
     static const KernelTable kern = []{
         KernelTable t{};
@@ -842,8 +796,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
     float y_scale = 1.0f / proj11;
     float inv_screen_width  = 1.0f / (float)screen_width;
     float inv_screen_height = 1.0f / (float)screen_height;
-    // Vertical focal length in pixels: projects a world radius to a screen
-    // radius via focal_px / eye_depth.
+    // Vertical focal length in pixels (world radius -> screen via focal_px / eye_depth).
     float focal_px = 0.5f * (float)screen_height * proj11;
 
     for (int y = y_strip_min; y <= y_strip_max; y++) {
@@ -854,28 +807,26 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
             float eye_depth = lz_row[x];
             if (eye_depth >= sky_z) continue;       // sky / background
 
-            // Center eye-space position straight from the linear-Z G-buffer.
             float cz = -eye_depth;
             float ndc_x = (((float)x + 0.5f) * inv_screen_width)  * 2.0f - 1.0f;
             float ndc_y = 1.0f - (((float)y + 0.5f) * inv_screen_height) * 2.0f;
             float cx = ndc_x * eye_depth * x_scale;
             float cy = ndc_y * eye_depth * y_scale;
 
-            // Smooth eye-space normal from the G-buffer, oriented toward the eye.
             const float* nb = normal_buffer + ((size_t)row_base + x) * 3;
             float nx = nb[0], ny = nb[1], nz = nb[2];
             if (nx * nx + ny * ny + nz * nz < 0.25f) continue; // unwritten / degenerate
-            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) { nx = -nx; ny = -ny; nz = -nz; }
+            if (nx * -cx + ny * -cy + nz * -cz < 0.0f) { nx = -nx; ny = -ny; nz = -nz; } // toward eye
 
-            // Per-pixel rotation angle (interleaved gradient noise), advanced
-            // every frame so the dither is spatial + temporal.
+            // Per-pixel rotation: interleaved gradient noise, advanced each frame
+            // for spatial + temporal dither.
             float fphase = 5.588238f * (float)(frame_index & 63u);
             float na = 0.06711056f * (float)x + 0.00583715f * (float)y + fphase;
             na = 52.9829189f * (na - floorf(na));
             float ang = (na - floorf(na)) * 6.28318531f;
             float rcos = cosf(ang), rsin = sinf(ang);
 
-            // Build a TBN from N and the rotated in-plane direction.
+            // TBN from N and the rotated in-plane direction.
             float rvx = rcos, rvy = rsin, rvz = 0.0f;
             float rdotn = rvx * nx + rvy * ny + rvz * nz;
             float tx = rvx - nx * rdotn, ty = rvy - ny * rdotn, tz = rvz - nz * rdotn;
@@ -889,16 +840,13 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
 
             float clamped_depth = eye_depth < min_eye_clamp ? min_eye_clamp : eye_depth;
             float radius = world_radius * (eye_depth / clamped_depth); // shrink only when extremely close
-            // Cap the kernel's screen reach to ssao_max_radius_px: closer
-            // surfaces clamp the world radius down so a tile never samples more
-            // than one tile away (keeps the 3x3 opportunistic overlap valid).
+            // Cap screen reach to ssao_max_radius_px so a tile never samples
+            // more than one tile away (keeps the 3x3 overlap valid).
             float max_world = (float)ssao_max_radius_px * eye_depth / focal_px;
             if (radius > max_world) radius = max_world;
 
-            // 4-wide masked tap loop: two groups of four independent probes
-            // (google/highway; the same code lowers to NEON natively and to
-            // wasm simd128 on the web build). All arithmetic runs branchless
-            // under lane masks; the only scalar step is the depth gather.
+            // 4-wide masked tap loop: two groups of four probes, branchless under
+            // lane masks; only the depth gather is scalar.
             namespace hs = hwy_static;
             const hs::FixedTag<float, 4> df;
             const auto vzero = hs::Zero(df);
@@ -910,7 +858,6 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
             const auto rv  = hs::Set(df, radius);
             float occlusion = 0.0f;
             for (int g = 0; g < 2; g++) {
-                // Tangent-space kernel samples -> eye space, offset from P.
                 const auto kxv = hs::LoadU(df, kern.x + g * 4);
                 const auto kyv = hs::LoadU(df, kern.y + g * 4);
                 const auto kzv = hs::LoadU(df, kern.z + g * 4);
@@ -923,9 +870,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
                 const auto valid = hs::Lt(spz, hs::Set(df, -0.0001f)); // behind / at the eye
                 if (hs::AllFalse(df, valid)) continue;
 
-                // Project the eye-space samples to pixels (perspective divide;
-                // proj(3,2) = -1). Masked-out lanes may divide by ~0 -> garbage,
-                // but they are never selected below.
+                // Project samples to pixels (proj(3,2) = -1). Masked-out lanes
+                // may divide by ~0, but are never selected below.
                 const auto inv_cw = hs::Div(hs::Set(df, -1.0f), spz);
                 const auto s_ndc_x = hs::Mul(hs::Mul(hs::Set(df, proj00), spx), inv_cw);
                 const auto s_ndc_y = hs::Mul(hs::Mul(hs::Set(df, proj11), spy), inv_cw);
@@ -937,8 +883,7 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
                             hs::And(hs::Ge(syf, vzero), hs::Lt(syf, hs::Set(df, (float)screen_height)))));
                 if (hs::AllFalse(df, mask)) continue;
 
-                // Real surface eye z at each sample pixel, read from the
-                // linear-Z G-buffer (scalar gather). Off-screen/behind lanes
+                // Real surface eye z per sample (scalar gather). Off-screen lanes
                 // get geom_z == spz, which the biased compare always rejects.
                 uint8_t mbits[1];
                 hs::StoreMaskBits(df, mask, mbits);
@@ -953,8 +898,8 @@ void apply_ssao_strip(uint8_t* pixels, int pitch, const float* linear_z,
                 }
                 const auto gzv = hs::LoadU(df, gz);
 
-                // Occluded when the real surface sits in front of the sample
-                // point (closer to the eye => larger, less-negative z).
+                // Occluded when the real surface is in front of the sample
+                // (closer to eye => larger, less-negative z).
                 const auto hit = hs::And(hs::Ge(gzv, hs::Add(spz, hs::Set(df, depth_bias))), mask);
                 if (hs::AllFalse(df, hit)) continue;
                 auto rc = hs::Min(hs::Div(hs::Set(df, world_radius), hs::Abs(hs::Sub(czv, gzv))), vone);

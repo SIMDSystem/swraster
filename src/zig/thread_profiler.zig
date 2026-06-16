@@ -1,5 +1,4 @@
-// thread_profiler.zig — per-thread concurrency overlay. Mirrors
-// thread_profiler.h + thread_profiler.cpp.
+// thread_profiler — per-thread concurrency overlay.
 
 const std = @import("std");
 const platform = @import("platform.zig");
@@ -230,8 +229,7 @@ pub fn threadProfilerDraw(p: *ThreadProfiler, pixels: [*]u8, pitch: i32, surface
         }
     }
 
-    // One lane painter for all three interval kinds: a flat color when given
-    // (physics), otherwise per-tag raster/TL palettes.
+    // Lane painter: flat_color for physics, else per-tag raster/TL palettes.
     const drawLane = struct {
         fn f(pp: *ThreadProfiler, pix: [*]u8, pit: i32, lane_index: i32, intervals: []const ProfilerInterval, lts: u64, ledge: i32, redge: i32, sw: i32, sh: i32, is_raster: bool, flat_color: ?u32, format2: *const PixelFormat) void {
             const y0 = pp.top_y + lane_index * (pp.lane_height_px + pp.lane_gap_px);

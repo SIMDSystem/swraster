@@ -1,5 +1,4 @@
-// clip.odin — vertex transform, near-plane clipping, screen-space projection,
-// and the matrix builders. Mirrors clip.h + clip.cpp.
+// clip.odin — vertex transform, near-plane clipping, projection, matrix builders.
 
 package main
 

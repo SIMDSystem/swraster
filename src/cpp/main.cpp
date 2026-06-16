@@ -1,32 +1,5 @@
-// swraster — software rasterizer entry point.
-//
-// What lives in this file:
-//   - Parse --threadperf arg, open log
-//   - Bring up Platform (window/framebuffer)
-//   - Load textures, generate geometry, init Jolt, build scene
-//   - Allocate IPC buffers (triangle/strip/shadow-box double-buffers,
-//     per-frame matrix ring, depth buffers, T&L per-thread scratch pads)
-//   - Construct RendererContext + PhysicsPipeline and wire them together
-//   - Spawn worker threads (T&L, raster, physics)
-//   - Hand control to run_render_loop()
-//   - Stop and join worker threads, close Jolt
-//
-// All per-frame logic lives elsewhere:
-//   - threading.* : thread-pool sync primitives + RasterJobMode + --threadperf timing
-//   - render_buffers.h : plain IPC types (RenderTriangle, TriangleBuffer,
-//                       PoseSnapshot, TLSharedData, RasterSharedData…)
-//   - physics_setup.* : Jolt callbacks, layer interfaces, Factory RAII
-//   - physics_pipeline.* : the physics producer thread + pose snapshot pipeline
-//   - scene.*         : CubeInstance, InitialInstanceState, WallData, scene
-//                       builders, write_instance_pose_snapshot
-//   - tl_worker.*     : T&L worker thread main
-//   - raster_worker.* : raster worker thread main
-//   - render_loop.*   : the per-frame loop body and reset_animation
-//   - clip / draw / shadow / texture / pixel : pure render math
-//   - platform.*      : windowing/input/blit/BMP abstraction (macOS Cocoa, web canvas)
-//   - geometry.*      : primitive generators (cube, sphere, torus, teapot)
-//   - renderer_context.h : the by-ref struct shared with workers and the loop
-//   - fps.h           : on-screen FPS counter
+// swraster entry point: bring up the platform, build the scene, spawn the
+// worker pool + physics thread, then run the render loop and tear down.
 
 #include <cstring>
 #include <cstdio>
@@ -78,8 +51,7 @@ static inline void set_physics_qos() {
 static inline void set_physics_qos() {}
 #endif
 
-// macOS app-bundle aware texture loader. Tries bundled Resources first,
-// then falls back to ../Resources/ and the CWD for command-line runs.
+// Texture loader: bundled .app Resources first, then assets/ near the binary or CWD.
 static Surface* load_texture(const char* basename) {
 #if defined(__APPLE__) && !defined(__EMSCRIPTEN__)
     {
@@ -96,9 +68,7 @@ static Surface* load_texture(const char* basename) {
                     Surface* s = Platform::LoadBMP(texture_path);
                     if (s) return s;
                 }
-                // Relative to the executable's directory (CWD-independent).
-                // The raw binary sits at <repo>/build/cpp/bin/raster, so walk
-                // a few levels up looking for assets/ (same as the other ports).
+                // Walk up from the binary (<repo>/build/cpp/bin/raster) for assets/.
                 if (char* slash = strrchr(real_path, '/')) {
                     *slash = '\0';
                     static const char* rels[] = {
@@ -176,8 +146,6 @@ int main(int argc, char** argv) {
     generate_torus (1.0f, 0.4f, 32, 10, torus_vertices, torus_faces);
     generate_teapot(teapot_vertices, teapot_faces);
     generate_sphere(0.3f, 8, 6,      smallball_vertices, smallball_faces);
-    // Small spotlight housing: a sphere shell with a 35-deg opening carved at
-    // the +Y pole (the local beam axis). Oriented along the spotlight each frame.
     generate_spotlight_housing(0.5f, 20, 12, 35.0f, lamp_vertices, lamp_faces);
 
     const float box_half   = 6.0f;
@@ -207,8 +175,7 @@ int main(int argc, char** argv) {
     ObjectVsBroadPhaseLayerFilterImpl object_vs_broadphase_layer_filter;
     ObjectLayerPairFilterImpl         object_vs_object_layer_filter;
 
-    // PhysicsSystem must be destroyed AFTER JobSystem (which stops threads).
-    // Declared BEFORE JobSystem so destruction order on scope unwind is correct.
+    // Declared before JobSystem so scope-unwind destroys PhysicsSystem after it.
     TempAllocatorImplWithMallocFallback temp_allocator(64 * 1024 * 1024);
     PhysicsSystem       physics_system;
     JobSystemThreadPool job_system;
@@ -237,10 +204,8 @@ int main(int argc, char** argv) {
     printf("Jolt: Created %zu physics bodies\n", instances.size());
     physics_system.OptimizeBroadPhase();
 
-    // Render-only spotlight housing (no physics body). Its pose is overwritten
-    // analytically each frame to sit at the light and aim its opening along the
-    // beam. Added before the initial-state capture / pose-snapshot init so the
-    // pose arrays are sized to include it.
+    // Render-only spotlight housing (no body); pose injected each frame. Added
+    // before the pose-snapshot init so the pose arrays include it.
     int lamp_instance_index = -1;
     if (USE_SPOTLIGHT) {
         CubeInstance lamp;
@@ -288,11 +253,7 @@ int main(int argc, char** argv) {
         opaque_strip_buffers[b].bins.resize(NUM_TILE_BINS);
         trans_strip_buffers [b].bins.resize(NUM_TILE_BINS);
         shadow_strip_buffers[b].bins.resize(NUM_TILE_BINS);
-        // Pre-reserve the published per-tile bins so the first dozen
-        // frames don't realloc-and-copy under T&L phase-2 inplace_merge
-        // (which inserts all worker contributions into one bin). Sized
-        // to absorb a few hundred tris per bin without growth; if the
-        // scene is calmer the periodic_capacity_shrink will trim later.
+        // Pre-reserve bins so early frames don't realloc under T&L bin merge.
         for (int s = 0; s < NUM_TILE_BINS; s++) {
             opaque_strip_buffers[b].bins[s].reserve(512);
             trans_strip_buffers [b].bins[s].reserve(128);
@@ -303,9 +264,7 @@ int main(int argc, char** argv) {
     ShadowBoxBuffer shadow_box_buffers[2];
     LuminaireConeBuffer cone_buffers[2];
     for (int b = 0; b < 2; b++) {
-        // Pre-reserve so the first frame's build_luminaire_cone_tl doesn't
-        // allocate inside the T&L profiler interval. Capacity is fixed by
-        // the cone tessellation.
+        // Pre-reserve so the first cone build doesn't allocate inside T&L timing.
         cone_buffers[b].tris.reserve(LUMINAIRE_CONE_SEGMENTS);
         cone_buffers[b].valid = false;
     }
@@ -325,11 +284,7 @@ int main(int argc, char** argv) {
         out.opaque_bins.resize(NUM_TILE_BINS);
         out.trans_bins .resize(NUM_TILE_BINS);
         out.shadow_bins.resize(NUM_TILE_BINS);
-        // Per-worker thread-local bins. With 256 tile bins and ~3 T&L
-        // workers, each worker's per-tile bin sees roughly one-third of
-        // the total triangle traffic — pre-reserve enough that hot
-        // scenes (light right on top of geometry) don't trigger the
-        // grow-and-realloc cycle that double-buffers every push.
+        // Pre-reserve per-worker bins so hot scenes don't grow-and-realloc.
         for (int s = 0; s < NUM_TILE_BINS; s++) {
             out.opaque_bins[s].reserve(256);
             out.trans_bins [s].reserve(96);
@@ -349,11 +304,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::pair<float, size_t>> instance_depths;
     instance_depths.reserve(instances.size());
-    // Per-frame eye-space occluder list (cube + sphere instances). Built
-    // by render_loop.cpp once per frame; consumed concurrently by T&L
-    // workers running small-ball occlusion checks. Reserve a generous
-    // upper bound (every non-smallball candidate) so the per-frame
-    // push_back loop never reallocates.
+    // Per-frame eye-space occluders; reserve an upper bound so the build never reallocates.
     std::vector<OccluderEye> occluders_eye;
     occluders_eye.reserve(instances.size());
 
@@ -428,9 +379,6 @@ int main(int argc, char** argv) {
     thread_profiler_init(profiler, launched_tl_threads, launched_raster_threads);
 
     // ----- 9. Spawn workers -----
-    // One unified pool. Its size is the (larger) raster thread count; the
-    // first NUM_TL_THREADS of them double as the T&L-preferred subset each
-    // frame. Sizing to hardware concurrency avoids oversubscription.
     int pool_size = launched_raster_threads;
     std::vector<std::thread> pool_workers;
     pool_workers.reserve(pool_size);

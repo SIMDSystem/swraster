@@ -1,9 +1,7 @@
-// render_config.odin — shared compile-time configuration + small POD typedefs.
-// Mirrors render_config.h. Runtime thread counts are written by init_thread_counts.
+// render_config.odin — shared compile-time configuration + small typedefs.
 
 package main
 
-// True for emscripten-linked wasm builds (freestanding_wasm32) and Odin's js target.
 IS_WEB_TARGET :: ODIN_ARCH == .wasm32 || ODIN_ARCH == .wasm64p32 || ODIN_OS == .JS
 
 NEAR_PLANE :: f32(1.0)
@@ -41,13 +39,9 @@ LUMINAIRE_CONE_SEGMENTS :: i32(64)
 
 TILE_X_SPLITS :: i32(16)
 
-// ---------------------------------------------------------------------------
-// [dynamic] warm-start capacities, mirroring the Zig ensureTotalCapacity values.
-// Lists still grow on demand (append/reserve); private per-worker lists are
-// only touched by their owner, and the shared strip bins only grow while the
-// owning tile_bin_lock is held, so relocation is safe. The IPC triangle buffers
-// are fixed slot arrays (C++ vector.size()); merge_tl_globals never grows them.
-// ---------------------------------------------------------------------------
+// [dynamic] warm-start capacities. Lists grow on demand; shared strip bins only
+// relocate under their tile_bin_lock, so growth is safe. IPC triangle buffers are
+// fixed slot arrays — merge_tl_globals never grows them.
 
 IPC_OPAQUE_TRI_CAP       :: 100_000
 IPC_TRANS_TRI_CAP        :: 100_000
@@ -71,8 +65,7 @@ NUM_RASTER_THREADS: i32 = 0
 NUM_STRIPS: i32 = 0
 NUM_TILE_BINS: i32 = 0
 
-// Divides [0, extent) into `splits` contiguous tiles. Tile `idx` covers pixels
-// [lo, hi] inclusive.
+// Tile `idx` of `splits` covers pixels [lo, hi] inclusive within [0, extent).
 tile_span :: proc(extent, splits, idx: i32) -> (lo, hi: i32) {
 	lo = (idx * extent) / splits
 	hi = ((idx + 1) * extent) / splits - 1

@@ -1,7 +1,4 @@
-// linalg.odin — minimal float linear algebra (Eigen replacement).
-//
-// Matrices are row-major (m[row][col]); matrix*vector and matrix*matrix follow
-// standard linear algebra so `projection * v` reproduces Eigen's behaviour 1:1.
+// linalg.odin — minimal float linear algebra. Matrices are row-major (m[row][col]).
 
 package main
 
@@ -111,7 +108,6 @@ vec4_scale :: #force_inline proc(a: Vec4, s: f32) -> Vec4 {
 }
 
 Mat3 :: struct {
-	// row-major: m[row][col]
 	m: [3][3]f32,
 }
 
@@ -128,7 +124,6 @@ mat3_mul_vec3 :: #force_inline proc(a: Mat3, v: Vec3) -> Vec3 {
 }
 
 Mat4 :: struct {
-	// row-major: m[row][col]
 	m: [4][4]f32,
 }
 
@@ -143,7 +138,7 @@ mat4_identity :: #force_inline proc() -> Mat4 {
 	return r
 }
 
-// Row-major TRS from physics/instance pose (matches Eigen model matrix in tl_worker.cpp).
+// Row-major TRS from a translation + quaternion pose.
 mat4_from_pose :: proc(tx, ty, tz, qx, qy, qz, qw: f32) -> Mat4 {
 	model := Mat4{}
 	model.m[0][0] = 1.0 - 2.0 * (qy * qy + qz * qz)
@@ -210,7 +205,7 @@ mat4_block33 :: #force_inline proc(a: ^Mat4) -> Mat3 {
 	}
 }
 
-// General 4x4 inverse (cofactor expansion). Mirrors Eigen's Matrix4f::inverse().
+// General 4x4 inverse via cofactor expansion.
 mat4_inverse :: proc(a: Mat4) -> Mat4 {
 	x := a.m
 	m := [16]f32{
@@ -255,7 +250,7 @@ Quat :: struct {
 	x, y, z, w: f32,
 }
 
-// Eigen's Quaternionf::setFromTwoVectors(a, b): shortest-arc rotation mapping a onto b.
+// Shortest-arc rotation mapping a onto b.
 quat_from_two_vectors :: proc(a_in, b_in: Vec3) -> Quat {
 	a := vec3_normalized(a_in)
 	b := vec3_normalized(b_in)

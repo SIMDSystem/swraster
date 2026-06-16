@@ -13,45 +13,11 @@
 #include "draw.h"
 #include "thread_profiler.h"
 
-// Raster half of the unified pool. Called once per frame by every pool worker
-// (T&L-preferred workers reach it after finishing their T&L; the rest enter
-// immediately). All workers cooperatively drain the previous frame's raster
-// passes via the shared pass state machine in threading.h:
-//
-//   ShadowDepth -> Color (+ SSAO overlapped) -> Luminaire
-//
-// shadow depth must complete before color samples the shadow map. Color and
-// SSAO share one TILE_X_SPLITS x NUM_STRIPS tile grid, and an SSAO pixel reads
-// the depth buffer no further than one tile away, so SSAO is *not* gated on a
-// whole-pass barrier: an SSAO tile runs as soon as its own Color tile plus its
-// in-bounds 8-neighbor Color tiles are done (off-edge neighbors are ready by
-// definition). Each Color tile, on completion, publishes its color_tile_done
-// flag and opportunistically runs any SSAO tile in its 3x3 neighborhood that
-// just became fully surrounded; a worker that runs out of Color tiles drains
-// whatever SSAO is already unblocked. The last Color tile is guaranteed to
-// unblock the last SSAO tiles, so SSAO fully overlaps the Color pass tail. The
-// dedicated SSAO pass (raster_pass == Ssao) is then just a drain+wait for any
-// tiles still in flight.
-//
-// Pull model: a completed Color tile only ever tries its OWN SSAO (gated on its
-// 8 neighbors being Color-complete); it never reaches out to trigger neighbors'
-// SSAO. Likewise a completed SSAO tile only runs its OWN two Luminaire cone
-// tiles. Every tile owns its eligibility test, and ssao_drain re-tests stragglers.
-//
-// The 'b' key flips raster_hard_barrier. When ON, all opportunistic overlap is
-// disabled: SSAO runs only in the SSAO pass and Luminaire only in the Luminaire
-// pass, each pass fully draining before the next — clean, strictly-ordered
-// timing. When OFF (default) the overlap above is active. Either way, the
-// per-tile color_tile_done + ssao_tile_done checks in run_lum_tile remain a hard
-// barrier so no cone pixel is drawn before that tile's RGB and SSAO are done.
-//
-// Each pass owns per-row claim counters (raster_row_next_col[pass][row]) so
-// advancing a pass never resets a counter another worker is mid-claim on.
-// Workers are row-sticky for cache locality. A worker with no claimable tile
-// and a pass that hasn't advanced blocks on cv_pool (a real dependency wait,
-// not a busy-wait).
-//
-// Profiler: one ProfilerInterval per tile, bracketing just the tile's work.
+// Workers drain the previous frame's passes (ShadowDepth -> Color (+SSAO
+// overlapped) -> Luminaire) via the shared pass state machine. SSAO/Luminaire
+// overlap is pull-based: each completed Color tile runs any now-eligible SSAO in
+// its 3x3 neighbourhood, each completed SSAO runs its own two cone tiles. The
+// 'b' key (raster_hard_barrier) disables overlap for strictly-ordered timing.
 void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) {
     if (!pool_do_raster) return;
 
@@ -59,16 +25,14 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
     int buf_id = active_raster_buf_id;
     auto& rs = ctx.raster_shared[buf_id];
 
-    // Snapshot the barrier mode once for the whole frame so it can't flip
-    // mid-frame and leave a pass half-overlapped.
+    // Snapshot once so the mode can't flip mid-frame.
     const bool hard_barrier = raster_hard_barrier.load(std::memory_order_relaxed);
 
-    // Color & SSAO share this grid; X columns by R rows.
     const int X = TILE_X_SPLITS;
     const int R = NUM_STRIPS;
     const int total_cs_tiles = R * X;
 
-    // Monotonic, idempotent pass advance: only ever moves raster_pass forward.
+    // Monotonic pass advance: only ever moves raster_pass forward.
     auto advance_pass_to = [&](int next) {
         bool wake_main = false;
         {
@@ -80,15 +44,12 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
         }
         cv_pool.notify_all();
         if (wake_main) {
-            // Empty mtx_main critical section closes the predicate-check /
-            // wait() race with the main thread.
+            // Empty lock parks main's wait-side before signalling (lost-wakeup guard).
             { std::lock_guard<std::mutex> lock(mtx_main); }
             cv_main.notify_one();
         }
     };
 
-    // Color/SSAO tile rectangle (shared NUM_STRIPS x TILE_X_SPLITS grid).
-    // Same tile_span() formula as Luminaire and shadow so all passes agree.
     auto cs_tile_rect = [&](int tile_col, int strip_idx,
                             int& x_min, int& x_max, int& y_min, int& y_max) {
         tile_span(rs.screen_width,  X, tile_col,   x_min, x_max);
@@ -130,7 +91,7 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
                                             &tri.rgb_setup);
         };
 
-        // Opaque first, merged front-to-back with the per-tile bin.
+        // Opaque front-to-back, merged with the per-tile bin.
         const auto& opaque_strip = rs.opaque_strip_triangles->bins[tile_idx];
         if (ENABLE_RGB_TRIANGLE_SORT) {
             size_t og = 0, os = 0;
@@ -145,7 +106,7 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             for (const auto& tri : opaque_strip) draw_color_tri(tri, rs.depth_write_enabled);
         }
 
-        // Transparent second, merged back-to-front with depth writes off.
+        // Transparent back-to-front, depth writes off.
         const auto& trans_strip = rs.trans_strip_triangles->bins[tile_idx];
         if (ENABLE_RGB_TRIANGLE_SORT) {
             size_t tg = 0, ts = 0;
@@ -180,13 +141,11 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
                                c1 > c0 ? c1 - c0 : 0, (uint8_t)RasterJobMode::Ssao);
     };
 
-    // Luminaire (spotlight cone) uses the finer 2*NUM_STRIPS grid. A fine tile
-    // (col, fstrip) lies entirely within coarse tile (col, fstrip>>1).
+    // Luminaire cone uses the finer 2*NUM_STRIPS grid; fine tile (col, fstrip)
+    // nests inside coarse tile (col, fstrip>>1).
     auto do_lum_tile = [&](int tile_col, int fstrip) {
         Uint64 t0 = Platform::PerfCounter();
         Uint64 c0 = Platform::ThreadCpuNs();
-        // Fine 2*NUM_STRIPS row grid; nests exactly inside the coarse Color/SSAO
-        // grid that gates this tile (see tile_span()). Same X column split.
         int x_min, x_max, y_min, y_max;
         tile_span(rs.screen_width,  X,     tile_col, x_min, x_max);
         tile_span(rs.screen_height, R * 2, fstrip,   y_min, y_max);
@@ -203,17 +162,9 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
     };
 
     const int total_lum_tiles = (R * 2) * X;
-    // Claim (one worker per fine tile) and run a Luminaire tile once the RGB
-    // tile it blends on top of is finished. The cone reads depth and blends
-    // over the tile's final shaded color, so it depends on that tile's:
-    //   - RGB color   (color_tile_done) and depth (written by the same pass), and
-    //   - SSAO        (ssao_tile_done) — the cone blends over the AO-darkened
-    //                 result and writes the same pixels, so it must trail SSAO
-    //                 on this tile to match the original pass order and avoid a
-    //                 same-tile pixel write-race.
-    // ssao_tile_done implies color_tile_done, but we check both so the RGB+depth
-    // dependency is explicit and independent of the SSAO chain. No neighbor
-    // checks: the cone stays within its own tile.
+    // Run a Luminaire tile once its coarse tile's Color and SSAO are both done
+    // (it blends over the AO-darkened pixels, so it must trail SSAO to avoid a
+    // same-tile write-race). One worker per fine tile; no neighbour checks.
     auto run_lum_tile = [&](int col, int fstrip) -> bool {
         int coarse = fstrip >> 1;
         if (color_tile_done[coarse * X + col].load(std::memory_order_acquire) == 0) return false;
@@ -244,10 +195,8 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
     auto color_done = [&](int c, int r) {
         return color_tile_done[r * X + c].load(std::memory_order_acquire) != 0;
     };
-    // SSAO's kernel is capped at SSAO_MAX_RADIUS_PX (16px) of screen reach, so
-    // a tile reads depth at most one tile away. An SSAO tile is therefore
-    // eligible as soon as it + its in-bounds 8 neighbours are Color-done
-    // (off-edge neighbours are ready by definition) — no whole-pass barrier.
+    // SSAO reads depth at most one tile away, so a tile is eligible once it + its
+    // in-bounds 8 neighbours are Color-done.
     auto ssao_eligible = [&](int c, int r) {
         for (int dr = -1; dr <= 1; dr++)
             for (int dc = -1; dc <= 1; dc++) {
@@ -266,11 +215,7 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             return false;
         }
         do_ssao_tile(c, r);
-        // Publish SSAO completion (release). This tile's SSAO is now done, so —
-        // unless the hard barrier is on — opportunistically run THIS tile's own
-        // two Luminaire fine tiles (the cone stays within the tile; no neighbor
-        // dependency). We never reach into neighbor tiles. With the hard barrier
-        // on, the cone waits for its dedicated pass instead.
+        // Publish, then (unless hard barrier) run this tile's own two cone tiles.
         ssao_tile_done[r * X + c].store(1, std::memory_order_release);
         if (!hard_barrier) {
             for (int half = 0; half < 2; half++) {
@@ -284,9 +229,7 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
         if (done >= total_cs_tiles) advance_pass_to((int)RasterJobMode::Luminaire);
         return true;
     };
-    // Drain every currently-eligible, unclaimed SSAO tile. Returns once a full
-    // scan finds nothing claimable (other workers may still be finishing Color
-    // tiles that will unblock more — handled by their opportunistic scan).
+    // Drain every currently-eligible, unclaimed SSAO tile.
     auto ssao_drain = [&]() {
         bool progressed = true;
         while (progressed) {
@@ -304,15 +247,10 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
         if (P >= RASTER_PASS_COUNT) break;
         RasterJobMode job_mode = (RasterJobMode)P;
 
-        // shadow_only pre-pass: bail the instant the shadow-depth pass is done
-        // (pass has advanced past it). We never run Color/SSAO/Luminaire here.
+        // shadow_only pre-pass: bail once shadow-depth is done.
         if (shadow_only && job_mode != RasterJobMode::ShadowDepth) break;
 
         if (job_mode == RasterJobMode::Ssao) {
-            // Color fully drained: every remaining SSAO tile is now eligible.
-            // Finish SSAO only; Luminaire waits for the dedicated pass (entered
-            // once the last SSAO tile advances the pass), so the cone can never
-            // run ahead of any tile's SSAO.
             ssao_drain();
             std::unique_lock<std::mutex> lk(mtx_pool);
             cv_pool.wait(lk, [&] {
@@ -323,7 +261,6 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
         }
 
         if (job_mode == RasterJobMode::Luminaire) {
-            // SSAO fully drained: every Luminaire fine tile is now eligible.
             lum_drain();
             std::unique_lock<std::mutex> lk(mtx_pool);
             cv_pool.wait(lk, [&] {
@@ -333,16 +270,13 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             continue;
         }
 
-        // ShadowDepth and Color use the coarse NUM_STRIPS grid the triangle
-        // bins were built against.
+        // ShadowDepth and Color use the coarse NUM_STRIPS bin grid.
         int cols_total   = TILE_X_SPLITS;
         int strips_total = NUM_STRIPS;
         int total_tiles  = strips_total * cols_total;
 
-        // Initial row spread so two workers never start on adjacent strips
-        // (adjacent strips share L2/L3 working sets on the shadow/color/depth
-        // buffers; shadow depth in particular thrashes when neighbours
-        // compete). Then drain left-to-right, advancing one row at a time.
+        // Spread workers across rows so they don't start on adjacent strips
+        // (which share cache and thrash, shadow depth especially).
         int current_row  = ((worker_id * strips_total) / pool) % strips_total;
         int rows_scanned = 0;
         while (true) {
@@ -357,12 +291,8 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
 
             if (job_mode == RasterJobMode::Color) {
                 do_color_tile(tile_col, strip_idx);
-                // Publish completion (release), then opportunistically fire any
-                // SSAO tile this completion just unblocked. With the 16px kernel
-                // cap a tile is eligible once it + its 8 neighbours are
-                // Color-done, so trying the whole 3x3 neighbourhood means the
-                // tile that finishes a neighbourhood last runs that SSAO tile
-                // immediately — SSAO overlaps the Color pass, not just its tail.
+                // Publish, then fire any SSAO tile in this 3x3 neighbourhood that
+                // this completion just unblocked.
                 color_tile_done[strip_idx * X + tile_col].store(1, std::memory_order_release);
                 int done = raster_pass_tiles_done[P].fetch_add(1, std::memory_order_acq_rel) + 1;
                 if (done >= total_tiles) advance_pass_to(P + 1);
@@ -378,7 +308,7 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
                 continue;
             }
 
-            // ShadowDepth: shadow-map depth raster (own SHADOW_MAP_SIZE grid).
+            // ShadowDepth raster (own SHADOW_MAP_SIZE grid).
             int tile_idx = tile_col * NUM_STRIPS + strip_idx;
 
             Uint64 tile_start_ts = Platform::PerfCounter();
@@ -443,16 +373,12 @@ void raster_worker_frame(int worker_id, RendererContext& ctx, bool shadow_only) 
             if (done >= total_tiles) advance_pass_to(P + 1);
         }
 
-        // Out of claimable Color tiles. Instead of idling while other workers
-        // finish the pass, help drain any SSAO tiles already unblocked by the
-        // Color tiles done so far (eligible once a tile + its 8 neighbours are
-        // Color-done). This is the bulk of the Color/SSAO overlap; the per-tile
-        // trigger above just lowers latency. Disabled under the hard barrier.
+        // Out of Color tiles: help drain already-unblocked SSAO instead of idling
+        // (the bulk of the overlap; the per-tile trigger above just cuts latency).
         if (job_mode == RasterJobMode::Color && !hard_barrier) ssao_drain();
 
-        // shadow_only pre-pass: we've drained every claimable shadow tile (the
-        // remainder are owned by other workers). Return rather than block so the
-        // caller can move on to T&L while the last shadow tiles finish.
+        // shadow_only: return instead of blocking so the caller can start T&L
+        // while other workers finish the last shadow tiles.
         if (shadow_only) return;
 
         std::unique_lock<std::mutex> lk(mtx_pool);

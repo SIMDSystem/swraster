@@ -1,5 +1,4 @@
-//! pixel.rs — pixel pack/unpack inlines + the 5x7 bitmap-font number renderer
-//! for the on-screen FPS readout. Mirrors pixel.h + pixel.cpp / pixel.zig.
+//! Pixel pack/unpack inlines + 5x7 bitmap-font number/text renderer.
 
 use crate::platform::PixelFormat;
 
@@ -59,8 +58,7 @@ pub fn add_pixel_rgb(
     );
 }
 
-/// Raw-pointer variant for the hot raster passes that operate on a shared
-/// framebuffer row (`row` points at pixel x==0 of the row).
+/// Raw-pointer variant for the hot raster passes (`row` points at pixel x==0).
 #[inline]
 pub unsafe fn add_pixel_rgb_ptr(
     row: *mut u32,

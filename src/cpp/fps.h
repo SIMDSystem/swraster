@@ -1,8 +1,6 @@
 #pragma once
 
-// On-screen FPS indicator. Header-only: a tiny POD bookkeeper that the
-// main loop ticks once per frame and asks to draw the cached count in the
-// top-right corner of the framebuffer.
+// On-screen FPS counter.
 
 #include <cstdint>
 
@@ -20,8 +18,7 @@ struct FpsCounter {
         fps           = 0;
     }
 
-    // Returns true if the displayed FPS value was updated (i.e. one second
-    // window rolled over).
+    // Returns true when the 1s window rolls over and `fps` updates.
     bool tick(Uint64 now_ms) {
         frame_count++;
         if (now_ms - last_fps_time >= 1000) {
@@ -33,7 +30,6 @@ struct FpsCounter {
         return false;
     }
 
-    // Draw the cached count in the top-right corner of the surface.
     void draw(uint8_t* pixels, int pitch, int surface_w, PixelFormat* format) const {
         const int fps_x = surface_w - 50;
         const int fps_y = 20;

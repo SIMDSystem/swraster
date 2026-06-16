@@ -1,7 +1,5 @@
-// build.rs — compile the joltc C++ wrapper and link the prebuilt Jolt static
-// library, exactly mirroring the Makefile's native joltc flags so the wrapper's
-// ABI lines up with the libJolt.a it links against. This reuses the same
-// third_party/JoltPhysics build the C++ and Zig ports share.
+// Compile the joltc C++ wrapper and link the prebuilt Jolt static library. The
+// joltc flags must match the Makefile's so the wrapper ABI lines up with libJolt.a.
 
 use std::path::PathBuf;
 
@@ -23,8 +21,7 @@ fn main() {
     println!("cargo:rerun-if-changed={}", cpp_dir.join("physics_setup.cpp").display());
     println!("cargo:rerun-if-changed={}", cpp_dir.join("physics_setup.h").display());
 
-    // Match JOLTC_FLAGS in the Makefile: C++17, no rtti/exceptions, the same
-    // JPH_* defines as the prebuilt libJolt.a, include Jolt + src/cpp.
+    // Must match JOLTC_FLAGS in the Makefile (defines, flags, includes).
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -59,11 +56,9 @@ fn main() {
     }
     build.compile("joltc");
 
-    // Link the prebuilt Jolt static library.
     println!("cargo:rustc-link-search=native={}", jolt_lib_dir.display());
     println!("cargo:rustc-link-lib=static=Jolt");
 
-    // C++ standard library (libc++ on macOS).
     if target.contains("apple-darwin") {
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rustc-link-lib=dylib=objc");

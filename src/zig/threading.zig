@@ -1,6 +1,5 @@
-// threading.zig — renderer threading scaffolding. Mirrors threading.h +
-// threading.cpp. C++ std::atomic -> std.atomic.Value, std::mutex ->
-// std.Thread.Mutex, std::condition_variable -> std.Thread.Condition.
+// threading — renderer threading scaffolding: pool sync primitives, thread
+// counts, perf timing, and the --threadperf sweep harness.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,7 +38,7 @@ pub var cv_main: sync.Condition = .{};
 
 pub var tl_done_counter = std.atomic.Value(i32).init(0);
 
-// std::vector<std::mutex> — allocated in initThreadCounts.
+// Allocated in initThreadCounts.
 pub var tile_bin_locks: []sync.Mutex = &.{};
 
 pub var raster_row_next_col = [_][MAX_RASTER_STRIPS]std.atomic.Value(i32){[_]std.atomic.Value(i32){std.atomic.Value(i32).init(0)} ** MAX_RASTER_STRIPS} ** RASTER_PASS_COUNT;
@@ -49,7 +48,7 @@ pub var ssao_tile_claimed = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)
 pub var ssao_tile_done = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** MAX_RASTER_TILES;
 pub var lum_tile_claimed = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** MAX_RASTER_TILES;
 
-// Wait for a predicate worker threads will eventually set true.
+// Block until a worker thread sets `predicate` true.
 pub fn waitForMainThreadPredicate(context: anytype, comptime predicate: fn (@TypeOf(context)) bool) void {
     if (builtin.target.os.tag != .emscripten) {
         mtx_main.lock();
@@ -67,8 +66,7 @@ pub fn waitForMainThreadPredicate(context: anytype, comptime predicate: fn (@Typ
 
 pub const JOLT_WORKER_THREADS: i32 = 2;
 
-// emscripten exposes navigator.hardwareConcurrency here. std.Thread.getCpuCount
-// takes a BSD sysctl path on this target, pulling in an undefined sysctlbyname.
+// std.Thread.getCpuCount pulls in an undefined sysctlbyname on emscripten.
 extern fn emscripten_num_logical_cores() c_int;
 
 pub fn initThreadCounts() void {

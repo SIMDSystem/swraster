@@ -1,5 +1,5 @@
 #+build freestanding, wasm32, wasm64p32, js
-// sync_wasm.odin — emscripten pthread mutex/cond with opaque C ABI types.
+// sync_wasm.odin — emscripten pthread Mutex/Condition.
 
 package main
 

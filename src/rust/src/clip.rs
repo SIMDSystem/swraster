@@ -1,5 +1,4 @@
-//! clip.rs — vertex transform, near-plane clipping, screen-space projection, and
-//! the matrix builders. Ported from clip.zig / clip.{h,cpp}.
+//! Vertex transform, near-plane clipping, screen-space projection, matrix builders.
 
 use crate::geometry::{RenderVertexList, Vertex3D};
 use crate::linalg::{Mat3, Mat4, Vec3, Vec4};

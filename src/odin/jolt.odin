@@ -1,7 +1,5 @@
-// jolt.odin — Odin bindings to Jolt Physics via the joltc C ABI (joltc.h).
-//
-// Quaternion construction math that Jolt exposes as static helpers is
-// reimplemented here in pure Odin; everything else crosses the C boundary.
+// jolt.odin — Odin bindings to Jolt Physics via the joltc C ABI. The quaternion
+// helpers are reimplemented in Odin; everything else crosses the C boundary.
 
 package main
 
@@ -71,7 +69,6 @@ quat_rotation :: proc(axis: Vec3, angle: f32) -> Quat {
 	return {axis.x * s, axis.y * s, axis.z * s, math.cos(h)}
 }
 
-// Rotate a vector by this quaternion (Quat * Vec3).
 quat_rotate_vec3 :: proc(q: Quat, v: Vec3) -> Vec3 {
 	ux, uy, uz := q.x, q.y, q.z
 	s := q.w

@@ -1,13 +1,7 @@
 #pragma once
 
-// Aggregate of all per-frame state the worker threads + the main render
-// loop need to touch. main() stack-allocates one of these, fills it once
-// after scene init, and hands references to the workers and the loop.
-//
-// Nothing here is owned — every field is a borrowed pointer or reference
-// to data whose storage lives in main(). The struct exists purely to
-// avoid threading 30+ separate by-ref arguments through every worker /
-// loop entry point.
+// Per-frame state shared by the workers and the render loop. main() stack-
+// allocates and fills one; every field is borrowed (storage lives in main()).
 
 #include <utility>
 #include <vector>
@@ -28,7 +22,7 @@ struct ThreadProfiler;
 
 struct RendererContext {
     // ----- Window / framebuffer -----
-    Surface* fb                  = nullptr; // re-fetched per-frame by the loop
+    Surface* fb                  = nullptr; // re-fetched per frame
     int          screen_width    = 0;
     int          screen_height   = 0;
 
@@ -57,9 +51,8 @@ struct RendererContext {
     float ground_bound_radius     = 0.0f;
     float lamp_bound_radius       = 0.0f;
 
-    // Index into `instances` of the render-only spotlight-housing instance,
-    // or -1 if none (e.g. directional light). Its pose is injected analytically
-    // each frame in render_loop to track the moving light.
+    // Index of the render-only spotlight-housing instance (-1 if none); its pose
+    // is injected each frame to track the moving light.
     int   lamp_instance_index     = -1;
 
     // ----- Scene -----
@@ -92,14 +85,10 @@ struct RendererContext {
 
     std::vector<ShadowDepth>* shadow_depth_buffers = nullptr; // [2]
     std::vector<float>*       depth_buffer         = nullptr;
-    // Eye-space shading normal G-buffer, 3 floats/pixel (nx,ny,nz). Written by
-    // the opaque Color pass and consumed by SSAO so it orients its hemisphere
-    // off the smooth interpolated vertex normal instead of a faceted
-    // depth-derivative normal (which "polygonized" low-poly surfaces).
+    // Eye-space shading normal G-buffer (nx,ny,nz/pixel); SSAO orients its
+    // hemisphere off this smooth normal, not a faceted depth-derivative one.
     std::vector<float>*       normal_buffer        = nullptr;
-    // Final linear eye-space depth (= 1/inv_w), 1 float/pixel. The Color pass
-    // already forms 1/inv_w for perspective-correct attributes, so writing it is
-    // ~free; SSAO reads it directly, skipping any NDC->eye linearization.
+    // Linear eye depth (= 1/inv_w); SSAO reads it directly, no NDC->eye step.
     std::vector<float>*       linear_z_buffer      = nullptr;
 
     // ----- T&L worker IO -----
@@ -113,10 +102,8 @@ struct RendererContext {
 
     // ----- Per-frame instance state -----
     std::vector<std::pair<float, size_t>>* instance_depths  = nullptr;
-    // Eye-space occluders (cube/sphere). Rebuilt by main in a single pass
-    // alongside the depth compute, then read by T&L workers running the
-    // small-ball occlusion test in parallel. Replaces the previous
-    // O(N_smallballs * N_total) main-thread occlusion loop.
+    // Eye-space occluders (cube/sphere), built by main and read in parallel by
+    // T&L workers for the small-ball occlusion test.
     std::vector<OccluderEye>*              occluders_eye    = nullptr;
 
     // ----- Physics + benchmarking + UI -----

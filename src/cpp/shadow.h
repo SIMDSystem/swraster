@@ -1,8 +1,6 @@
 #pragma once
-// Shadow map rasterizer + samplers. The shadow buffer is a packed uint16
-// depth array (ShadowDepth from render_config.h) sized SHADOW_MAP_SIZE^2.
-// All rasterizer entry points are strip-clipped so each worker thread only
-// touches its assigned region of the shadow map.
+// Shadow map rasterizer + PCF samplers. The buffer is a uint16 depth array
+// (ShadowDepth) sized SHADOW_MAP_SIZE^2; entry points are strip-clipped.
 
 #include <Eigen/Dense>
 #include "render_config.h"
@@ -12,8 +10,7 @@ struct ShadowVertex {
     float x, y, z;
 };
 
-// Project a screen-space VertexVaryings's homogeneous shadow texcoords into
-// shadow-map pixel space. Returns false if the homogeneous w is zero.
+// Homogeneous shadow texcoords -> shadow-map pixel space. False if w is zero.
 static inline bool shadow_vertex_from_varying(const VertexVaryings& v, ShadowVertex& out) {
     if (v.sq == 0.0f) return false;
     float inv_q = 1.0f / v.sq;
@@ -23,9 +20,8 @@ static inline bool shadow_vertex_from_varying(const VertexVaryings& v, ShadowVer
     return true;
 }
 
-// Whole-map and tile-clipped shadow triangle rasterizers. The _strip variants
-// also accept a screendoor mask index (-1 = solid, 0..7 = stipple pattern)
-// to allow per-instance alpha-to-coverage style fades cheaply.
+// Shadow triangle rasterizers. _strip takes a screendoor mask index
+// (-1 solid, 0..7 stipple) for cheap per-instance coverage fades.
 void draw_shadow_triangle(ShadowDepth* shadow_depth, int shadow_size,
                           const ShadowVertex& v0, const ShadowVertex& v1, const ShadowVertex& v2);
 void draw_shadow_triangle_strip(ShadowDepth* shadow_depth, int shadow_size,

@@ -1,9 +1,6 @@
 #pragma once
 
-// Per-frame IPC buffers between T&L workers, raster workers, and main.
-// Plain old data — no logic, no allocation hooks, no lifetime gymnastics.
-// Renderer threading globals live in threading.h; scene-side data
-// (CubeInstance, instance lists, physics handles) lives in scene.h.
+// Per-frame IPC buffers between T&L workers, raster workers, and main. POD only.
 
 #include <cstdint>
 #include <cstddef>
@@ -16,16 +13,15 @@
 #include "render_config.h"
 #include "geometry.h"
 #include "clip.h"
-#include "cull.h"     // OccluderEye
-#include "draw.h"     // VertexVaryings, RasterTriangleSetup
-#include "shadow.h"   // ShadowVertex
-#include "texture.h"  // PackedTexture (used as opaque pointer here)
-#include "keysort.h"  // KeyIdx + sort_by_key scratch
+#include "cull.h"
+#include "draw.h"
+#include "shadow.h"
+#include "texture.h"
+#include "keysort.h"
 
-struct CubeInstance; // defined in scene.h
+struct CubeInstance;
 
-// One triangle ready for rasterization: post-T&L varyings + bbox/barycentric
-// setup + material/shadow flags. Bulk type kept in flat vectors and bins.
+// One triangle ready for rasterization: post-T&L varyings + setup + flags.
 struct RenderTriangle {
     VertexVaryings v0, v1, v2;
     RasterTriangleSetup rgb_setup;
@@ -36,34 +32,24 @@ struct RenderTriangle {
     int   shadow_screendoor_mask; // -1 = solid, 0..7 = 4x4 50% mask
 };
 
-// Double-buffered triangle list. `count` is the immutable valid-triangle
-// count published by T&L for that buffer slot and consumed by raster.
 struct TriangleBuffer {
     std::vector<RenderTriangle> triangles;
-    size_t count;
+    size_t count; // valid-triangle count published by T&L
 };
 
-// Per-tile bin lists (NUM_TILE_BINS bins) used by the tile-binned raster
-// dispatch path. Each bin holds RenderTriangle copies for the tiles it
-// overlaps.
+// Per-tile bins (NUM_TILE_BINS) for the tile-binned raster dispatch.
 struct StripTriangleBuffer {
     std::vector<std::vector<RenderTriangle>> bins;
 };
 
-// Cached cuboid (the camera frustum's near box) projected into shadow space.
-// Filled by T&L for the active light, consumed by raster's shadow stage.
+// Camera near box projected into shadow space; filled by T&L, read by the shadow stage.
 struct ShadowBoxBuffer {
     ShadowVertex vertices[8];
     bool         visible[8];
 };
 
-// Pre-T&L'd spotlight luminaire cone fan. The cone has a fixed segment
-// count (LUMINAIRE_CONE_SEGMENTS) so its triangle list is small and the
-// vertex transforms are identical across all raster tiles — doing them
-// once per frame in the T&L pass replaces the previous "transform 64
-// segments inside every Luminaire raster tile" pathology. Filled by T&L
-// worker thread 0 each frame (or marked !valid if the spotlight is off),
-// consumed by the Luminaire raster job.
+// Pre-T&L'd spotlight cone fan: transformed once per frame by T&L worker 0
+// instead of per raster tile. Marked !valid when the spotlight is off.
 struct LuminaireConeTri {
     VertexVaryings v0, v1, v2;
 };
@@ -72,8 +58,6 @@ struct LuminaireConeBuffer {
     bool valid = false;                 // false when spotlight is off
 };
 
-// One instance pose snapshot from the physics producer thread, consumed by
-// the renderer's animation update.
 struct InstancePose {
     float tx, ty, tz;
     float qx, qy, qz, qw;
@@ -85,8 +69,7 @@ struct PoseSnapshot {
     uint64_t sequence = 0;
 };
 
-// Inputs every T&L worker reads from. Filled by main once per frame, then
-// the workers fan out and walk shared geometry into per-thread output bins.
+// Read-only inputs for every T&L worker; filled by main once per frame.
 struct TLSharedData {
     const std::vector<CubeInstance>* instances;
     const std::vector<std::pair<float, size_t>>* sorted_instances;
@@ -129,26 +112,17 @@ struct TLSharedData {
     int   screen_width;
     int   screen_height;
     PixelFormat* format;
-    // Eye-space occluder list (type 0/1 instances), precomputed by main once
-    // per frame. T&L workers consume read-only when running small-ball
-    // (type 4) occlusion checks; the test cost is then O(occluders) per
-    // small ball instead of O(all instances) with redundant matrix work.
+    // Eye-space occluders (type 0/1), so small-ball occlusion is O(occluders)
+    // not O(all instances).
     const std::vector<OccluderEye>* occluders_eye;
-    // Read slot of the physics pose ring for this frame. T&L workers
-    // pull per-instance translation + quaternion from here when building
-    // model matrices, so there is no copy of physics output into the
-    // CubeInstance fields. Physics is concurrently writing the OPPOSITE
-    // slot, so this pointer stays valid for the duration of the T&L pass.
+    // Physics pose-ring read slot. T&L reads poses directly (no copy into
+    // CubeInstance); physics writes the opposite slot, so this stays valid.
     const PoseSnapshot* pose_snapshot;
-    // Write slot for the spotlight luminaire cone fan. T&L worker thread 0
-    // fills this each frame (or marks !valid when the spotlight is off);
-    // the raster Luminaire pass reads from the matching read slot in
-    // RasterSharedData::cone_buf_read on the next frame.
+    // Cone-fan write slot (T&L worker 0); raster reads it next frame via cone_buf_read.
     LuminaireConeBuffer* cone_buf_write;
 };
 
-// Per-T&L-thread scratch output. Allocated once at startup, cleared each
-// frame, reaggregated into the published TriangleBuffers by main.
+// Per-T&L-thread scratch output, allocated once and cleared each frame.
 struct TLThreadOutput {
     std::vector<RenderTriangle> opaque;
     std::vector<RenderTriangle> trans;
@@ -156,14 +130,13 @@ struct TLThreadOutput {
     std::vector<std::vector<RenderTriangle>> opaque_bins;
     std::vector<std::vector<RenderTriangle>> trans_bins;
     std::vector<std::vector<RenderTriangle>> shadow_bins;
-    // Reused scratch for the local key-sort (see keysort.h); per-worker so it
-    // never contends and retains capacity across frames.
+    // Per-worker key-sort scratch (keysort.h); retains capacity across frames.
     std::vector<KeyIdx>         sort_keys;
     std::vector<RenderTriangle> sort_gather;
 };
 
-// Inputs every raster worker reads from. Double-buffered so we can publish
-// frame N+1's setup while frame N's raster is still draining.
+// Read-only inputs for every raster worker; double-buffered so frame N+1's setup
+// can publish while frame N's raster drains.
 struct RasterSharedData {
     const std::vector<RenderTriangle>* opaque_triangles;
     const std::vector<RenderTriangle>* trans_triangles;
@@ -177,12 +150,8 @@ struct RasterSharedData {
     uint8_t* pixels;
     int      pitch;
     float*   depth_buffer;
-    // Eye-space normals (3 floats/pixel) written by the opaque Color pass,
-    // read by SSAO. See RenderContext::normal_buffer.
-    float*   normal_buffer;
-    // Final linear eye-space depth (1 float/pixel), written by the Color pass,
-    // read directly by SSAO. See RenderContext::linear_z_buffer.
-    float*   linear_z;
+    float*   normal_buffer; // eye-space normals; Color writes, SSAO reads
+    float*   linear_z;      // linear eye depth; Color writes, SSAO reads
     int      screen_width;
     int      screen_height;
     PixelFormat* format;
@@ -199,10 +168,7 @@ struct RasterSharedData {
     int                shadow_size;
     const ShadowBoxBuffer* shadow_box;
     bool depth_write_enabled;
-    // Monotonic frame counter, used by SSAO for temporal sample-jitter.
-    uint32_t frame_index;
-    // Pre-T&L'd spotlight cone fan from the previous frame's T&L pass.
-    // Null / !valid when the spotlight is off; otherwise the Luminaire
-    // raster job iterates this buffer per tile (no per-tile T&L work).
+    uint32_t frame_index; // SSAO temporal jitter
+    // Pre-T&L'd cone fan from the previous frame; !valid when spotlight is off.
     const LuminaireConeBuffer* cone_buf_read;
 };

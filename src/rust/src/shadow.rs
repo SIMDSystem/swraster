@@ -1,7 +1,5 @@
-//! shadow.rs — shadow-map rasterizer + PCF samplers. Ported from shadow.zig /
-//! shadow.{h,cpp}. The hot raster/sampler functions take raw pointers into the
-//! shared shadow map (like the C++/Zig originals), because raster workers write
-//! disjoint tiles/strips of one shared map concurrently.
+//! Shadow-map rasterizer + PCF samplers. The hot functions take raw pointers into
+//! the shared shadow map: raster workers write disjoint tiles/strips concurrently.
 
 use crate::clip::VertexVaryings;
 use crate::draw;
@@ -118,8 +116,7 @@ pub unsafe fn sample_shadow_compare_bilinear_2x2(
             for gx in 0..3 {
                 let fetched = *shadow_depth.add(base + gx) as u32;
                 let biased = (fetched + bias).min(0xffff);
-                // Branchless compare (cset + ucvtf); a data-dependent branch here
-                // mispredicts at every shadow edge.
+                // Branchless: a data-dependent branch mispredicts at every shadow edge.
                 grid[gy][gx] = (r16 <= biased) as u32 as f32;
             }
         }

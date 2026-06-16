@@ -1,27 +1,18 @@
-//! profiler.rs — per-thread concurrency overlay. Port of thread_profiler.zig
-//! (thread_profiler.h/.cpp). Toggled with the 's' key, it draws a rolling
-//! two-frame timeline: one horizontal lane per worker thread, with a colored
-//! bar for each job interval (T&L / shadow / color / SSAO / luminaire), a 1ms
-//! tick grid, a physics lane, and present/draw-end markers.
-//!
-//! Unlike the original — which records intervals from a persistent worker pool
-//! via profiler_record_* — this port collects each scoped worker's [start,end]
-//! span from its join handle and records it after the pass. Timestamps are
-//! nanoseconds since a fixed epoch (so they're comparable across threads).
+//! Per-thread concurrency overlay (toggled with 's'): a rolling two-frame timeline,
+//! one lane per worker, colored bars per job interval, plus a 1ms tick grid, a
+//! physics lane, and present/draw-end markers. Timestamps are ns since a fixed epoch.
 
 use crate::pixel;
 use crate::platform::PixelFormat;
 use std::time::Instant;
 
-// Raster job tags (mirror threading.zig RasterJobMode: ShadowDepth=0, Color=1,
-// Ssao=2, Luminaire=3).
+// Raster job tags.
 pub const RASTER_SHADOW: u8 = 0;
 pub const RASTER_COLOR: u8 = 1;
 pub const RASTER_SSAO: u8 = 2;
 pub const RASTER_LUMINAIRE: u8 = 3;
 
-// T&L job tags (mirror thread_profiler.zig TLJobTag: PerInstance=0, Spotlight=1,
-// BinMerge=2, LocalSort=3).
+// T&L job tags.
 pub const TL_PER_INSTANCE: u8 = 0;
 pub const TL_SPOTLIGHT: u8 = 1;
 pub const TL_BIN_MERGE: u8 = 2;
@@ -63,7 +54,7 @@ pub struct Profiler {
     frozen_blit_end: u64,
     frozen_draw_end: u64,
 
-    // Layout (logical pixels), matching thread_profiler.zig defaults.
+    // Layout (logical pixels).
     right_margin_px: i32,
     left_margin_px: i32,
     top_y: i32,
@@ -113,8 +104,8 @@ impl Profiler {
         self.epoch.elapsed().as_nanos() as u64
     }
 
-    /// The epoch `Instant` (Copy), so worker threads can timestamp their own
-    /// spans without borrowing the profiler.
+    /// The epoch `Instant` (Copy): workers timestamp their own spans without
+    /// borrowing the profiler.
     #[inline]
     pub fn epoch_instant(&self) -> Instant {
         self.epoch
@@ -133,8 +124,7 @@ impl Profiler {
         self.frozen = frozen;
     }
 
-    /// Begin a new frame: roll current intervals into the previous-frame slot,
-    /// snapshot the prior present/draw timing, and clear the current buffers.
+    /// Roll current intervals into the previous-frame slot and clear the current ones.
     pub fn begin_frame(&mut self) {
         if self.frozen {
             return;

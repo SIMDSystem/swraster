@@ -16,14 +16,8 @@
 #include <emscripten/html5.h>
 #endif
 
-// This file holds:
-//   1. Backend-independent helpers compiled on every target: the portable BMP
-//      loader (+ FreeSurface) and the per-thread CPU clock.
-//   2. The complete web (<canvas> + JS input) backend, under __EMSCRIPTEN__.
-//
-// The macOS native backend lives in platform_mac.mm (Cocoa). Each backend owns
-// its own RGBA framebuffer and implements the window/present/event/timing half
-// of the Platform API; the shared helpers below are defined exactly once here.
+// Shared helpers (BMP loader, per-thread CPU clock) plus the Emscripten web
+// backend. The macOS native backend lives in platform_mac.mm.
 
 namespace Platform {
 
@@ -31,9 +25,6 @@ namespace Platform {
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
 Uint64 ThreadCpuNs() {
-    // CLOCK_THREAD_CPUTIME_ID measures CPU time consumed by the calling
-    // thread (user+sys), excluding any time the kernel preempted it.
-    // macOS 10.12+, Linux, and emscripten (under -pthread) all support it.
     struct timespec ts;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
     return (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
@@ -129,11 +120,8 @@ PixelFormat           g_fb_format{};
 Surface               g_fb_web{};
 std::vector<uint32_t> g_fb_pixels;
 
-// Input events are pushed into this lock-protected queue by JavaScript
-// listeners registered in web_shell.html. They run on the browser main
-// thread and call the WASM-exported swr_push_* entry points below.
-// Platform::PollEvent() (called from the worker pthread that hosts our
-// renderer's main loop) drains the queue.
+// JS listeners (browser main thread) push here via the swr_push_* exports;
+// PollEvent on the renderer worker pthread drains it.
 std::mutex        g_event_mtx;
 std::deque<Event> g_event_queue;
 
@@ -143,11 +131,8 @@ void push_event(const Event& ev) {
 }
 } // anon
 
-// ---- C entry points called directly from JS in the page shell ---------------
-// EMSCRIPTEN_KEEPALIVE exports them so they're reachable as Module._swr_*().
-// USE_PTHREADS=1 makes WASM memory a SharedArrayBuffer; calling these from the
-// browser UI thread safely contends with the renderer worker pthread through
-// the std::mutex guarding the queue.
+// C entry points called from JS (KEEPALIVE-exported as Module._swr_*); the queue
+// mutex makes the browser-thread push safe against the renderer worker.
 extern "C" {
 
 EMSCRIPTEN_KEEPALIVE void swr_push_key(int key) {
@@ -200,9 +185,8 @@ bool Init(int w, int h, const char* title) {
     g_fb_web.pixels = g_fb_pixels.data();
     g_fb_web.format = &g_fb_format;
 
-    // Size the canvas + install passive page-side listeners on the browser
-    // main thread. The actual mouse/keyboard/wheel handlers that feed our
-    // queue live in web_shell.html as JS calling our swr_push_*() exports.
+    // Size the canvas + install passive listeners; the input handlers feeding
+    // our queue live in web_shell.html.
     MAIN_THREAD_EM_ASM({
         var canvas = Module.canvas;
         if (!canvas) {
@@ -228,9 +212,8 @@ void Shutdown() {
 Surface* GetFramebuffer() { return &g_fb_web; }
 
 void Present() {
-    // Synchronous blit to <canvas> via 2D context on the browser main thread.
-    // MAIN_THREAD_EM_ASM blocks the worker pthread until the JS finishes, so
-    // g_fb_pixels is safe to overwrite once we return.
+    // Synchronous blit; MAIN_THREAD_EM_ASM blocks until JS finishes, so
+    // g_fb_pixels is safe to overwrite on return.
     MAIN_THREAD_EM_ASM({
         var ptr = $0;
         var w   = $1;

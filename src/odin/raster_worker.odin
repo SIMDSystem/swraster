@@ -1,4 +1,4 @@
-// raster_worker.odin — raster half of the unified pool. Mirrors raster_worker.h + raster_worker.cpp.
+// raster_worker.odin — raster half of the unified pool.
 
 package main
 
@@ -33,6 +33,7 @@ raster_advance_pass_to :: proc(next: i32) {
 	}
 	condition_broadcast(&cv_pool)
 	if wake_main {
+		// empty lock parks main if it saw the stale pass before we signal (lost-wakeup guard).
 		mutex_lock(&mtx_main)
 		mutex_unlock(&mtx_main)
 		condition_signal(&cv_main)

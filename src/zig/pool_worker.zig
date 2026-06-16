@@ -1,7 +1,6 @@
-// pool_worker.zig — unified worker pool entry point. Mirrors pool_worker.h +
-// pool_worker.cpp. Each persistent worker sleeps on cv_pool until main publishes
-// a frame plan, then runs this frame's T&L (if T&L-preferred) and drains the
-// previous frame's raster passes.
+// pool_worker — unified worker pool entry point. Each persistent worker sleeps
+// on cv_pool until main publishes a frame plan, then runs this frame's T&L (if
+// T&L-preferred) and drains the previous frame's raster passes.
 
 const std = @import("std");
 const threading = @import("threading.zig");

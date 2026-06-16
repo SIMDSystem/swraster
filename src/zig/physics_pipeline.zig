@@ -1,5 +1,4 @@
-// physics_pipeline.zig — async physics producer. Mirrors physics_pipeline.h +
-// physics_pipeline.cpp. Jolt access is routed through jolt.zig (joltc).
+// physics_pipeline — async physics producer; Jolt access routed through jolt.zig.
 
 const std = @import("std");
 const jolt = @import("jolt.zig");
@@ -28,8 +27,7 @@ pub const PhysicsPipeline = struct {
 
     pose_snapshots: [2]PoseSnapshot = .{ .{}, .{} },
     published_snapshot: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
-    // 32-bit: wasm32 only supports atomics up to 32-bit in this Zig, and this
-    // value is publish-only (no atomic reader), so truncation is harmless.
+    // u32 not u64: wasm32 caps atomics at 32-bit; publish-only, so truncation is harmless.
     published_sequence: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     mtx: sync.Mutex = .{},

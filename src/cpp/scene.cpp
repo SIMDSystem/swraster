@@ -19,9 +19,8 @@
 using namespace JPH;
 using namespace Eigen;
 
-// Uniform random float in [0, 1). We divide by (RAND_MAX + 1.0f) — not just
-// (float)RAND_MAX — so the result never reaches 1.0 and we side-step the
-// -Wimplicit-const-int-float-conversion warning that fires under Emscripten.
+// Uniform float in [0, 1). Dividing by (RAND_MAX + 1.0f) keeps it below 1.0 and
+// dodges the -Wimplicit-const-int-float-conversion warning under Emscripten.
 static inline float rand_unit() {
     return (float)rand() / ((float)RAND_MAX + 1.0f);
 }
@@ -69,12 +68,12 @@ void build_tumbling_walls(BodyInterface& body_interface,
     };
 
     const float full = box_half + wall_thick * 2;
-    create_wall(new BoxShape(Vec3(full, wall_thick, full)), Vec3(0, -box_half - wall_thick, 0));  // Bottom
-    create_wall(new BoxShape(Vec3(full, wall_thick, full)), Vec3(0,  box_half + wall_thick, 0));  // Top
-    create_wall(new BoxShape(Vec3(wall_thick, full, full)), Vec3(-box_half - wall_thick, 0, 0)); // Left
-    create_wall(new BoxShape(Vec3(wall_thick, full, full)), Vec3( box_half + wall_thick, 0, 0)); // Right
-    create_wall(new BoxShape(Vec3(full, full, wall_thick)), Vec3(0, 0, -box_half - wall_thick)); // Back
-    create_wall(new BoxShape(Vec3(full, full, wall_thick)), Vec3(0, 0,  box_half + wall_thick)); // Front
+    create_wall(new BoxShape(Vec3(full, wall_thick, full)), Vec3(0, -box_half - wall_thick, 0));
+    create_wall(new BoxShape(Vec3(full, wall_thick, full)), Vec3(0,  box_half + wall_thick, 0));
+    create_wall(new BoxShape(Vec3(wall_thick, full, full)), Vec3(-box_half - wall_thick, 0, 0));
+    create_wall(new BoxShape(Vec3(wall_thick, full, full)), Vec3( box_half + wall_thick, 0, 0));
+    create_wall(new BoxShape(Vec3(full, full, wall_thick)), Vec3(0, 0, -box_half - wall_thick));
+    create_wall(new BoxShape(Vec3(full, full, wall_thick)), Vec3(0, 0,  box_half + wall_thick));
 }
 
 ShapeRefC build_torus_compound_shape(float major_radius, float minor_radius,
@@ -85,8 +84,7 @@ ShapeRefC build_torus_compound_shape(float major_radius, float minor_radius,
         float angle = (float)i * 2.0f * (float)M_PI / num_segments;
         float x = major_radius * cosf(angle);
         float z = major_radius * sinf(angle);
-        // Capsule axis is along Y by default. Tangent to the ring at angle θ
-        // is (-sin θ, 0, cos θ). Rotate Y to tangent: 90° around radial axis.
+        // Rotate the Y-axis capsule to the ring tangent: 90° about the radial axis.
         Quat rot = Quat::sRotation(Vec3(cosf(angle), 0, sinf(angle)), (float)M_PI * 0.5f);
         compound_settings.AddShape(Vec3(x, 0, z), rot, capsule);
     }
@@ -98,10 +96,8 @@ ShapeRefC build_torus_compound_shape(float major_radius, float minor_radius,
 }
 
 ShapeRefC build_teapot_compound_shape(float scale, int tess) {
-    // Utah teapot patch organization (from geometry.cpp):
-    //   0-3  Lid top      4-7  Body upper   8-11 Body lower
-    //  12-15 Handle      16-19 Spout       20-23 Lid handle    24-27 Lid handle base
-    //  28-31 Bottom (omitted — convexity seals it)
+    // Teapot patches: 0-3 lid top, 4-11 body, 12-15 handle, 16-19 spout,
+    // 20-27 lid handle/base; 28-31 bottom omitted (convexity seals it).
     auto bezier_sample = [](float p[4], float t) -> float {
         float mt = 1.0f - t;
         return mt*mt*mt*p[0] + 3*mt*mt*t*p[1] + 3*mt*t*t*p[2] + t*t*t*p[3];

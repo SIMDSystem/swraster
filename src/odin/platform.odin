@@ -1,9 +1,6 @@
-// platform.odin — thin portable platform layer (windowing/input/blit/BMP/timing).
-//
-// Mirrors platform.h + platform.cpp. The public API dispatches at compile time to
-// the macOS Cocoa backend (platform_mac.odin) or the emscripten web backend
-// (below). The shared helpers — the BMP loader, free_surface, and the per-thread
-// CPU clock — are defined once here, exactly as in platform.cpp.
+// platform.odin — portable platform layer (windowing/input/blit/BMP/timing).
+// The public API dispatches at compile time to the macOS Cocoa backend
+// (platform_mac.odin) or the emscripten web backend below.
 
 package main
 
@@ -13,8 +10,7 @@ import "core:sync"
 import "core:sys/posix"
 import "core:time"
 
-// SDL-style field names kept deliberately: the struct mirrors SDL_PixelFormat
-// byte-for-byte across all four ports (the Zig port keeps them too).
+// SDL_PixelFormat field names/layout kept deliberately.
 Pixel_Format :: struct #align (4) {
 	BytesPerPixel: c.int,
 	Rloss:         u8,
@@ -64,10 +60,8 @@ Event :: struct {
 // ===========================================================================
 thread_cpu_ns :: proc() -> u64 {
 	when IS_WEB_TARGET {
-		// Per-thread CPU clock through emscripten's libc, exactly like the Zig
-		// build. (web_perf_counter() here was wrong twice over: wall time, and
-		// in microseconds — the profiler treats this value as CPU nanoseconds,
-		// so busy bars drew 1000x too short and the overlay showed gaps.)
+		// Must be the per-thread CPU clock, not web_perf_counter (wall time, µs):
+		// the profiler treats this as CPU ns.
 		ts: timespec
 		if clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0 do return 0
 		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)

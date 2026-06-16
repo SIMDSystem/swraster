@@ -1,5 +1,4 @@
-// texture.zig — packed RGB textures with software mip chains plus the hot-path
-// bilinear/anisotropic samplers. Mirrors texture.h + texture.cpp.
+// texture — packed RGB textures with software mip chains + bilinear/anisotropic samplers.
 
 const std = @import("std");
 const platform = @import("platform.zig");
@@ -32,9 +31,7 @@ fn previousPowerOfTwo(v: i32) i32 {
     return std.math.floorPowerOfTwo(i32, v);
 }
 
-// Optional wrapper keeps the C++-shaped "null on any failure" contract for
-// callers; the error-union builder below gets errdefer-based cleanup so a
-// mid-build OOM cannot leak the texture, the mip levels, or the scratch.
+// Null-on-failure wrapper; the error-union builder below handles errdefer cleanup.
 pub fn makePackedTexture(allocator: std.mem.Allocator, src: ?*Surface) ?*PackedTexture {
     const s = src orelse return null;
     if (s.pixels == null or s.format == null) return null;
@@ -147,9 +144,7 @@ fn buildPackedTexture(allocator: std.mem.Allocator, s: *Surface) !*PackedTexture
 }
 
 pub inline fn sampleTextureBilinear(level: *const PackedTextureLevel, u: f32, v: f32) u32 {
-    // Match clang's default -ffp-contract=on (the C++ build contracts mul+add
-    // within expressions); Zig defaults to strict, which left this per-pixel
-    // sampler emitting un-contracted, un-reassociated float ops vs C++.
+    // .optimized enables FMA contraction (Zig defaults to strict).
     @setFloatMode(.optimized);
     const fx = u * @as(f32, @floatFromInt(level.w)) - 0.5;
     const fy = v * @as(f32, @floatFromInt(level.h)) - 0.5;
@@ -167,8 +162,7 @@ pub inline fn sampleTextureBilinear(level: *const PackedTextureLevel, u: f32, v:
     const c01 = level.rgb[@intCast((y1 & ym) * level.w + (x0 & xm))];
     const c11 = level.rgb[@intCast((y1 & ym) * level.w + (x1 & xm))];
 
-    // Blend all three channels at once: one (r,g,b) FMA chain over the 4 texels
-    // instead of three independent scalar dot products.
+    // One (r,g,b) FMA chain over the 4 texels, not three scalar dot products.
     const s00: @Vector(3, f32) = @splat((1.0 - tx) * (1.0 - ty));
     const s10: @Vector(3, f32) = @splat(tx * (1.0 - ty));
     const s01: @Vector(3, f32) = @splat((1.0 - tx) * ty);

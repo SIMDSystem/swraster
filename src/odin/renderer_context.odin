@@ -1,5 +1,4 @@
-// renderer_context.odin — aggregate of borrowed per-frame state shared by the
-// worker threads and the render loop. Mirrors renderer_context.zig.
+// renderer_context.odin — borrowed per-frame state shared by workers and the render loop.
 
 package main
 

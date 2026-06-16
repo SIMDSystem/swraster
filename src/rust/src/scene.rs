@@ -1,7 +1,5 @@
-//! scene.rs — scene description + builders. Ported from scene.zig / scene.{h,cpp}.
-//! Jolt is reached through the joltc wrapper (jolt.rs). The fixed-seed RNG is a
-//! SplitMix64 (the exact object placement differs from Zig's xoshiro, but the
-//! scene composition — counts, types, container — is identical).
+//! Scene description + builders. Uses a fixed-seed SplitMix64 RNG for reproducible
+//! object placement.
 
 use crate::geometry::{self as geom, Face, RenderVertexList, Vertex3D};
 use crate::jolt::{self, BodyId, Quat, Vec3};
@@ -74,7 +72,6 @@ pub struct WallData {
     pub local_pos: Vec3,
 }
 
-/// Deterministic SplitMix64 RNG (fixed seed for reproducibility).
 struct Rng {
     state: u64,
 }

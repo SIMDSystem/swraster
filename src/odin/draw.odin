@@ -1,5 +1,4 @@
 // draw.odin — color-buffer rasterizer + spotlight cone / luminaire / SSAO passes.
-// Mirrors draw.h + draw.cpp.
 
 package main
 
@@ -8,11 +7,8 @@ import "core:math"
 import "core:simd"
 import "core:sync"
 
-// FMA helpers: Zig's hot loops run under @setFloatMode(.optimized), which lets
-// LLVM contract the barycentric interpolation chains into fma ops. Odin has no
-// fast-math mode, so fuse explicitly. On wasm there is no FMA instruction and
-// fused_mul_add lowers to an fmaf libcall — use plain mul+add there (same
-// policy as linalg.odin).
+// FMA helpers: Odin has no fast-math mode, so fuse interpolation chains explicitly.
+// wasm has no FMA instruction (fused_mul_add -> fmaf libcall), so use plain mul+add there.
 @(private="file")
 fma4 :: #force_inline proc(a, b, c: simd.f32x4) -> simd.f32x4 {
 	when IS_WASM {
@@ -36,10 +32,9 @@ interp3 :: #force_inline proc(a0: f32, w0: simd.f32x4, a1: f32, w1: simd.f32x4, 
 	return fma4(simd.f32x4(a2), w2, fma4(simd.f32x4(a1), w1, simd.f32x4(a0) * w0))
 }
 
-// simd.min/simd.max on FLOAT vectors segfault odin dev-2026-06's wasm32
-// backend (null operand into LLVM ConstantFolder::FoldSelect; integer vector
-// min/max and the arm64 target are unaffected). Route through a compare +
-// select on wasm until the upstream fix lands.
+// wasm uses compare+select, not simd.min/max: it works around the filed upstream
+// Odin wasm simd.min/max compiler bug AND is faster (pmin/pmax beat NaN-correct min/max).
+// Keep it even after the bug is fixed.
 min4 :: #force_inline proc(a, b: simd.f32x4) -> simd.f32x4 {
 	when IS_WASM {
 		return simd.select(simd.lanes_lt(a, b), a, b)
@@ -61,9 +56,7 @@ interp3s :: #force_inline proc(a0, w0, a1, w1, a2, w2: f32) -> f32 {
 	return fma1(a2, w2, fma1(a1, w1, a0 * w0))
 }
 
-// math.floor/math.round are branchy software ports (Go's floor.go); going
-// through the simd unit lowers to a single hardware rounding op (frintm on
-// arm64, f32x4.floor on wasm). Zig's @floor/@round compile to the same.
+// math.floor is branchy software; the simd unit lowers to one hardware rounding op.
 fast_floor :: #force_inline proc(x: f32) -> f32 {
 	return simd.extract(simd.floor(simd.f32x4(x)), 0)
 }
@@ -595,10 +588,8 @@ draw_triangle_barycentric_strip :: proc(
 
 		x := x_min
 		for x <= x_max {
-			// 4-wide maskless quad path: take it only when all four lanes are
-			// covered (consistent edge sign) and all four pass the depth test,
-			// so no write mask is needed — vector compares + reduce, no
-			// per-lane extraction (mirrors Zig's @select/@reduce form).
+			// 4-wide maskless quad path: only when all four lanes are covered and
+			// pass depth, so no write mask is needed.
 			if quad_enabled && shader == .Lit && x + 3 <= x_max {
 				w0v := fma4(simd.f32x4(A0), lane_idx, simd.f32x4(w0))
 				w1v := fma4(simd.f32x4(A1), lane_idx, simd.f32x4(w1))
@@ -665,8 +656,7 @@ draw_triangle_barycentric_strip :: proc(
 					b0 := aw0 * inv_w_sum; b1 := aw1 * inv_w_sum; b2 := aw2 * inv_w_sum
 					inv_w := interp3s(v0.inv_w, b0, v1.inv_w, b1, v2.inv_w, b2)
 
-					// One reciprocal instead of a divide per varying (Zig's
-					// fast-math float mode performs this rewrite itself).
+					// One reciprocal, then multiply each varying (vs a divide per varying).
 					persp := 1.0 / inv_w
 
 					if shader == .Debug_Unlit_Red {
@@ -805,11 +795,8 @@ draw_spotlight_cone_strip :: proc(
 
 SSAO_KERNEL_SIZE :: 8
 
-// The 8-tap probe kernel, stored as two 4-lane groups: the tap loop runs
-// 4-wide (two iterations per pixel) with lane masks instead of branches.
-// Values are the same xorshift(0x9e3779b9) sequence the Zig/C++ builds
-// generate at comptime (exact f32 output of the original init_ssao_kernel),
-// baked as read-only data so LLVM can treat them as immutable.
+// 8-tap probe kernel as two 4-lane groups (tap loop runs 4-wide). The values are
+// a fixed xorshift(0x9e3779b9) sequence, baked as rodata so LLVM treats them as immutable.
 @(private="file", rodata)
 ssao_kernel_x4 := [2]simd.f32x4{
 	{-0.0683465824, 0.00404883549, -0.0776575431, -0.210358173},
@@ -886,9 +873,7 @@ apply_ssao_strip :: proc(
 			max_world := f32(ssao_max_radius_px) * eye_depth / focal_px
 			if radius > max_world do radius = max_world
 
-			// 4-wide masked tap loop: two groups of four independent probes.
-			// All arithmetic runs branchless under lane masks; the only scalar
-			// step is the depth gather (four indexed loads).
+			// 4-wide masked tap loop; only the depth gather is scalar.
 			occlusion: f32 = 0.0
 			vzero := simd.f32x4(0)
 			vone := simd.f32x4(1)

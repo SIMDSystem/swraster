@@ -1,5 +1,4 @@
-// render_buffers.odin — per-frame IPC buffers between T&L workers, raster
-// workers, and main. Mirrors render_buffers.zig. POD only.
+// render_buffers.odin — per-frame IPC buffers shared by T&L workers, raster workers, and main.
 
 package main
 
@@ -20,7 +19,7 @@ Render_Triangle :: struct {
 Triangle_Buffer :: struct {
 	triangles: Render_Triangle_List,
 	count:     int,
-	slots:     int, // fixed IPC slot count (C++ vector.size()); count is active length
+	slots:     int, // fixed IPC slot count; count is the active length within it
 }
 
 Strip_Triangle_Buffer :: struct {

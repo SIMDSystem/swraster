@@ -1,9 +1,4 @@
-//! platform.rs — portable platform layer. The pixel format description lives
-//! here (mirrors platform.zig's PixelFormat); the windowing/input/present layer
-//! is built on winit + softbuffer further down (see window module).
-//!
-//! The Rust macOS backend presents through the same IOSurface BGRA path as the
-//! C++/Zig native backends. In host-order u32 pixels this is 0xAARRGGBB.
+//! Pixel format description + runtime asset path resolution.
 
 #[derive(Clone, Copy, Debug)]
 pub struct PixelFormat {
@@ -39,8 +34,7 @@ impl Default for PixelFormat {
 }
 
 impl PixelFormat {
-    /// IOSurface 'BGRA' in little-endian memory, represented as host-order
-    /// 0xAARRGGBB: R at bit 16, G at bit 8, B at bit 0, opaque alpha.
+    /// IOSurface 'BGRA' in little-endian memory = host-order 0xAARRGGBB.
     #[cfg(not(target_os = "emscripten"))]
     pub const fn rgb888() -> PixelFormat {
         PixelFormat {
@@ -58,8 +52,7 @@ impl PixelFormat {
         }
     }
 
-    /// Emscripten canvas ImageData expects RGBA byte order. In little-endian
-    /// u32 storage this is host-order 0xAABBGGRR.
+    /// Canvas ImageData RGBA byte order = host-order 0xAABBGGRR (little-endian).
     #[cfg(target_os = "emscripten")]
     pub const fn rgb888() -> PixelFormat {
         PixelFormat {
@@ -80,20 +73,15 @@ impl PixelFormat {
 
 pub const FB_FORMAT: PixelFormat = PixelFormat::rgb888();
 
-/// Ordered candidate paths for a runtime asset, mirroring main.zig's
-/// load_texture / main.cpp asset resolution. Covers (in order):
-///   1. the macOS .app bundle's Contents/Resources,
-///   2. several locations relative to the executable (CWD-independent),
-///   3. CWD-relative fallbacks for running straight from the repo.
+/// Ordered candidate paths for a runtime asset: .app Resources, then
+/// executable-relative (CWD-independent), then CWD-relative fallbacks.
 pub fn asset_candidates(basename: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(exe) = std::env::current_exe() {
         let exe_str = exe.to_string_lossy().into_owned();
-        // Inside a .app bundle: <...>.app/Contents/MacOS/raster -> Resources.
         if let Some(pos) = exe_str.find(".app/Contents/MacOS/") {
             out.push(format!("{}.app/Contents/Resources/{}", &exe_str[..pos], basename));
         }
-        // Relative to the executable's directory, walking a few levels up.
         if let Some(dir) = exe.parent() {
             let d = dir.to_string_lossy();
             out.push(format!("{}/assets/{}", d, basename));
@@ -103,7 +91,6 @@ pub fn asset_candidates(basename: &str) -> Vec<String> {
             out.push(format!("{}/../Resources/{}", d, basename));
         }
     }
-    // CWD-relative fallbacks (running from the repo root or src/rust).
     out.push(format!("../Resources/{}", basename));
     out.push(format!("assets/{}", basename));
     out.push(format!("../assets/{}", basename));

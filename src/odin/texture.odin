@@ -1,5 +1,4 @@
-// texture.odin — packed RGB textures with software mip chains plus the hot-path
-// bilinear/anisotropic samplers. Mirrors texture.h + texture.cpp.
+// texture.odin — packed RGB textures with mip chains + bilinear/anisotropic samplers.
 
 package main
 

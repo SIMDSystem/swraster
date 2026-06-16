@@ -1,6 +1,5 @@
-//! mac_blit.rs — macOS present path ported from `src/cpp/platform_mac.mm`:
-//! fixed IOSurface back buffer(s), CPU renders into mapped shared memory,
-//! Present hands the IOSurface to the NSView's layer.
+//! macOS present path: CPU renders into mapped IOSurface back buffers; present
+//! hands the IOSurface to the NSView's layer.
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::ffi::c_void;
@@ -210,8 +209,7 @@ pub struct SurfaceFrame<'a> {
 
 impl SurfaceFrame<'_> {
     pub fn as_framebuffer_mut(&mut self) -> &mut [u32] {
-        // The renderer assumes a dense framebuffer; a padded IOSurface row
-        // pitch would silently shear every row, so fail loudly.
+        // Renderer assumes a dense framebuffer; a padded pitch would shear rows.
         assert_eq!(self.pitch_pixels, self.width, "IOSurface row pitch must equal width");
         &mut self.pixels[..self.width * self.height]
     }
@@ -245,7 +243,7 @@ impl CocoaBlitter {
             msg_void_id(layer, b"setMinificationFilter:\0", kCAFilterNearest);
             msg_void_id(layer, b"setContentsGravity:\0", kCAGravityResize);
 
-            // C++ uses three IOSurfaces. Keep the same producer/consumer delay.
+            // Triple-buffered for producer/consumer delay.
             let surfaces = vec![IOSurface::new(width, height), IOSurface::new(width, height), IOSurface::new(width, height)];
             Self { layer, surfaces, render: 0, width, height }
         }

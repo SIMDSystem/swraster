@@ -1,6 +1,4 @@
-//! render_config.rs — shared configuration constants + small POD typedefs.
-//! Mirrors render_config.h / render_config.zig. Runtime-set thread counts live
-//! in `threading` (atomics); compile-time flags are `const` here.
+//! Shared configuration constants + small POD typedefs.
 
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -43,9 +41,7 @@ pub fn shadow_depth_to_u16(z_in: f32) -> ShadowDepth {
     (z * 65535.0 + 0.5) as ShadowDepth
 }
 
-// Runtime-configured T&L thread count ([ / ] keys). The C++/Zig versions are
-// plain globals written once at startup then adjusted from the event loop; an
-// atomic gives us safe shared access without unsafe statics.
+// Runtime-configured T&L thread count ([ / ] keys); atomic for shared access.
 pub static NUM_TL_THREADS: AtomicI32 = AtomicI32::new(0);
 
 #[inline]
@@ -53,9 +49,8 @@ pub fn num_tl_threads() -> i32 {
     NUM_TL_THREADS.load(Ordering::Relaxed)
 }
 
-/// Divides [0,extent) into `splits` contiguous tiles. Tile `idx` covers pixels
-/// [lo, hi] inclusive — the single floor-division formula every framebuffer
-/// pass shares so they can never disagree on a tile boundary.
+/// Tile `idx` of `splits` over [0,extent), pixels [lo,hi] inclusive. The single
+/// shared formula so passes never disagree on a tile boundary.
 #[inline]
 pub fn tile_span(extent: i32, splits: i32, idx: i32) -> (i32, i32) {
     let mut lo = idx * extent / splits;

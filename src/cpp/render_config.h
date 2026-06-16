@@ -1,27 +1,18 @@
 #pragma once
-// Shared compile-time configuration and small POD typedefs used across the
-// rasterizer modules. No allocations, no Eigen, no platform deps — keep this
-// header cheap to include from anywhere.
+// Shared compile-time config and POD typedefs. No allocations/Eigen/platform deps.
 
 #include <cstdint>
 #include <cmath>
 
-// Near/far clip planes for the camera projection matrix. NEAR_PLANE also drives
-// the geometry near-clip (clip_triangle_near) and the per-instance clip gate.
-// Held at 1.0 (not the usual 0.1) to cap 1/w on near-clipped vertices at ~1
-// instead of ~10, shrinking the worst-case projected screen coordinate ~10x and
-// the resulting edge-function precision error on hither-grazing triangles.
+// NEAR_PLANE is 1.0 (not 0.1) to cap 1/w on near-clipped vertices at ~1, cutting
+// the worst-case projected coordinate ~10x and its edge-function precision error.
 constexpr float NEAR_PLANE       = 1.0f;
 constexpr float CAMERA_FAR_PLANE = 200.0f;
 
-// Sky/background sentinel for the linear eye-Z G-buffer (written by the Color
-// pass, read by SSAO). Far larger than any real eye depth so a sample landing
-// on background fails the occlusion test naturally.
+// Sky sentinel for the linear eye-Z G-buffer; larger than any real eye depth.
 constexpr float LINEAR_Z_SKY     = 1e30f;
 
-// Render feature toggles. Flat constexpr instead of macros so the compiler
-// can const-fold them and dead-strip disabled paths without leaking #ifdef
-// branches across the codebase.
+// Feature toggles as constexpr so disabled paths const-fold away.
 constexpr bool ENABLE_NEAR_CLIP                = true;
 constexpr bool ENABLE_PHONG_SHADING            = true;
 constexpr bool USE_SPOTLIGHT                   = true;
@@ -30,15 +21,12 @@ constexpr bool ENABLE_RGB_TRIANGLE_SORT        = true;
 constexpr bool ENABLE_SHADOW_TRIANGLE_SORT     = false;
 constexpr bool DEBUG_DRAW_CAMERA_OCCLUDED_RED  = false;
 
-// When the on-screen pixel coverage of a triangle exceeds this threshold (in
-// pixels along its longest edge) the rasterizer interpolates eye-space normals
-// per-pixel; below it the cheaper Gouraud path is used.
+// Above this longest-edge pixel coverage, normals interpolate per-pixel;
+// below, the cheaper Gouraud path runs.
 constexpr float NORMAL_PERSPECTIVE_THRESHOLD = 8.0f;
 
-// Shadow map sizing + the 16-bit depth representation we store in the shadow
-// buffer. SHADOW_DEPTH_BIAS_U16 is the constant slope-independent bias added
-// to comparator samples. We cast back faces into the map, so there's no
-// self-shadow acne to fight; the bias is kept small to minimize peter-panning.
+// Shadow map config. Bias is small (we cast back faces, so no acne to fight;
+// keep peter-panning minimal).
 constexpr int          SHADOW_MAP_SIZE       = 1024;
 constexpr float        SHADOW_DEPTH_BIAS     = 0.00125f;
 using ShadowDepth = uint16_t;
@@ -46,8 +34,7 @@ constexpr ShadowDepth  SHADOW_DEPTH_CLEAR    = 0xffff;
 constexpr ShadowDepth  SHADOW_DEPTH_BIAS_U16 =
     (ShadowDepth)(SHADOW_DEPTH_BIAS * 65535.0f + 1.0f);
 
-// 32-bpp pixel alias. The __may_alias__ attribute is needed under strict
-// aliasing because we reinterpret the framebuffer surface as a Pixel32 buffer.
+// 32-bpp pixel alias; may_alias is required since we reinterpret the framebuffer.
 #if defined(__GNUC__) || defined(__clang__)
 typedef uint32_t Pixel32 __attribute__((may_alias));
 #else
@@ -59,32 +46,20 @@ static inline ShadowDepth shadow_depth_to_u16(float z) {
     return (ShadowDepth)(z * 65535.0f + 0.5f);
 }
 
-// Spotlight luminaire cone tessellation. The cone fan has a fixed segment
-// count so the per-frame T&L cost (one apex + two rim vertices per segment)
-// is constant and tiny; the raster Luminaire pass then just walks the
-// pre-T&L'd triangle list per tile instead of re-transforming inside the
-// tile inner loop.
+// Fixed cone-fan segment count so per-frame T&L cost is constant.
 constexpr int LUMINAIRE_CONE_SEGMENTS = 64;
 
-// Tile dispatch shape. TILE_X_SPLITS is fixed at compile time; NUM_STRIPS and
-// the derived NUM_TILE_BINS are set at startup once we know the platform's
-// hardware concurrency. Workers and the merge phase read these as plain ints.
+// Tile dispatch shape. NUM_STRIPS / NUM_TILE_BINS are set at startup.
 constexpr int TILE_X_SPLITS = 16;
 extern int NUM_TL_THREADS;
 extern int NUM_RASTER_THREADS;
 extern int NUM_STRIPS;
 extern int NUM_TILE_BINS;
 
-// Canonical 1-D tile split. Divides [0,extent) into `splits` contiguous tiles
-// with one floor-division formula used by EVERY framebuffer pass (RGB/depth
-// fill, SSAO fill, Luminaire fill) and the shadow pass, so they can never
-// disagree on a tile boundary. Tile `idx` covers pixels [lo, hi] inclusive.
-//
-// Coarse (NUM_STRIPS) and fine (2*NUM_STRIPS) row splits nest exactly: the two
-// fine tiles 2r and 2r+1 tile coarse tile r with no gap or overlap, because
-// floor((2r)*h / (2R)) == floor(r*h / R) and likewise at the top edge. This is
-// what lets the per-tile completion flags on the coarse grid correctly gate the
-// fine Luminaire tiles drawn on top of them.
+// Canonical 1-D tile split, used by EVERY pass so they can't disagree on a
+// boundary. Tile `idx` covers [lo, hi] inclusive. Coarse (R) and fine (2R) row
+// splits nest exactly (fine tiles 2r,2r+1 cover coarse tile r), which lets the
+// coarse-grid completion flags gate the fine Luminaire tiles on top.
 static inline void tile_span(int extent, int splits, int idx, int& lo, int& hi) {
     lo = (idx * extent) / splits;
     hi = (((idx + 1) * extent) / splits) - 1;

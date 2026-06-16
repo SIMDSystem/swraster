@@ -31,7 +31,7 @@ Matrix4f lookAt(const Vector3f& eye, const Vector3f& target, const Vector3f& up)
 
 Matrix4f build_shadow_tex_matrix(const Matrix4f& view_matrix, const Vector3f& light_dir,
                                  const Vector3f& scene_min, const Vector3f& scene_max) {
-    Vector3f L = light_dir.normalized(); // Eye-space direction from shaded point toward light.
+    Vector3f L = light_dir.normalized();
     Vector3f up(0.0f, 1.0f, 0.0f);
     if (fabsf(L.dot(up)) > 0.95f) {
         up = Vector3f(1.0f, 0.0f, 0.0f);
@@ -52,7 +52,7 @@ Matrix4f build_shadow_tex_matrix(const Matrix4f& view_matrix, const Vector3f& li
                 Vector3f p = (view_matrix * corner).head<3>();
                 float lx = sx.dot(p);
                 float ly = sy.dot(p);
-                float ld = -L.dot(p); // smaller depth is closer to the light
+                float ld = -L.dot(p);
                 min_x = fminf(min_x, lx); max_x = fmaxf(max_x, lx);
                 min_y = fminf(min_y, ly); max_y = fmaxf(max_y, ly);
                 min_d = fminf(min_d, ld); max_d = fmaxf(max_d, ld);
@@ -95,7 +95,7 @@ void transform_vertices(const RenderVertexList& source_vertices,
     size_t n = source_vertices.size();
     transformed_vertices.resize(n);
 
-    // Upper 3x3 is orthonormal for rigid transforms: inverse-transpose == itself.
+    // Rigid transform: 3x3 is orthonormal, so it doubles as the normal matrix.
     Matrix3f normal_matrix = transform.block<3, 3>(0, 0);
 
     for (size_t i = 0; i < n; i++) {
@@ -119,7 +119,7 @@ VertexVaryings project_vertex(const Vertex3D& v3d, int screen_width, int screen_
     float z = v3d.position.z() * inv_w;
 
     float screen_x = (x + 1.0f) * 0.5f * screen_width;
-    float screen_y = (1.0f - y) * 0.5f * screen_height; // Flip Y
+    float screen_y = (1.0f - y) * 0.5f * screen_height;
 
     VertexVaryings v2d;
     v2d.x = screen_x;

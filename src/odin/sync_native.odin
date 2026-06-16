@@ -1,5 +1,5 @@
 #+build darwin, linux, windows
-// sync_native.odin — pthread-backed Mutex/Condition (mirrors sync.zig).
+// sync_native.odin — pthread-backed Mutex/Condition.
 
 package main
 
@@ -34,11 +34,8 @@ Condition_Timed_Wait_Error :: enum {
 	Timeout,
 }
 
-// A zero-value pthread_mutex_t/pthread_cond_t is NOT a valid initializer on
-// Darwin (lock/wait/signal all return EINVAL and silently do nothing — no
-// mutual exclusion, no blocking). Zig's std.c types carry the signature-bearing
-// PTHREAD_*_INITIALIZER as their default value; Odin structs zero-init, so every
-// Mutex/Condition must be run through these before first use.
+// Darwin needs non-zero pthread init; zero-init makes lock/wait/signal return
+// EINVAL and silently no-op. Odin zero-inits structs, so every one must run through these.
 mutex_init :: proc(m: ^Mutex) {
 	pthread_mutex_init(&m.inner, nil)
 }

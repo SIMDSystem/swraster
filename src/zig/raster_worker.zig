@@ -1,7 +1,5 @@
-// raster_worker.zig — raster half of the unified pool. Mirrors raster_worker.h
-// + raster_worker.cpp. Cooperatively drains the previous frame's raster passes:
-// ShadowDepth -> Color (+ SSAO overlapped) -> Luminaire, via the shared pass
-// state machine in threading.zig.
+// raster_worker — raster half of the unified pool. Cooperatively drains the
+// previous frame's passes: ShadowDepth -> Color (+ SSAO overlapped) -> Luminaire.
 
 const std = @import("std");
 const config = @import("render_config.zig");

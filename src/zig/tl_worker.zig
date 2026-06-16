@@ -1,7 +1,6 @@
-// tl_worker.zig — T&L half of the unified pool. Mirrors tl_worker.h +
-// tl_worker.cpp. Transforms / lights / clips / projects / tile-bins one frame's
-// geometry into a private TLThreadOutput, then scatter-merges into the published
-// double-buffer slot.
+// tl_worker — T&L half of the unified pool. Transforms / lights / clips /
+// projects / tile-bins one frame's geometry into a private TLThreadOutput, then
+// scatter-merges into the published double-buffer slot.
 
 const std = @import("std");
 const la = @import("linalg.zig");
@@ -218,8 +217,7 @@ pub fn tlWorkerFrame(worker_id: i32, active_tl_threads: i32, ctx: *RendererConte
     const start_idx = worker_id * instances_per_thread;
     const end_idx = @min(start_idx + instances_per_thread, num_instances);
 
-    // Persistent per-worker scratch (capacity retained across frames); both are
-    // fully overwritten by transformVertices each instance, so no clear needed.
+    // Per-worker scratch; transformVertices fully overwrites both, so no clear.
     const eye_space_vertices = &output.eye_scratch;
     const clip_space_vertices = &output.clip_scratch;
 
@@ -459,11 +457,8 @@ pub fn tlWorkerFrame(worker_id: i32, active_tl_threads: i32, ctx: *RendererConte
     const per_instance_cpu_ns = if (sort_start_cpu_ns > work_start_cpu_ns) sort_start_cpu_ns - work_start_cpu_ns else 0;
     profiler.profilerRecordTl(ctx.profiler, worker_id, work_start_ts, sort_start_ts, per_instance_cpu_ns, @intFromEnum(TLJobTag.PerInstance));
 
-    // Initial sort of freshly-emitted (unsorted) triangles. This is C++'s
-    // std::sort site. Rather than sort the ~480-byte RenderTriangle structs in
-    // place (pdq/block both swap whole structs, ~3*n*log2(n) * 480 bytes of
-    // movement -- this was the trailing light-blue "local sort" stage), we sort
-    // (sort_z, index) pairs and gather each struct exactly once. See keysort.zig.
+    // Initial sort of freshly-emitted triangles via keysort (sort_z,index pairs)
+    // rather than swapping the ~480-byte structs in place.
     const ks = &output.sort_keys;
     const gb = &output.merge_scratch;
     if (config.ENABLE_RGB_TRIANGLE_SORT) {
@@ -515,10 +510,8 @@ pub fn tlWorkerFrame(worker_id: i32, active_tl_threads: i32, ctx: *RendererConte
             const old_size = dst.items.len;
             dst.appendSlice(std.heap.c_allocator, src) catch unreachable;
             if (keep_sorted and old_size > 0) {
-                // Both halves are already sorted (dst was kept sorted, src was
-                // locally sorted before scatter). This is C++'s
-                // std::inplace_merge: a single O(n) merge of the two runs, NOT
-                // a re-sort of the concatenation.
+                // Both halves already sorted: O(n) merge of the two runs, not a
+                // re-sort of the concatenation.
                 merge.mergeSortedRuns(RenderTriangle, dst.items, old_size, scratch, {}, less);
             }
         }

@@ -2,23 +2,12 @@ const std = @import("std");
 
 // swraster — Zig build.
 //
-// File-for-file Zig port of the C++ rasterizer. Two external dependencies are
-// linked here and are the "deferred install" the port assumes:
+// External deps linked here: Jolt + the joltc C wrapper (point -Djolt-lib /
+// -Djoltc-lib at the prebuilt archives), and the macOS Cocoa/QuartzCore/
+// IOSurface frameworks for the native window backend.
 //
-//   1. Jolt Physics + a C wrapper (joltc). Zig cannot consume Jolt's C++ API
-//      directly, so jolt.zig binds an `extern "C"` surface that a small joltc
-//      shim must export. Point -Djolt-lib / -Djoltc-lib / -Djolt-include at the
-//      built artifacts. Until then a native build links-fails at the Jolt
-//      symbols (everything else compiles).
-//
-//   2. The macOS Cocoa / QuartzCore / IOSurface frameworks for the native
-//      windowing backend (platform_mac.zig drives them through the Objective-C
-//      runtime). No third-party code; just framework links.
-//
-// Usage:
-//   zig build              # native debug
-//   zig build -Doptimize=ReleaseFast
-//   zig build web          # emscripten wasm (requires the zig emscripten sysroot)
+//   zig build [-Doptimize=ReleaseFast]   # native
+//   zig build web                        # emscripten wasm
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -28,7 +17,7 @@ pub fn build(b: *std.Build) void {
     const joltc_lib = b.option([]const u8, "joltc-lib", "Path to libjoltc.a (C wrapper)") orelse "";
     _ = jolt_include;
 
-    // Jolt + joltc are C++; link libc++ and the static archives.
+    // Jolt + joltc are C++; link libc++.
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
@@ -36,8 +25,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .link_libcpp = true,
     });
-    // joltc (the C wrapper) references Jolt, so it must precede libJolt on the
-    // link line. These are external prebuilt archives; accept absolute/cwd paths.
+    // joltc references Jolt, so it must precede libJolt on the link line.
     if (joltc_lib.len > 0) exe_mod.addObjectFile(.{ .cwd_relative = joltc_lib });
     if (jolt_lib.len > 0) exe_mod.addObjectFile(.{ .cwd_relative = jolt_lib });
 
@@ -47,7 +35,6 @@ pub fn build(b: *std.Build) void {
         exe_mod.linkFramework("QuartzCore", .{});
         exe_mod.linkFramework("IOSurface", .{});
         exe_mod.linkFramework("Foundation", .{});
-        // Objective-C runtime (objc_msgSend etc.).
         exe_mod.linkSystemLibrary("objc", .{});
     }
 
@@ -56,14 +43,10 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
-    // Install the raw executable to <prefix>/bin/raster.
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
 
-    // macOS: assemble + sign a first-class .app bundle as part of the default
-    // build, so `zig build` (any prefix) produces a runnable, icon-decorated,
-    // console-free <prefix>/Raster.app with no external script/Make step. The
-    // .icns is generated once from assets/icon.png and cached at <prefix>.
+    // macOS: assemble + sign a runnable <prefix>/Raster.app as part of the build.
     if (os == .macos) {
         const build_root_path = b.build_root.path orelse ".";
         const repo_root = std.fs.path.resolve(b.allocator, &.{ build_root_path, "..", ".." }) catch @panic("build: cannot resolve repo root");
@@ -88,32 +71,17 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the rasterizer");
     run_step.dependOn(&run_cmd.step);
 
-    // Web (emscripten): compile the Zig rasterizer to a static archive that
-    // emcc links into the final .wasm/.js/.html (see the Makefile `web-zig`
-    // target). Three things make the wasm threaded build work:
-    //   * link_libc: routes std.start through emscripten's __main_argc_argv
-    //     entry instead of the bare wasm `_start` (which rejects this target).
-    //   * atomics + bulk_memory: required for the shared-memory pthread build
-    //     that mirrors the native worker pool (emcc -pthread / SharedArrayBuffer).
-    //   * -Demscripten-sysroot: emscripten's libc headers, passed by the Makefile.
+    // Web (emscripten): a static archive that emcc links into the final wasm.
+    // link_libc routes std.start through emscripten's __main_argc_argv entry.
     const web_step = b.step("web", "Build the Zig wasm static library for emcc to link");
     var web_query: std.Target.Query = .{ .cpu_arch = .wasm32, .os_tag = .emscripten };
-    // simd128 lets LLVM lower our @Vector math to wasm v128 ops (the native
-    // build gets NEON/AVX); without it every @Vector is scalarized, which is
-    // why the wasm build trailed C++ (-msimd128). atomics+bulk_memory back the
-    // shared-memory pthread runtime.
-    //
-    // The rest match the feature set emcc's clang enables by default for the
-    // C++ side — Zig's wasm32 baseline is bare MVP, so without them our body
-    // codegen was strictly worse than C++ on the hot pixel loop:
-    //   * nontrapping_fptoint: lowers every @intFromFloat (pack RGB, texture
-    //     unpack, @floor) to a single trunc_sat instead of a branch-guarded
-    //     trapping conversion — the loop is saturated with float->int casts.
-    //   * sign_ext: native i32.extend8/16_s instead of shift-pair shims for the
-    //     u8 channel truncations.
-    //   * mutable_globals / multivalue / extended_const: modern codegen baseline
-    //     emcc assumes; lets the linker/wasm-opt keep better lowerings.
-    // All are supported by current Chrome (incl. Apple Silicon).
+    // Zig's wasm32 baseline is bare MVP; these match emcc's clang defaults so
+    // codegen isn't strictly worse than the C++ side on the hot loops:
+    //   simd128: lower @Vector math to v128 (else scalarized).
+    //   atomics + bulk_memory: shared-memory pthread runtime.
+    //   nontrapping_fptoint: @intFromFloat → single trunc_sat (the loop is
+    //     saturated with float->int casts).
+    //   sign_ext / mutable_globals / multivalue / extended_const: modern baseline.
     web_query.cpu_features_add = std.Target.wasm.featureSet(&.{
         .atomics,
         .bulk_memory,
@@ -143,10 +111,9 @@ pub fn build(b: *std.Build) void {
     web_step.dependOn(&web_install.step);
 }
 
-// Assemble + sign a macOS .app bundle. Mirrors the Makefile's make_app_bundle:
-// copy the exe, Info.plist, icon, and runtime BMPs into the bundle, drop the
-// quarantine xattr (browser-downloaded BMPs carry it, which blocks Launch
-// Services from registering the signed bundle), then ad-hoc codesign.
+// Assemble + ad-hoc sign a macOS .app bundle. The quarantine xattr is dropped
+// because browser-downloaded BMPs carry it, which blocks Launch Services from
+// registering the signed bundle.
 // Args: $1 exe, $2 app path, $3 Info.plist, $4 assets dir, $5 cached .icns.
 const mac_bundle_script =
     \\set -e

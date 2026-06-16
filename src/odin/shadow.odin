@@ -1,4 +1,4 @@
-// shadow.odin — shadow-map rasterizer + PCF samplers. Mirrors shadow.h + shadow.cpp.
+// shadow.odin — shadow-map rasterizer + PCF samplers.
 
 package main
 
@@ -71,8 +71,7 @@ sample_shadow_compare_bilinear_2x2 :: proc(shadow_depth: []Shadow_Depth, shadow_
 	col_base := clamp(fxr < 0.5 ? nx - 1 : nx, 0, max_base)
 	row_base := clamp(fyr < 0.5 ? ny - 1 : ny, 0, max_base)
 
-	// Resolve each 3-texel row's bias + compare in one vector op (4th lane is
-	// padding), mirroring the Zig @Vector(3, u32) form.
+	// Bias + compare each 3-texel row in one vector op (4th lane is padding).
 	grid: [3][3]f32
 	bias_v := simd.u32x4(u32(SHADOW_DEPTH_BIAS_U16))
 	max_v := simd.u32x4(0xffff)

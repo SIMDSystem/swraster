@@ -10,6 +10,5 @@ delete_program_args :: proc(args: []string) {
 }
 
 program_exit :: proc() {
-	// no-op on wasm: the runtime keeps the page alive; main never exits the
-	// process, and there is no core:os @(fini) cleanup to skip.
+	// no-op on wasm: the runtime keeps the page alive; main never exits.
 }

@@ -1,9 +1,6 @@
-// renderer_context.zig — aggregate of borrowed per-frame state shared by the
-// worker threads and the render loop. Mirrors renderer_context.h. Nothing here
-// is owned; every field is a borrowed pointer to storage living in main().
-// All fields are non-optional: main() fully populates the context in a single
-// initialization before any worker thread starts, so workers never observe a
-// partially-built context and no field access needs an unwrap.
+// renderer_context — borrowed per-frame state shared by workers and the render
+// loop. Nothing is owned; every field points into storage living in main().
+// main() fully populates this before any worker starts, so no field is optional.
 
 const std = @import("std");
 const la = @import("linalg.zig");
@@ -25,8 +22,7 @@ const RenderVertexList = geom.RenderVertexList;
 const FaceList = geom.FaceList;
 const ShadowDepth = config.ShadowDepth;
 
-// One renderable mesh (geometry + cull radius). The renderer keeps one per
-// scene.InstanceType, indexed by @intFromEnum(type): cube=0 .. lamp=6.
+// One renderable mesh, indexed by @intFromEnum(scene.InstanceType): cube=0 .. lamp=6.
 pub const MeshRef = struct {
     vertices: *const RenderVertexList,
     faces: *const FaceList,
@@ -51,8 +47,7 @@ pub const RendererContext = struct {
     ground_y: f32,
     ground_half: f32,
 
-    // IPC double-buffers: pointers-to-[2] keep the bounds in the type (the
-    // buffer id is always frame parity, 0 or 1).
+    // IPC double-buffers; buffer id is always frame parity (0 or 1).
     opaque_buffers: *[2]buffers.TriangleBuffer,
     trans_buffers: *[2]buffers.TriangleBuffer,
     shadow_buffers: *[2]buffers.TriangleBuffer,

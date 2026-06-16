@@ -1,6 +1,4 @@
-// shadow.zig — shadow-map rasterizer + PCF samplers. Mirrors shadow.h +
-// shadow.cpp. The NEON fast paths from the C++ are folded into the portable
-// scalar paths (identical results); Zig @Vector could reintroduce SIMD later.
+// shadow — shadow-map rasterizer + PCF samplers.
 
 const std = @import("std");
 const config = @import("render_config.zig");
@@ -64,8 +62,7 @@ pub fn sampleShadowCompareBilinear2x2(shadow_depth: ?[*]const ShadowDepth, shado
     @setFloatMode(.optimized);
     const depth = shadow_depth orelse return 1.0;
     if (shadow_size <= 0) return 1.0;
-    // r is shared by all four bilinear taps, so an out-of-range r makes every
-    // tap return 1.0 (sum == 4 -> 1.0). Bail before touching the map.
+    // r shared by all taps: out-of-range r → all taps 1.0, bail before fetching.
     if (r < 0.0 or r > 1.0) return 1.0;
 
     const sizef = @as(f32, @floatFromInt(shadow_size - 1));
@@ -78,19 +75,15 @@ pub fn sampleShadowCompareBilinear2x2(shadow_depth: ?[*]const ShadowDepth, shado
     const fxr = fx - @as(f32, @floatFromInt(nx));
     const fyr = fy - @as(f32, @floatFromInt(ny));
 
-    // The four bilinear taps sit at +/-0.5 texel around (fx,fy); together they
-    // touch one 3x3 texel block. Resolve each of the 9 compares once instead of
-    // refetching the 16 overlapping texels the naive 2x2 did. The two taps along
-    // each axis share the same fractional weight (wx/wy), and select adjacent
-    // 2x2 windows {0,1} and {1,2} of the block.
+    // The 4 taps at +/-0.5 texel touch one 3x3 block; resolve its 9 compares
+    // once rather than refetching 16 overlapping texels. Each axis' two taps
+    // share weight wx/wy and select adjacent 2x2 windows {0,1} and {1,2}.
     const wx = if (fxr < 0.5) fxr + 0.5 else fxr - 0.5;
     const wy = if (fyr < 0.5) fyr + 0.5 else fyr - 0.5;
 
-    // Callers gate this sampler on the spotlight cone, so every lit pixel lands
-    // inside the cone's shadow frustum and the 3x3 block is on the map. The
-    // clamp below is a branchless safety backstop (it never bites for lit
-    // pixels); it lets us drop the per-row / per-tap image-edge branches and run
-    // one straight-line vectorized pass.
+    // Lit pixels are always inside the cone's frustum (caller-gated), so the
+    // 3x3 block is on the map; this clamp is a branchless backstop that lets us
+    // drop per-tap edge checks and run one straight-line vectorized pass.
     const max_base = shadow_size - 3;
     const col_base = std.math.clamp(if (fxr < 0.5) nx - 1 else nx, 0, max_base);
     const row_base = std.math.clamp(if (fyr < 0.5) ny - 1 else ny, 0, max_base);

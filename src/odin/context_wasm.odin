@@ -1,14 +1,8 @@
 #+build freestanding, wasm32, wasm64p32, js
 // context_wasm.odin — web entry point + emscripten-backed context.
-//
-// -target:freestanding_wasm32 emits no entry point (without an exported main
-// the whole program dead-strips down to the swr_push_* exports), and on
-// freestanding Odin's default context wires the raw wasm page allocator
-// (wasm_memory_grow) and a nil temp allocator. Under emscripten both are
-// wrong: dlmalloc owns the linear-memory break, so a second memory_grow user
-// corrupts the heap, and a nil temp allocator breaks fmt.tprintf. Mirror the
-// Zig build (std.heap.c_allocator): allocate everything through emscripten's
-// malloc.
+// Route all allocation through emscripten malloc: freestanding's default page
+// allocator (wasm_memory_grow) fights dlmalloc for the heap break and corrupts
+// it, and its nil temp allocator breaks fmt.tprintf.
 
 package main
 
@@ -71,13 +65,9 @@ emscripten_allocator :: proc "contextless" () -> runtime.Allocator {
 	return {procedure = emscripten_allocator_proc, data = nil}
 }
 
-// Main-thread temp arena backed by emscripten malloc (the freestanding
-// default temp allocator is the nil allocator). run_render_loop free_all()s
-// the temp allocator once per frame, same as the native arena idiom.
-// @(thread_local) crashes the Odin compiler on freestanding_wasm32, so the
-// arena is handed only to the render-loop thread in swr_web_entry; worker
-// threads get the plain emscripten allocator as their temp allocator (they
-// only touch it for rare debug prints).
+// Render-loop temp arena (free_all'd once per frame). Not @(thread_local) —
+// that crashes the compiler on freestanding_wasm32 — so only swr_web_entry's
+// thread gets it; workers fall back to the plain emscripten temp allocator.
 @(private="file")
 web_main_temp_arena: runtime.Arena
 
@@ -88,10 +78,9 @@ swr_default_context :: proc "contextless" () -> runtime.Context {
 	return c
 }
 
-// emscripten's C entry. Odin reserves the link name "main", but wasm-ld
-// resolves an arg-taking C main through the __main_argc_argv alias, so export
-// that instead. PROXY_TO_PTHREAD runs this on a worker thread, so blocking in
-// run_render_loop is fine — same shape as the Zig build.
+// emscripten's C entry. Odin reserves "main", so export the __main_argc_argv
+// alias wasm-ld resolves instead. PROXY_TO_PTHREAD runs this off-main, so
+// blocking in run_render_loop is fine.
 @(export, link_name="__main_argc_argv")
 swr_web_entry :: proc "c" (argc: i32, argv: rawptr) -> i32 {
 	_ = argc
