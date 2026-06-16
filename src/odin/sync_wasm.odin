@@ -47,8 +47,7 @@ Condition_Timed_Wait_Error :: enum {
 	Timeout,
 }
 
-// emscripten (musl) treats zeroed pthread types as validly initialized, so these
-// only exist for API parity with sync_native.odin.
+// emscripten (musl) treats zeroed pthread types as initialized, so init is a no-op.
 mutex_init :: proc(m: ^Mutex) {
 	m.inner = {}
 }

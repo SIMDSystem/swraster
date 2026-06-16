@@ -10,7 +10,7 @@ import "core:sync"
 import "core:sys/posix"
 import "core:time"
 
-// SDL_PixelFormat field names/layout kept deliberately.
+// SDL_PixelFormat layout.
 Pixel_Format :: struct #align (4) {
 	BytesPerPixel: c.int,
 	Rloss:         u8,

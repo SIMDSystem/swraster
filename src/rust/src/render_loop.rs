@@ -453,7 +453,7 @@ impl RenderState {
 
         // ----- Jolt physics -----
         physics_setup::register_jolt_callbacks();
-        // The Jolt factory deliberately lives for the program lifetime.
+        // The Jolt factory lives for the program lifetime (never torn down).
         physics_setup::JoltScope::leak();
 
         let (system, body_interface, temp_allocator, job_system, mut instances, walls, initial_states);

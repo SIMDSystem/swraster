@@ -4,8 +4,8 @@
 #include <cmath>
 #include <Eigen/Dense>
 
-// `inner_radius` is intentionally smaller than the true bounding radius so the
-// cone-angle occlusion tests below stay conservative.
+// `inner_radius` is smaller than the true bounding radius to keep the cone-angle
+// occlusion tests conservative.
 struct OccluderEye {
     Eigen::Vector3f eye_pos;
     float           inner_radius;
