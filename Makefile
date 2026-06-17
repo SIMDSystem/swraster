@@ -545,6 +545,30 @@ $(RUST_APP): $(RUST_BIN) $(INFO_PLIST) $(ICON_ICNS) $(ASSET_FILES)
 
 rust: $(RUST_APP)
 
+# --- Windows (x86-64-v3 / FMA3) — platform scaffolding -----------------------
+# Mirrors the apple layout under build/windows/. Path vars + the dir skeleton
+# are in place now; the compile/link rules and the Win32 window/blit backend
+# land in the Windows build phase. x86-64-v3 = SSE..AVX2 + FMA3 + BMI (prosumer;
+# no AVX-512/Xeon). Built on Windows or cross-compiled where the toolchain allows.
+WIN_DEPS_DIR  = $(WIN_DIR)/deps
+WIN_JOLT_DIR  = $(WIN_DEPS_DIR)/jolt
+WIN_JOLTC_DIR = $(WIN_DEPS_DIR)/joltc
+WIN_CPP_DIR   = $(WIN_DIR)/cpp
+WIN_ZIG_DIR   = $(WIN_DIR)/zig
+WIN_ODIN_DIR  = $(WIN_DIR)/odin
+WIN_RUST_DIR  = $(WIN_DIR)/rust
+WIN_MARCH    ?= x86-64-v3
+
+# Materialize the empty platform skeleton (build/ is gitignored; regenerate any
+# time). The real build rules will mkdir these on demand too.
+windows-dirs:
+	@mkdir -p $(WIN_JOLT_DIR) $(WIN_JOLTC_DIR) \
+	          $(WIN_CPP_DIR)/obj $(WIN_CPP_DIR)/bin \
+	          $(WIN_ZIG_DIR)/obj $(WIN_ZIG_DIR)/bin \
+	          $(WIN_ODIN_DIR)/obj $(WIN_ODIN_DIR)/bin \
+	          $(WIN_RUST_DIR)/cargo $(WIN_RUST_DIR)/bin
+	@echo "Windows build skeleton ready under $(WIN_DIR)/"
+
 clean:
 	rm -rf $(BUILD_DIR)
 
@@ -582,4 +606,4 @@ rebuild-rust:
 	$(MAKE) clean-rust
 	$(MAKE) rust
 
-.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-deps clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin
+.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-deps clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin windows-dirs
