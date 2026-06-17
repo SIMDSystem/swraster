@@ -11,9 +11,9 @@ fn main() {
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_emscripten = target.contains("emscripten");
     let jolt_lib_dir = if is_emscripten {
-        repo_root.join("build/deps/jolt/web")
+        repo_root.join("build/web/deps/jolt")
     } else {
-        repo_root.join("build/deps/jolt/native")
+        repo_root.join("build/apple/deps/jolt")
     };
 
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.cpp").display());

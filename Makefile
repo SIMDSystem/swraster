@@ -10,11 +10,17 @@ WEB_SRC_DIR = src/web
 SCRIPT_DIR = scripts
 ASSET_DIR = assets
 BUILD_DIR = build
-DEPS_DIR  = $(BUILD_DIR)/deps
-CPP_BUILD_DIR = $(BUILD_DIR)/cpp
-ZIG_BUILD_DIR = $(BUILD_DIR)/zig
-ODIN_BUILD_DIR = $(BUILD_DIR)/odin
-RUST_BUILD_DIR = $(BUILD_DIR)/rust
+# Platform-first layout: build/{apple,windows,web}/ each hold that platform's
+# deps + per-language obj/bin. apple = arm64 macOS; windows = x86-64-v3
+# (AVX2+FMA3); web = wasm. Each <platform>/<lang>/ mirrors the same shape.
+APPLE_DIR = $(BUILD_DIR)/apple
+WIN_DIR   = $(BUILD_DIR)/windows
+WEB_BUILD_DIR = $(BUILD_DIR)/web
+DEPS_DIR  = $(APPLE_DIR)/deps
+CPP_BUILD_DIR = $(APPLE_DIR)/cpp
+ZIG_BUILD_DIR = $(APPLE_DIR)/zig
+ODIN_BUILD_DIR = $(APPLE_DIR)/odin
+RUST_BUILD_DIR = $(APPLE_DIR)/rust
 JOLT_DIR  = third_party/JoltPhysics
 # Header-only SIMD (google/highway), no build step.
 HIGHWAY_DIR = third_party/highway
@@ -26,7 +32,7 @@ WEB_INDEX = $(WEB_SRC_DIR)/web_index.html
 WEB_JSLIB = $(WEB_SRC_DIR)/web_zig_lib.js
 INFO_PLIST = $(ASSET_DIR)/Info.plist
 
-JOLT_BUILD_DIR = $(DEPS_DIR)/jolt/native
+JOLT_BUILD_DIR = $(DEPS_DIR)/jolt
 JOLT_LIB = $(JOLT_BUILD_DIR)/libJolt.a
 JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG -mcpu=native"
@@ -42,9 +48,8 @@ SOURCES = $(addprefix $(SRC_DIR)/,$(SRC_NAMES))
 NATIVE_SOURCES = $(SOURCES) $(SRC_DIR)/platform_mac.mm
 NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework CoreGraphics -framework IOSurface
 ICON_PNG  = $(ASSET_DIR)/icon.png
-ICON_ICNS = $(BUILD_DIR)/icon.icns
-WEB_BUILD_DIR = $(BUILD_DIR)/web
-JOLT_WEB_BUILD_DIR = $(DEPS_DIR)/jolt/web
+ICON_ICNS = $(APPLE_DIR)/icon.icns
+JOLT_WEB_BUILD_DIR = $(WEB_BUILD_DIR)/deps/jolt
 JOLT_WEB_LIB = $(JOLT_WEB_BUILD_DIR)/libJolt.a
 CPP_WEB_DIR = $(WEB_BUILD_DIR)/cpp
 ZIG_WEB_DIR = $(WEB_BUILD_DIR)/zig
@@ -91,14 +96,14 @@ WEB_JOLT_CMAKE_FLAGS = -DCMAKE_BUILD_TYPE=Release -DUSE_ASSERTS=ON \
 # Jolt C++ -> jph_* C ABI bridge for the Zig/Odin/Rust ports, built once.
 # Flags must match libJolt.a (defines / no rtti / no exceptions) or the
 # BroadPhaseLayerInterface vtables won't line up.
-JOLTC_DIR = $(DEPS_DIR)/joltc/native
+JOLTC_DIR = $(DEPS_DIR)/joltc
 JOLTC_LIB = $(JOLTC_DIR)/libjoltc.a
 JOLTC_FLAGS = -std=c++17 -O3 -fno-rtti -fno-exceptions -ffp-model=precise \
   -faligned-allocation -arch arm64 -mcpu=native -DNDEBUG \
   -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM \
   -I$(JOLT_DIR) -I$(SRC_DIR)
 # joltc wasm objects, shared by the Zig and Odin web links.
-JOLTC_WEB_DIR = $(DEPS_DIR)/joltc/web
+JOLTC_WEB_DIR = $(WEB_BUILD_DIR)/deps/joltc
 JOLTC_WEB_OBJS = $(JOLTC_WEB_DIR)/joltc.o $(JOLTC_WEB_DIR)/physics_setup.o
 
 # --- Zig native build -------------------------------------------------------
@@ -110,7 +115,7 @@ ZIG_BIN = $(ZIG_BUILD_DIR)/bin/raster
 ZIG_APP = $(ZIG_BUILD_DIR)/Raster.app
 ZIG_SOURCES = $(wildcard $(ZIG_SRC_DIR)/*.zig)
 ZIG_OBJ_DIR = $(ZIG_BUILD_DIR)/obj
-ZIG_OBJ_WEB_DIR = $(ZIG_BUILD_DIR)/obj-web
+ZIG_OBJ_WEB_DIR = $(WEB_BUILD_DIR)/zig/obj
 
 # --- Zig web (emscripten) build ---------------------------------------------
 # Larger pthread pool + explicit export list (Zig `export fn` symbols must be
@@ -152,7 +157,7 @@ ODIN_BIN = $(ODIN_BUILD_DIR)/bin/raster
 ODIN_APP = $(ODIN_BUILD_DIR)/Raster.app
 ODIN_SOURCES = $(wildcard $(ODIN_SRC_DIR)/*.odin)
 ODIN_OBJ_DIR = $(ODIN_BUILD_DIR)/obj
-ODIN_OBJ_WEB_DIR = $(ODIN_BUILD_DIR)/obj-web
+ODIN_OBJ_WEB_DIR = $(WEB_BUILD_DIR)/odin/obj
 ODIN_NATIVE_OBJ = $(ODIN_OBJ_DIR)/swraster_native.o
 ODIN_NATIVE_FRAMEWORKS = -framework Cocoa -framework QuartzCore -framework IOSurface -framework Foundation -lobjc -lc++ -pthread
 # -build-mode:llvm-ir writes <basename>.ll into the CWD (ignores -out dir), so
@@ -211,7 +216,7 @@ RUST_CARGO_BIN = $(RUST_CARGO_DIR)/release/raster
 RUST_BIN = $(RUST_BUILD_DIR)/bin/raster
 RUST_APP = $(RUST_BUILD_DIR)/Raster.app
 RUST_SOURCES = $(wildcard $(RUST_SRC_DIR)/src/*.rs) $(RUST_SRC_DIR)/Cargo.toml $(RUST_SRC_DIR)/build.rs
-RUST_WEB_CARGO_DIR = $(RUST_BUILD_DIR)/cargo-web
+RUST_WEB_CARGO_DIR = $(WEB_BUILD_DIR)/rust/cargo
 RUST_WEB_DEPS_DIR = $(RUST_WEB_CARGO_DIR)/wasm32-unknown-emscripten/release/deps
 RUST_WEB_RUSTFLAGS = -C target-cpu=generic -C target-feature=+atomics,+bulk-memory,+bulk-memory-opt,+mutable-globals,+simd128,+relaxed-simd,+sign-ext,+nontrapping-fptoint,+multivalue,+extended-const
 
@@ -228,9 +233,9 @@ $(HIGHWAY_HEADER):
 
 # iconutil requires the source dir to end in ".iconset".
 $(ICON_ICNS): $(ICON_PNG)
-	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(APPLE_DIR)
 	@if [ -f "$(ICON_PNG)" ]; then \
-		ICONSET=$(BUILD_DIR)/icon.iconset; \
+		ICONSET=$(APPLE_DIR)/icon.iconset; \
 		rm -rf $$ICONSET; mkdir -p $$ICONSET; \
 		sips -z 1024 1024 "$(ICON_PNG)" --out $$ICONSET/icon_512x512@2x.png >/dev/null 2>&1 || \
 			sips -s format png "$(ICON_PNG)" --out $$ICONSET/icon_512x512@2x.png; \
@@ -281,7 +286,7 @@ $(JOLT_WEB_LIB): Makefile $(JOLT_DIR)/Build/CMakeLists.txt
 	cmake --build $(JOLT_WEB_BUILD_DIR) --target Jolt --parallel $(WEB_JOBS)
 
 # C++ web (two-step): per-TU wasm objects, then the emcc -O3 wasm-opt link.
-CPP_WEB_OBJ_DIR = $(CPP_BUILD_DIR)/obj-web
+CPP_WEB_OBJ_DIR = $(WEB_BUILD_DIR)/cpp/obj
 CPP_WEB_OBJS = $(addprefix $(CPP_WEB_OBJ_DIR)/,$(SRC_NAMES:.cpp=.o))
 
 $(CPP_WEB_OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp $(HIGHWAY_HEADER)
@@ -556,7 +561,7 @@ clean-odin:
 	rm -rf $(ODIN_BUILD_DIR)
 
 clean-web:
-	rm -rf $(WEB_BUILD_DIR) $(CPP_WEB_OBJ_DIR) $(ZIG_OBJ_WEB_DIR) $(ODIN_OBJ_WEB_DIR) $(RUST_WEB_CARGO_DIR)
+	rm -rf $(WEB_BUILD_DIR)
 
 clean-rust:
 	rm -rf $(RUST_BUILD_DIR)
