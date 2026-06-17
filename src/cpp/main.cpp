@@ -73,7 +73,8 @@ static Surface* load_texture(const char* basename) {
                     *slash = '\0';
                     static const char* rels[] = {
                         "/assets/", "/../assets/", "/../../assets/",
-                        "/../../../assets/", "/../Resources/",
+                        "/../../../assets/", "/../../../../assets/",
+                        "/../../../../../assets/", "/../Resources/",
                     };
                     for (const char* rel : rels) {
                         char texture_path[PATH_MAX];

@@ -44,7 +44,7 @@ load_texture :: proc(basename: cstring) -> ^Surface {
 			}
 			exe_dir := exe_dir_from_path(exe)
 			if exe_dir != "" {
-				asset_rels := [?]string{"/assets/", "/../assets/", "/../../assets/", "/../../../assets/", "/../Resources/"}
+				asset_rels := [?]string{"/assets/", "/../assets/", "/../../assets/", "/../../../assets/", "/../../../../assets/", "/../../../../../assets/", "/../Resources/"}
 				for rel in asset_rels {
 					p := fmt.tprintf("%s%s%s", exe_dir, rel, basename)
 					if s := try_load_bmp(p); s != nil do return s

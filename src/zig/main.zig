@@ -90,6 +90,8 @@ fn loadTexture(basename: [:0]const u8) ?*Surface {
                 if (tryLoad(alloc, "{s}/../assets/{s}", .{ exe_dir, basename })) |s| return s;
                 if (tryLoad(alloc, "{s}/../../assets/{s}", .{ exe_dir, basename })) |s| return s;
                 if (tryLoad(alloc, "{s}/../../../assets/{s}", .{ exe_dir, basename })) |s| return s;
+                if (tryLoad(alloc, "{s}/../../../../assets/{s}", .{ exe_dir, basename })) |s| return s;
+                if (tryLoad(alloc, "{s}/../../../../../assets/{s}", .{ exe_dir, basename })) |s| return s;
                 if (tryLoad(alloc, "{s}/../Resources/{s}", .{ exe_dir, basename })) |s| return s;
             }
         }

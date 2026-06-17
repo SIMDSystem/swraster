@@ -88,6 +88,8 @@ pub fn asset_candidates(basename: &str) -> Vec<String> {
             out.push(format!("{}/../assets/{}", d, basename));
             out.push(format!("{}/../../assets/{}", d, basename));
             out.push(format!("{}/../../../assets/{}", d, basename));
+            out.push(format!("{}/../../../../assets/{}", d, basename));
+            out.push(format!("{}/../../../../../assets/{}", d, basename));
             out.push(format!("{}/../Resources/{}", d, basename));
         }
     }
