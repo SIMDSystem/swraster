@@ -25,8 +25,8 @@ const LuminaireConeBuffer = buffers.LuminaireConeBuffer;
 pub const TriangleShader = enum { Lit, DebugUnlitRed, LuminaireCone };
 
 // wasm: @min/@max lower to NaN-propagating f32x4.min/max (~10 ops); the select
-// form lowers to single-op pmin/pmax. Lanes are never NaN. Native keeps @min/@max
-// (NEON fmin/fmax).
+// form lowers to single-op pmin/pmax and measures faster in practice. Lanes are
+// never NaN. Native keeps @min/@max (NEON fmin/fmax).
 inline fn min4(a: @Vector(4, f32), b: @Vector(4, f32)) @Vector(4, f32) {
     if (comptime builtin.target.os.tag == .emscripten) {
         return @select(f32, a < b, a, b);

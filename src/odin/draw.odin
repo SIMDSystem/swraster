@@ -33,8 +33,8 @@ interp3 :: #force_inline proc(a0: f32, w0: simd.f32x4, a1: f32, w1: simd.f32x4, 
 }
 
 // wasm uses compare+select, not simd.min/max: it lowers to single-op pmin/pmax
-// (NaN-correct min/max is ~10 ops) and sidesteps an Odin wasm simd.min/max
-// codegen bug. Lanes are never NaN.
+// (NaN-correct min/max is ~10 ops) and measures faster in practice; it also
+// sidesteps an Odin wasm simd.min/max codegen bug. Lanes are never NaN.
 min4 :: #force_inline proc(a, b: simd.f32x4) -> simd.f32x4 {
 	when IS_WASM {
 		return simd.select(simd.lanes_lt(a, b), a, b)
