@@ -1,0 +1,4 @@
+// Windows resource script: the app icon. ID 1 (lowest numeric ICON id) is what
+// Explorer/taskbar use as the application icon. The .ico is generated from
+// assets/icon.png into the build dir, found via the resource compiler's -I path.
+1 ICON "icon.ico"

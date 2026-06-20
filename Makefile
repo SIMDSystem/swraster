@@ -237,17 +237,16 @@ $(ICON_ICNS): $(ICON_PNG)
 	@if [ -f "$(ICON_PNG)" ]; then \
 		ICONSET=$(APPLE_DIR)/icon.iconset; \
 		rm -rf $$ICONSET; mkdir -p $$ICONSET; \
-		sips -z 1024 1024 "$(ICON_PNG)" --out $$ICONSET/icon_512x512@2x.png >/dev/null 2>&1 || \
-			sips -s format png "$(ICON_PNG)" --out $$ICONSET/icon_512x512@2x.png; \
-		sips -z 512 512 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_512x512.png >/dev/null 2>&1; \
-		sips -z 512 512 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_256x256@2x.png >/dev/null 2>&1; \
-		sips -z 256 256 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_256x256.png >/dev/null 2>&1; \
-		sips -z 256 256 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_128x128@2x.png >/dev/null 2>&1; \
-		sips -z 128 128 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_128x128.png >/dev/null 2>&1; \
-		sips -z 64 64 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_32x32@2x.png >/dev/null 2>&1; \
-		sips -z 32 32 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_32x32.png >/dev/null 2>&1; \
-		sips -z 32 32 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_16x16@2x.png >/dev/null 2>&1; \
-		sips -z 16 16 $$ICONSET/icon_512x512@2x.png --out $$ICONSET/icon_16x16.png >/dev/null 2>&1; \
+		SRC=$$(sips -g pixelWidth "$(ICON_PNG)" 2>/dev/null | awk '/pixelWidth/{print $$2}'); \
+		[ -n "$$SRC" ] || SRC=0; \
+		for slot in 16x16:16 16x16@2x:32 32x32:32 32x32@2x:64 128x128:128 128x128@2x:256 256x256:256 256x256@2x:512 512x512:512 512x512@2x:1024; do \
+			name=$${slot%%:*}; px=$${slot##*:}; \
+			if [ "$$px" -le "$$SRC" ]; then \
+				sips -z $$px $$px "$(ICON_PNG)" --out $$ICONSET/icon_$$name.png >/dev/null 2>&1; \
+			else \
+				echo "  skip icon_$$name.png ($${px}px > $${SRC}px source; not upscaling)"; \
+			fi; \
+		done; \
 		iconutil -c icns $$ICONSET -o $(ICON_ICNS); \
 		rm -rf $$ICONSET; \
 	fi
@@ -559,8 +558,33 @@ WIN_ODIN_DIR  = $(WIN_DIR)/odin
 WIN_RUST_DIR  = $(WIN_DIR)/rust
 WIN_MARCH    ?= x86-64-v3
 
-# Materialize the empty platform skeleton (build/ is gitignored; regenerate any
-# time). The real build rules will mkdir these on demand too.
+# Cross toolchain: zig ships mingw-w64 headers + libc, so `zig c++` cross-builds
+# the whole Windows lane (port + Jolt + joltc) from macOS with no install, and
+# `zig ar` archives. Runtime testing still needs Windows.
+WIN_ZIG_TGT  = -target x86_64-windows-gnu -mcpu=$(subst -,_,$(WIN_MARCH))
+WIN_CXX      = $(ZIG) c++ $(WIN_ZIG_TGT)
+WIN_AR       = $(ZIG) ar
+WIN_INC      = -I$(SRC_DIR) -I/opt/homebrew/include/eigen3 -I$(JOLT_DIR) -I$(HIGHWAY_DIR)
+WIN_DEFS     = -DNDEBUG -DJPH_PROFILE_ENABLED -DJPH_DEBUG_RENDERER -DJPH_OBJECT_STREAM -D_USE_MATH_DEFINES
+WIN_CXXFLAGS = -std=c++17 -O2 -Wno-nullability-completeness $(WIN_INC) $(WIN_DEFS)
+WIN_LIBS     = -lgdi32 -luser32
+
+# App icon: assemble a multi-size .ico from the master PNG (scripts/make_ico.py,
+# stdlib + sips, no PIL), compile it to a COFF resource object, and link it into
+# every lane. Windows uses the lowest-id ICON resource as the exe/taskbar icon.
+WINDRES      ?= /opt/homebrew/opt/llvm/bin/llvm-windres
+WIN_ICO      = $(WIN_DIR)/icon.ico
+WIN_ICON_RC  = $(ASSET_DIR)/win_icon.rc
+WIN_ICON_OBJ = $(WIN_DIR)/icon.o
+$(WIN_ICO): $(ICON_PNG) scripts/make_ico.py
+	@mkdir -p $(WIN_DIR)
+	@echo "Assembling Windows .ico from $(ICON_PNG)..."
+	@python3 scripts/make_ico.py $(ICON_PNG) $@
+$(WIN_ICON_OBJ): $(WIN_ICO) $(WIN_ICON_RC)
+	@command -v $(WINDRES) >/dev/null 2>&1 || { echo "Error: llvm-windres not found at $(WINDRES) (brew install llvm)."; exit 1; }
+	$(WINDRES) --target=pe-x86-64 -I $(WIN_DIR) -O coff -o $@ $(WIN_ICON_RC)
+
+# Materialize the empty platform skeleton (build/ is gitignored; regenerate any time).
 windows-dirs:
 	@mkdir -p $(WIN_JOLT_DIR) $(WIN_JOLTC_DIR) \
 	          $(WIN_CPP_DIR)/obj $(WIN_CPP_DIR)/bin \
@@ -568,6 +592,108 @@ windows-dirs:
 	          $(WIN_ODIN_DIR)/obj $(WIN_ODIN_DIR)/bin \
 	          $(WIN_RUST_DIR)/cargo $(WIN_RUST_DIR)/bin
 	@echo "Windows build skeleton ready under $(WIN_DIR)/"
+
+# --- C++ Windows build (zig cross, x86-64-v3 / FMA3) -------------------------
+WIN_CPP_BIN      = $(WIN_CPP_DIR)/bin/raster.exe
+WIN_CPP_SOURCES  = $(SOURCES) $(SRC_DIR)/platform_win.cpp
+WIN_JOLT_LIB     = $(WIN_JOLT_DIR)/libJolt.a
+WIN_JOLTC_LIB    = $(WIN_JOLTC_DIR)/libjoltc.a
+
+# Jolt: glob-compile its 133 TUs with zig (parallel) and archive. Recipes run
+# in /bin/sh so the find|xargs split is well-defined.
+$(WIN_JOLT_LIB): $(JOLT_DIR)/Build/CMakeLists.txt Makefile
+	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG)."; exit 1; }
+	@mkdir -p $(WIN_JOLT_DIR)/obj
+	@echo "Cross-compiling Jolt for Windows ($(WIN_MARCH))..."
+	@find $(JOLT_DIR)/Jolt -name '*.cpp' -print0 | xargs -0 -P 8 -I{} sh -c \
+	  '$(WIN_CXX) $(WIN_CXXFLAGS) -fno-rtti -fno-exceptions -c "$$1" -o "$(WIN_JOLT_DIR)/obj/$$(echo "$$1" | sed "s#[/.]#_#g").o"' _ {}
+	$(WIN_AR) rcs $@ $(WIN_JOLT_DIR)/obj/*.o
+
+$(WIN_JOLTC_LIB): $(SRC_DIR)/joltc.cpp $(SRC_DIR)/joltc.h $(SRC_DIR)/physics_setup.cpp $(SRC_DIR)/physics_setup.h Makefile
+	@mkdir -p $(WIN_JOLTC_DIR)
+	$(WIN_CXX) $(WIN_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/joltc.cpp -o $(WIN_JOLTC_DIR)/joltc.o
+	$(WIN_CXX) $(WIN_CXXFLAGS) -fno-rtti -fno-exceptions -c $(SRC_DIR)/physics_setup.cpp -o $(WIN_JOLTC_DIR)/physics_setup.o
+	$(WIN_AR) rcs $@ $(WIN_JOLTC_DIR)/joltc.o $(WIN_JOLTC_DIR)/physics_setup.o
+
+# App TUs + link. -mwindows + explicit --subsystem,windows for a GUI (no console)
+# app; mingw's libmingw32 bridges WinMain -> our int main().
+$(WIN_CPP_BIN): $(WIN_CPP_SOURCES) $(WIN_JOLT_LIB) $(WIN_JOLTC_LIB) $(WIN_ICON_OBJ) $(HIGHWAY_HEADER) Makefile
+	@mkdir -p $(WIN_CPP_DIR)/obj $(WIN_CPP_DIR)/bin
+	@echo "Cross-compiling swraster C++ for Windows ($(WIN_MARCH))..."
+	@for s in $(WIN_CPP_SOURCES); do \
+	  o=$(WIN_CPP_DIR)/obj/$$(basename $$s .cpp).o; \
+	  $(WIN_CXX) $(WIN_CXXFLAGS) -c $$s -o $$o || exit 1; \
+	done
+	@echo "Linking raster.exe..."
+	$(WIN_CXX) -mwindows -Wl,--subsystem,windows -O2 -o $@ \
+	  $(WIN_CPP_DIR)/obj/*.o $(WIN_ICON_OBJ) $(WIN_JOLTC_LIB) $(WIN_JOLT_LIB) $(WIN_LIBS)
+	@echo "  -> $@"
+
+windows-cpp: $(WIN_CPP_BIN)
+
+# --- Zig Windows build (zig build-exe cross, x86-64-v3 / FMA3) ---------------
+WIN_ZIG_BIN = $(WIN_ZIG_DIR)/bin/raster.exe
+$(WIN_ZIG_BIN): $(ZIG_SOURCES) $(WIN_JOLT_LIB) $(WIN_JOLTC_LIB) $(WIN_ICON_OBJ) Makefile
+	@command -v $(ZIG) >/dev/null 2>&1 || [ -x $(ZIG) ] || { echo "Error: zig not found at $(ZIG)."; exit 1; }
+	@mkdir -p $(WIN_ZIG_DIR)/bin
+	@echo "Cross-compiling Zig for Windows ($(WIN_MARCH))..."
+	cd $(ZIG_SRC_DIR) && $(abspath $(ZIG)) build-exe main.zig \
+		-target x86_64-windows-gnu -mcpu=$(subst -,_,$(WIN_MARCH)) -O$(ZIG_OPT) \
+		-lc -lc++ --subsystem windows \
+		-femit-bin=$(abspath $(WIN_ZIG_BIN)) \
+		$(abspath $(WIN_ICON_OBJ)) \
+		$(abspath $(WIN_JOLTC_LIB)) $(abspath $(WIN_JOLT_LIB)) -lgdi32 -luser32 \
+		--cache-dir $(abspath $(ZIG_CACHE))/local --global-cache-dir $(abspath $(ZIG_CACHE))/global
+	@echo "  -> $(WIN_ZIG_BIN)"
+
+windows-zig: $(WIN_ZIG_BIN)
+
+# --- Odin Windows build -----------------------------------------------------
+# Odin can't cross-link to Windows from macOS, so we emit a COFF object for
+# windows_amd64 and link it ourselves with zig (mingw): crt2.o bridges
+# mainCRTStartup -> the C `main` Odin emits. -lbcrypt/-lntdll satisfy the Odin
+# runtime's BCryptGenRandom and Rtl* (wait-on-address) references.
+WIN_ODIN_BIN = $(WIN_ODIN_DIR)/bin/raster.exe
+WIN_ODIN_OBJ = $(WIN_ODIN_DIR)/obj/swraster_win.obj
+WIN_ODIN_MARCH ?= -microarch:x86-64-v3
+$(WIN_ODIN_BIN): $(ODIN_SOURCES) $(WIN_JOLT_LIB) $(WIN_JOLTC_LIB) $(WIN_ICON_OBJ) Makefile
+	@command -v $(ODIN) >/dev/null 2>&1 || { echo "Error: odin not found. Install via brew install odin."; exit 1; }
+	@mkdir -p $(WIN_ODIN_DIR)/obj $(WIN_ODIN_DIR)/bin
+	@echo "Emitting Odin Windows object ($(ODIN_OPT) $(WIN_ODIN_MARCH))..."
+	$(ODIN) build $(ODIN_SRC_DIR) -build-mode:obj -target:windows_amd64 \
+		$(ODIN_OPT) $(WIN_ODIN_MARCH) -out:$(WIN_ODIN_OBJ)
+	@echo "Linking Odin raster.exe for Windows ($(WIN_MARCH))..."
+	$(WIN_CXX) -mwindows -Wl,--subsystem,windows -O2 -o $@ \
+		$(WIN_ODIN_OBJ) $(ODIN_SRC_DIR)/win_fltused.c $(WIN_ICON_OBJ) \
+		$(WIN_JOLTC_LIB) $(WIN_JOLT_LIB) $(WIN_LIBS) -lbcrypt -lntdll
+	@echo "  -> $(WIN_ODIN_BIN)"
+
+windows-odin: $(WIN_ODIN_BIN)
+
+# --- Rust Windows build -----------------------------------------------------
+# cargo cross-build to x86_64-pc-windows-gnu using zig as the linker driver, so
+# the mingw CRT + libc++ (which the prebuilt Jolt/joltc archives need) stay
+# consistent with the other Windows lanes. Raw Win32 backend (win_blit.rs), no winit.
+# gnullvm = the LLVM-mingw flavor (clang/lld/libc++/compiler-rt), matching zig's
+# toolchain — unlike gnu, which hardcodes a libgcc/libpthread.a GCC late-link set.
+WIN_RUST_TARGET    = x86_64-pc-windows-gnullvm
+WIN_RUST_BIN       = $(WIN_RUST_DIR)/bin/raster.exe
+WIN_RUST_CARGO_DIR = $(WIN_RUST_DIR)/cargo
+WIN_RUST_CARGO_BIN = $(WIN_RUST_CARGO_DIR)/$(WIN_RUST_TARGET)/release/raster.exe
+WIN_RUST_LINKER    = scripts/zig-cc-win.sh
+$(WIN_RUST_BIN): $(RUST_SOURCES) $(WIN_RUST_LINKER) $(WIN_JOLT_LIB) $(WIN_JOLTC_LIB) $(WIN_ICON_OBJ) Makefile
+	@command -v $(CARGO) >/dev/null 2>&1 || { echo "Error: cargo not found. Install Rust (https://rustup.rs)."; exit 1; }
+	@rustup target list --installed 2>/dev/null | grep -q $(WIN_RUST_TARGET) || { echo "Error: rust target $(WIN_RUST_TARGET) not installed (rustup target add $(WIN_RUST_TARGET))."; exit 1; }
+	@mkdir -p $(WIN_RUST_DIR)/bin
+	@echo "Cross-compiling Rust for Windows ($(WIN_MARCH))..."
+	cd $(RUST_SRC_DIR) && CARGO_TARGET_DIR=$(abspath $(WIN_RUST_CARGO_DIR)) CARGO_INCREMENTAL=0 \
+		ZIG=$(abspath $(ZIG)) ZIG_MCPU=$(subst -,_,$(WIN_MARCH)) \
+		RUSTFLAGS="-Clinker=$(abspath $(WIN_RUST_LINKER)) -Ctarget-cpu=$(WIN_MARCH)" \
+		$(CARGO) build --release --target $(WIN_RUST_TARGET)
+	@cp $(WIN_RUST_CARGO_BIN) $(WIN_RUST_BIN)
+	@echo "  -> $(WIN_RUST_BIN)"
+
+windows-rust: $(WIN_RUST_BIN)
 
 clean:
 	rm -rf $(BUILD_DIR)
@@ -606,4 +732,4 @@ rebuild-rust:
 	$(MAKE) clean-rust
 	$(MAKE) rust
 
-.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-deps clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin windows-dirs
+.PHONY: apps cpp-llvm23 cpp-apple odin-llvm23 clean clean-deps clean-cpp clean-zig clean-odin clean-web clean-rust rebuild-cpp rebuild-zig rebuild-odin rebuild-rust app all web web-cpp web-zig web-odin web-rust web-all zig zig-bin odin odin-bin rust rust-bin windows-dirs windows-cpp windows-zig windows-odin windows-rust

@@ -1,5 +1,5 @@
-#+build darwin, linux, windows
-// sync_native.odin — pthread-backed Mutex/Condition.
+#+build darwin, linux
+// sync_native.odin — pthread-backed Mutex/Condition. Windows uses sync_windows.odin.
 
 package main
 

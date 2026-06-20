@@ -5,7 +5,6 @@ package main
 import "core:c"
 import "core:sync"
 import "core:sys/info"
-import posix "core:sys/posix"
 import "core:time"
 
 RASTER_PASS_COUNT :: 4
@@ -183,19 +182,11 @@ perf_ms :: proc(start, end: u64) -> f64 {
 	return f64(end - start) * inv_freq_ms
 }
 
-when !IS_WEB_TARGET {
-	timeval_ms :: proc(tv: posix.timeval) -> f64 {
-		return f64(tv.tv_sec) * 1000.0 + f64(tv.tv_usec) * 0.001
-	}
-}
-
 process_cpu_ms :: proc() -> f64 {
 	when IS_WEB_TARGET {
 		return 0.0
 	} else {
-		usage: posix.rusage
-		posix.getrusage(.SELF, &usage)
-		return timeval_ms(usage.ru_utime) + timeval_ms(usage.ru_stime)
+		return native_process_cpu_ms()
 	}
 }
 

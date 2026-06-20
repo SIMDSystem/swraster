@@ -16,6 +16,10 @@
 #include <emscripten/html5.h>
 #endif
 
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <windows.h>
+#endif
+
 // Shared helpers (BMP loader, per-thread CPU clock) plus the Emscripten web
 // backend. The macOS native backend lives in platform_mac.mm.
 
@@ -24,11 +28,22 @@ namespace Platform {
 // ===========================================================================
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+Uint64 ThreadCpuNs() {
+    FILETIME c, e, k, u;
+    if (!GetThreadTimes(GetCurrentThread(), &c, &e, &k, &u)) return 0;
+    auto ns = [](const FILETIME& t) {
+        return (((Uint64)t.dwHighDateTime << 32) | t.dwLowDateTime) * 100ull; // 100ns ticks
+    };
+    return ns(k) + ns(u); // kernel + user
+}
+#else
 Uint64 ThreadCpuNs() {
     struct timespec ts;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) return 0;
     return (Uint64)ts.tv_sec * 1000000000ull + (Uint64)ts.tv_nsec;
 }
+#endif
 
 // ===========================================================================
 //  Shared: portable BMP loader (24/32 bpp uncompressed -> RGBA8)

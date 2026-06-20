@@ -6,7 +6,9 @@
 #include <cstring>
 #include <cstdlib>
 
-#ifndef __EMSCRIPTEN__
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <windows.h>
+#elif !defined(__EMSCRIPTEN__)
 #include <sys/resource.h>
 #endif
 
@@ -76,6 +78,13 @@ double perf_ms(Uint64 start, Uint64 end) {
 double process_cpu_ms() {
 #ifdef __EMSCRIPTEN__
     return 0.0;
+#elif defined(_WIN32)
+    FILETIME c, e, k, u;
+    if (!GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u)) return 0.0;
+    auto ms = [](const FILETIME& t) {
+        return (double)(((uint64_t)t.dwHighDateTime << 32) | t.dwLowDateTime) * 1e-4; // 100ns->ms
+    };
+    return ms(k) + ms(u); // kernel + user
 #else
     auto timeval_ms = [](const timeval& tv) {
         return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec * 0.001;

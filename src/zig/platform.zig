@@ -55,12 +55,15 @@ pub const Event = struct {
 
 const is_web = builtin.target.os.tag == .emscripten;
 const is_mac = builtin.target.os.tag == .macos;
+const is_windows = builtin.target.os.tag == .windows;
 const mac = if (is_mac) @import("platform_mac.zig") else struct {};
+const win = if (is_windows) @import("platform_win.zig") else struct {};
 
 // ===========================================================================
 //  Shared: per-thread CPU time (used by the profiler on every backend)
 // ===========================================================================
 pub fn threadCpuNs() u64 {
+    if (is_windows) return win.threadCpuNs();
     var ts: std.c.timespec = undefined;
     if (std.c.clock_gettime(.THREAD_CPUTIME_ID, &ts) != 0) return 0;
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
@@ -159,49 +162,59 @@ pub fn freeSurface(s: ?*Surface) void {
 // ===========================================================================
 pub fn init(w: i32, h: i32, title: [*:0]const u8) bool {
     if (is_mac) return mac.init(w, h, title);
+    if (is_windows) return win.init(w, h, title);
     if (is_web) return web.init(w, h, title);
     return false;
 }
 pub fn shutdown() void {
     if (is_mac) return mac.shutdown();
+    if (is_windows) return win.shutdown();
     if (is_web) return web.shutdown();
 }
 pub fn getFramebuffer() ?*Surface {
     if (is_mac) return mac.getFramebuffer();
+    if (is_windows) return win.getFramebuffer();
     if (is_web) return web.getFramebuffer();
     return null;
 }
 pub fn present() void {
     if (is_mac) return mac.present();
+    if (is_windows) return win.present();
     if (is_web) return web.present();
 }
 pub fn isRenderable() bool {
     if (is_mac) return mac.isRenderable();
+    if (is_windows) return win.isRenderable();
     if (is_web) return web.isRenderable();
     return true;
 }
 pub fn pollEvent(out: *Event) bool {
     if (is_mac) return mac.pollEvent(out);
+    if (is_windows) return win.pollEvent(out);
     if (is_web) return web.pollEvent(out);
     return false;
 }
 pub fn ticksMs() u64 {
     if (is_mac) return mac.ticksMs();
+    if (is_windows) return win.ticksMs();
     if (is_web) return web.ticksMs();
     return @intCast(std.time.milliTimestamp());
 }
 pub fn perfCounter() u64 {
     if (is_mac) return mac.perfCounter();
+    if (is_windows) return win.perfCounter();
     if (is_web) return web.perfCounter();
     return @intCast(std.time.nanoTimestamp());
 }
 pub fn perfFrequency() u64 {
     if (is_mac) return mac.perfFrequency();
+    if (is_windows) return win.perfFrequency();
     if (is_web) return web.perfFrequency();
     return 1_000_000_000;
 }
 pub fn delay(ms: u32) void {
     if (is_mac) return mac.delay(ms);
+    if (is_windows) return win.delay(ms);
     if (is_web) return web.delay(ms);
     std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
 }

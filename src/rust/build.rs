@@ -10,11 +10,35 @@ fn main() {
     let jolt_dir = repo_root.join("third_party/JoltPhysics");
     let target = std::env::var("TARGET").unwrap_or_default();
     let is_emscripten = target.contains("emscripten");
+    let is_windows = target.contains("windows");
     let jolt_lib_dir = if is_emscripten {
         repo_root.join("build/web/deps/jolt")
+    } else if is_windows {
+        repo_root.join("build/windows/deps/jolt")
     } else {
         repo_root.join("build/apple/deps/jolt")
     };
+
+    // Windows is cross-built from macOS, where the `cc` crate has no Windows C++
+    // compiler. The C++/Odin lanes already cross-compiled Jolt + joltc with zig
+    // (libc++ ABI), so reuse those archives and link libc++ to match.
+    if is_windows {
+        let joltc_dir = repo_root.join("build/windows/deps/joltc");
+        println!("cargo:rerun-if-changed={}", joltc_dir.join("libjoltc.a").display());
+        println!("cargo:rustc-link-search=native={}", joltc_dir.display());
+        println!("cargo:rustc-link-search=native={}", jolt_lib_dir.display());
+        println!("cargo:rustc-link-lib=static=joltc");
+        println!("cargo:rustc-link-lib=static=Jolt");
+        println!("cargo:rustc-link-lib=dylib=c++");
+
+        // Embed the app icon (Makefile builds it; absent for a bare `cargo build`).
+        let icon_obj = repo_root.join("build/windows/icon.o");
+        println!("cargo:rerun-if-changed={}", icon_obj.display());
+        if icon_obj.exists() {
+            println!("cargo:rustc-link-arg={}", icon_obj.display());
+        }
+        return;
+    }
 
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.cpp").display());
     println!("cargo:rerun-if-changed={}", cpp_dir.join("joltc.h").display());

@@ -7,7 +7,6 @@ package main
 import "core:c"
 import "core:mem"
 import "core:sync"
-import "core:sys/posix"
 import "core:time"
 
 // SDL_PixelFormat layout.
@@ -66,9 +65,7 @@ thread_cpu_ns :: proc() -> u64 {
 		if clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0 do return 0
 		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
 	} else {
-		ts: posix.timespec
-		if posix.clock_gettime(.THREAD_CPUTIME_ID, &ts) != .OK do return 0
-		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
+		return native_thread_cpu_ns()
 	}
 }
 
@@ -323,6 +320,8 @@ when IS_WEB_TARGET {
 platform_init :: proc(w, h: i32, title: cstring) -> bool {
 	when ODIN_OS == .Darwin {
 		return mac_init(w, h, title)
+	} else when ODIN_OS == .Windows {
+		return win_init(w, h, title)
 	} else when IS_WEB_TARGET {
 		return web_init(c.int(w), c.int(h), title)
 	}
@@ -332,6 +331,8 @@ platform_init :: proc(w, h: i32, title: cstring) -> bool {
 platform_shutdown :: proc() {
 	when ODIN_OS == .Darwin {
 		mac_shutdown()
+	} else when ODIN_OS == .Windows {
+		win_shutdown()
 	} else when IS_WEB_TARGET {
 		web_shutdown()
 	}
@@ -340,6 +341,8 @@ platform_shutdown :: proc() {
 platform_get_framebuffer :: proc() -> ^Surface {
 	when ODIN_OS == .Darwin {
 		return mac_get_framebuffer()
+	} else when ODIN_OS == .Windows {
+		return win_get_framebuffer()
 	} else when IS_WEB_TARGET {
 		return web_get_framebuffer()
 	}
@@ -349,6 +352,8 @@ platform_get_framebuffer :: proc() -> ^Surface {
 platform_present :: proc() {
 	when ODIN_OS == .Darwin {
 		mac_present()
+	} else when ODIN_OS == .Windows {
+		win_present()
 	} else when IS_WEB_TARGET {
 		web_present()
 	}
@@ -357,6 +362,8 @@ platform_present :: proc() {
 platform_is_renderable :: proc() -> bool {
 	when ODIN_OS == .Darwin {
 		return mac_is_renderable()
+	} else when ODIN_OS == .Windows {
+		return win_is_renderable()
 	} else when IS_WEB_TARGET {
 		return web_is_renderable()
 	}
@@ -366,18 +373,12 @@ platform_is_renderable :: proc() -> bool {
 platform_poll_event :: proc(out: ^Event) -> bool {
 	when ODIN_OS == .Darwin {
 		return mac_poll_event(out)
+	} else when ODIN_OS == .Windows {
+		return win_poll_event(out)
 	} else when IS_WEB_TARGET {
 		return web_poll_event(out)
 	}
 	return false
-}
-
-when !IS_WEB_TARGET {
-	fallback_mono_ns :: proc() -> u64 {
-		ts: posix.timespec
-		if posix.clock_gettime(.MONOTONIC, &ts) != .OK do return 0
-		return u64(ts.tv_sec) * 1_000_000_000 + u64(ts.tv_nsec)
-	}
 }
 
 ticks_ms :: proc() -> u64 {
@@ -386,7 +387,7 @@ ticks_ms :: proc() -> u64 {
 	} else when IS_WEB_TARGET {
 		return web_ticks_ms()
 	} else when !IS_WEB_TARGET {
-		return fallback_mono_ns() / 1_000_000
+		return native_mono_ns() / 1_000_000
 	}
 	return 0
 }
@@ -397,7 +398,7 @@ perf_counter :: proc() -> u64 {
 	} else when IS_WEB_TARGET {
 		return web_perf_counter()
 	} else when !IS_WEB_TARGET {
-		return fallback_mono_ns()
+		return native_mono_ns()
 	}
 	return 0
 }

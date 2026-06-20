@@ -1,4 +1,5 @@
 #![cfg_attr(target_os = "emscripten", no_main)]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 #![deny(unsafe_op_in_unsafe_fn)]
 //! swraster Rust port entry point: winit window + IOSurface blitter driving the
 //! multithreaded software renderer.
@@ -12,6 +13,8 @@ mod jolt;
 mod linalg;
 #[cfg(target_os = "macos")]
 mod mac_blit;
+#[cfg(windows)]
+mod win_blit;
 mod physics;
 mod physics_setup;
 mod pixel;
@@ -207,6 +210,67 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("event loop error");
+}
+
+#[cfg(windows)]
+fn main() {
+    use win_blit::{Event, Window};
+
+    let mut win = Window::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, "swraster");
+    let mut state = RenderState::new(INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32);
+    let start = Instant::now();
+    let mut running = true;
+
+    while running {
+        for ev in win.pump() {
+            match ev {
+                Event::Quit => running = false,
+                Event::Key(k) => match k {
+                    27 => running = false, // Escape
+                    32 => state.toggle_pause(),
+                    k if k == 's' as i32 || k == 'S' as i32 => state.toggle_stats(),
+                    k if k == 'f' as i32 || k == 'F' as i32 => state.toggle_profiler_unfreeze(),
+                    k if k == 'b' as i32 || k == 'B' as i32 => {
+                        state.toggle_raster_hard_barrier();
+                    }
+                    k if k == 'q' as i32 || k == 'Q' as i32 => {
+                        let was = draw::QUAD_PATH_ENABLED.load(Ordering::Relaxed);
+                        draw::QUAD_PATH_ENABLED.store(!was, Ordering::Relaxed);
+                    }
+                    k if k == '-' as i32 || k == '_' as i32 => {
+                        state.adjust_active_workers(-1);
+                    }
+                    k if k == '=' as i32 || k == '+' as i32 => {
+                        state.adjust_active_workers(1);
+                    }
+                    k if k == '[' as i32 || k == '{' as i32 => {
+                        state.adjust_tl_workers(-1);
+                    }
+                    k if k == ']' as i32 || k == '}' as i32 => {
+                        state.adjust_tl_workers(1);
+                    }
+                    _ => {}
+                },
+                Event::MouseButton { pressed } => state.camera_orbiting = pressed,
+                Event::MouseMotion { dx, dy } => state.orbit(dx as f32, dy as f32),
+                Event::Wheel(y) => state.zoom(y as f32),
+            }
+        }
+
+        if win.is_minimized() {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+
+        let now_ms = start.elapsed().as_millis() as u64;
+        state.frame(win.framebuffer_mut(), INITIAL_WIDTH as i32, INITIAL_HEIGHT as i32, now_ms);
+
+        // Bracket the present so the profiler can mark it next frame.
+        let blit_start = state.prof_now();
+        win.present();
+        let blit_end = state.prof_now();
+        state.prof_set_present(blit_start, blit_end);
+    }
 }
 
 #[cfg(target_os = "emscripten")]

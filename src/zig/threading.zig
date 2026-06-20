@@ -101,6 +101,7 @@ pub fn perfMs(start: u64, end: u64) f64 {
 
 pub fn processCpuMs() f64 {
     if (builtin.target.os.tag == .emscripten) return 0.0;
+    if (builtin.target.os.tag == .windows) return win_process_cpu_ms();
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     const timeval_ms = struct {
         fn f(tv: std.posix.timeval) f64 {
@@ -108,6 +109,23 @@ pub fn processCpuMs() f64 {
         }
     }.f;
     return timeval_ms(usage.utime) + timeval_ms(usage.stime);
+}
+
+const WinFileTime = extern struct { lo: u32 = 0, hi: u32 = 0 };
+extern "kernel32" fn GetCurrentProcess() callconv(.c) ?*anyopaque;
+extern "kernel32" fn GetProcessTimes(?*anyopaque, *WinFileTime, *WinFileTime, *WinFileTime, *WinFileTime) callconv(.c) i32;
+fn win_process_cpu_ms() f64 {
+    var c: WinFileTime = .{};
+    var e: WinFileTime = .{};
+    var k: WinFileTime = .{};
+    var u: WinFileTime = .{};
+    if (GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u) == 0) return 0.0;
+    const ms = struct {
+        fn f(t: WinFileTime) f64 {
+            return @as(f64, @floatFromInt(@as(u64, t.hi) << 32 | t.lo)) * 1e-4; // 100ns->ms
+        }
+    }.f;
+    return ms(k) + ms(u); // kernel + user
 }
 
 // ---- --threadperf sweep harness ----
