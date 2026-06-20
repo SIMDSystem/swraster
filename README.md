@@ -6,8 +6,8 @@ The point of the project is an exploration of comparative language performance a
 
 ## Highlights
 
-- **CPU-only renderer**: tiled rasterization, a unified multithreaded worker pool with live thread controls, frame-lagged pipelining (`T&L(N) ‖ raster(N-1) ‖ physics(N)`), and an on-screen per-thread concurrency profiler.
-- **SIMD throughout**: 4-wide quad pixel paths, masked SSAO taps, FMA-contracted interpolation, hand-tuned NEON / wasm-SIMD / AVX2 paths.
+- **CPU-only renderer**: tiled rasterization, a unified multithreaded worker pool with live thread controls, frame-lagged pipelining, and an on-screen per-thread concurrency profiler.
+- **SIMD throughout**: 4-wide quad pixel paths, masked SSAO taps, FMA-contracted interpolation, tuned NEON / wasm-SIMD / AVX2 paths.
 - **Effects**: hemisphere SSAO over G-buffers, 16-bit PCF spotlight shadows, a two-sided spotlight housing with a distance-scaled glare disk.
 - **Physics**: Jolt Physics, driven from all four ports via a small C ABI wrapper (`joltc`).
 - **Four ports at parity**: every optimization that lands in one port is mirrored in the others.
