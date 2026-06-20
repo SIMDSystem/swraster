@@ -1,8 +1,8 @@
 # swraster
 
-A real-time, multithreaded **software rasterizer** — no GPU — implemented **four times** (C++, Zig, Odin, Rust) at strict algorithmic and optimization parity, each written in its language's native idiom. It runs the same scene (Jolt-physics-driven instances, a spotlight with shadows, SSAO, textured meshes) across **macOS (native), the browser (WebAssembly), and Windows (native)**.
+A multithreaded SIMD **software renderer** in performant compiled languages, implemented **four times** (C++, Zig, Odin, Rust) preserving algorithmic equivalence, each ported to its language's native idiom. It runs the same scene (Jolt-physics-driven instances, a spotlight with shadows, SSAO, textured meshes) across **macOS (native), the browser (WebAssembly), and Windows (native)**.
 
-The point of the project is the comparison: one renderer design, four languages, three platforms, kept in lockstep so each build can be measured against the others on identical work.
+The point of the project is an exploration of comparative language performance and implementation on an interesting problem. It bridges languages and platforms with some language specific optimizations without which performance parity would fall well short. I'm reluctant to call this a benchmark as apples to apples comparisons in the face of all the variances and required tuning is folly. It's a snapshot of code and compilers at a moment in time subject to compiler stack limitations in some cases.
 
 ## Highlights
 
@@ -79,7 +79,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source /path/to/emsdk/emsdk_env.sh
 ```
 
-Jolt Physics is **not** installed system-wide — it's built out-of-tree from the submodule by the Makefile on first build.
+Jolt Physics is **not** installed system-wide; it's built out-of-tree from the submodule by the Makefile on first build.
 
 ## Build
 
@@ -101,7 +101,7 @@ make zig-bin  odin-bin  rust-bin
 
 ### Web (WebAssembly)
 
-Requires an active emsdk. The Rust web lane additionally needs nightly Rust with `rust-src` and the `wasm32-unknown-emscripten` target — the Makefile adds these automatically.
+Requires an active emsdk. The Rust web lane additionally needs nightly Rust with `rust-src` and the `wasm32-unknown-emscripten` target; the Makefile adds these automatically.
 
 ```sh
 make web-cpp
@@ -118,9 +118,9 @@ Then open `http://127.0.0.1:8000` and pick a port.
 
 ### Windows (cross-compiled from macOS)
 
-> ⚠️ Work in progress — these binaries are **untested on real hardware** and unpolished (see the note above).
+> ⚠️ Work in progress: these binaries are **untested on real hardware** and unpolished (see the note above).
 
-Produces `build/windows/<lang>/bin/raster.exe` (PE32+ GUI, `x86-64-v3`/FMA3) using the vendored Zig as the toolchain — no Windows machine required to build. The icon step uses `llvm-windres` (`brew install llvm`). The Rust lane needs the `x86_64-pc-windows-gnullvm` target (`rustup target add x86_64-pc-windows-gnullvm`).
+Produces `build/windows/<lang>/bin/raster.exe` (PE32+ GUI, `x86-64-v3`/FMA3) using the vendored Zig as the toolchain, so no Windows machine is required to build. The icon step uses `llvm-windres` (`brew install llvm`). The Rust lane needs the `x86_64-pc-windows-gnullvm` target (`rustup target add x86_64-pc-windows-gnullvm`).
 
 ```sh
 make windows-cpp
@@ -139,7 +139,16 @@ make clean-cpp | clean-zig | clean-odin | clean-rust | clean-web
 
 ## Running
 
-Launch a `Raster.app` (or a raw `build/apple/<lang>/bin/raster`), or open the web build in a browser. Drag with the **left mouse button** to orbit, **scroll** to zoom.
+Launch a `Raster.app` (or a raw `build/apple/<lang>/bin/raster`), or open the web build in a browser.
+
+**Mouse**
+
+| Input | Action |
+|---|---|
+| Left button + drag | Orbit the camera around the scene (yaw / pitch) |
+| Scroll wheel | Zoom: dolly the camera in and out |
+
+**Keyboard**
 
 | Key | Action |
 |---|---|
