@@ -4,6 +4,8 @@ A multithreaded SIMD **software renderer** in performant compiled languages, imp
 
 The point of the project is an exploration of comparative language performance and implementation on an interesting problem. It bridges languages and platforms with some language specific optimizations without which performance parity would fall well short. I'm reluctant to call this a benchmark as apples to apples comparisons in the face of all the variances and required tuning is folly. It's a snapshot of code and compilers at a moment in time subject to compiler stack limitations in some cases.
 
+<img width="1257" height="999" alt="Screenshot 2026-06-20 at 12 41 52 PM" src="https://github.com/user-attachments/assets/0736ced0-cf01-4732-8ff7-c8f3bdccbf4f" />
+
 ## Highlights
 
 - **CPU-only renderer**: tiled rasterization, a unified multithreaded worker pool with live thread controls, frame-lagged pipelining, and an on-screen per-thread concurrency profiler.
