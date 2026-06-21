@@ -20,7 +20,7 @@ See [documentation.md](documentation.md) for the engineering notes (architecture
 
 | Port | macOS (native) | Web (WASM) | Windows (cross from macOS) |
 |------|:---:|:---:|:---:|
-| C++ (reference) | ✓ | ✓ | ✓ |
+| C++ | ✓ | ✓ | ✓ |
 | Zig | ✓ | ✓ | ✓ |
 | Odin | ✓ | ✓ | ✓ |
 | Rust | ✓ | ✓ | ✓ |
@@ -90,7 +90,7 @@ All output lands under `build/<platform>/<lang>/`. `build/` is gitignored.
 ### macOS (native)
 
 ```sh
-make              # default: C++ reference app (clang-23 lane; needs emsdk)
+make              # default: C++ app (clang-23 lane; needs emsdk)
 make cpp-apple    # C++ app with stock Apple clang (no emsdk)
 make zig          # Zig app  -> build/apple/zig/Raster.app
 make odin         # Odin app
