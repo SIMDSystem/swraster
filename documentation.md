@@ -1,6 +1,8 @@
 # swraster: Engineering Notes
 
-A multithreaded software rasterizer implemented four times (C++, Zig, Odin, Rust) at strict algorithmic and optimization parity, each written in its language's native idiom. Targets: macOS-native (Cocoa/IOSurface), Windows-native (Win32/GDI), and WebAssembly (emscripten/canvas).
+A multithreaded SIMD software renderer in performant compiled languages, implemented four times (C++, Zig, Odin, Rust) preserving algorithmic equivalence, each ported to its language's native idiom. Targets: macOS-native (Cocoa/IOSurface), Windows-native (Win32/GDI), and WebAssembly (emscripten/canvas).
+
+This is an exploration of comparative language performance on one non-trivial problem, not a benchmark: with the per-language tuning each build needs to reach parity, strict apples-to-apples comparison is not meaningful. Treat the numbers as a snapshot of these languages and compiler stacks at one moment in time.
 
 These notes describe the state of the code by subsystem and record the engineering lessons that shaped it. Every optimization that lands in one port is mirrored in the others, so the per-language sections describe how the same idea is expressed in each language rather than four different designs.
 
