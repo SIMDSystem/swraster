@@ -501,20 +501,35 @@ draw_triangle_barycentric_strip :: proc(
 	if has_texture {
 		base := &texture.levels[0]
 		mip_level: i32 = 0
-		dx1 := v1.x - v0.x; dy1 := v1.y - v0.y
-		dx2 := v2.x - v0.x; dy2 := v2.y - v0.y
-		den := dx1 * dy2 - dy1 * dx2
+		// Perspective-correct texture footprint, evaluated in tile-local space.
+		// u(x,y) = Un/Wd with the premultiplied numerator and 1/w denominator both
+		// linear in screen (x,y); the Jacobian is taken by the quotient rule at the
+		// tile-center so a large receding triangle's LOD tracks depth instead of
+		// one whole-triangle footprint. (See the C++ port for the derivation.)
+		iw0, iw1, iw2 := v0.inv_w, v1.inv_w, v2.inv_w
+		un_dx := uw0 * A0 + uw1 * A1 + uw2 * A2
+		un_dy := uw0 * B0 + uw1 * B1 + uw2 * B2
+		vn_dx := v0_w * A0 + v1_w * A1 + v2_w * A2
+		vn_dy := v0_w * B0 + v1_w * B1 + v2_w * B2
+		wd_dx := iw0 * A0 + iw1 * A1 + iw2 * A2
+		wd_dy := iw0 * B0 + iw1 * B1 + iw2 * B2
+		xc := 0.5 * f32(x_min + x_max)
+		yc := 0.5 * f32(y_min + y_max)
+		wc0 := A0 * xc + B0 * yc + setup.K0
+		wc1 := A1 * xc + B1 * yc + setup.K1
+		wc2 := A2 * xc + B2 * yc + setup.K2
+		wd_c := iw0 * wc0 + iw1 * wc1 + iw2 * wc2
 		major, minor: f32 = 1.0, 1.0
 		major_vec_u, major_vec_v: f32 = 0.0, 0.0
-		if math.abs(den) > 0.0001 {
-			inv_den := 1.0 / den
-			du1 := v1.u - v0.u; du2 := v2.u - v0.u
-			dv1 := v1.v - v0.v; dv2 := v2.v - v0.v
+		if math.abs(wd_c) > 0.000001 {
+			inv_wd_c := 1.0 / wd_c
 			bw := f32(base.w); bh := f32(base.h)
-			du_dx := (du1 * dy2 - du2 * dy1) * inv_den * bw
-			du_dy := (dx1 * du2 - dx2 * du1) * inv_den * bw
-			dv_dx := (dv1 * dy2 - dv2 * dy1) * inv_den * bh
-			dv_dy := (dx1 * dv2 - dx2 * dv1) * inv_den * bh
+			uc := (uw0 * wc0 + uw1 * wc1 + uw2 * wc2) * inv_wd_c
+			vc := (v0_w * wc0 + v1_w * wc1 + v2_w * wc2) * inv_wd_c
+			du_dx := (un_dx - uc * wd_dx) * inv_wd_c * bw
+			du_dy := (un_dy - uc * wd_dy) * inv_wd_c * bw
+			dv_dx := (vn_dx - vc * wd_dx) * inv_wd_c * bh
+			dv_dy := (vn_dy - vc * wd_dy) * inv_wd_c * bh
 			a := du_dx * du_dx + du_dy * du_dy
 			b := du_dx * dv_dx + du_dy * dv_dy
 			c := dv_dx * dv_dx + dv_dy * dv_dy

@@ -1253,27 +1253,38 @@ pub unsafe fn draw_triangle_barycentric_strip(
         if let Some(t) = texture.filter(|t| !t.levels.is_empty() && !t.levels[0].rgb.is_empty()) {
             let base = &t.levels[0];
             let mut mip_level = 0i32;
-            let dx1 = v1.x - v0.x;
-            let dy1 = v1.y - v0.y;
-            let dx2 = v2.x - v0.x;
-            let dy2 = v2.y - v0.y;
-            let den = dx1 * dy2 - dy1 * dx2;
+            // Perspective-correct texture footprint, evaluated in tile-local space.
+            // u(x,y) = Un/Wd with the premultiplied numerator and 1/w denominator
+            // both linear in screen (x,y); the Jacobian is taken by the quotient
+            // rule at the tile-center so a large receding triangle's LOD tracks
+            // depth instead of one whole-triangle footprint. (See the C++ port.)
+            let (iw0, iw1, iw2) = (v0.inv_w, v1.inv_w, v2.inv_w);
+            let un_dx = uw0 * a0 + uw1 * a1 + uw2 * a2;
+            let un_dy = uw0 * b0 + uw1 * b1 + uw2 * b2;
+            let vn_dx = v0_w * a0 + v1_w * a1 + v2_w * a2;
+            let vn_dy = v0_w * b0 + v1_w * b1 + v2_w * b2;
+            let wd_dx = iw0 * a0 + iw1 * a1 + iw2 * a2;
+            let wd_dy = iw0 * b0 + iw1 * b1 + iw2 * b2;
+            let xc = 0.5 * (x_min + x_max) as f32;
+            let yc = 0.5 * (y_min + y_max) as f32;
+            let wc0 = a0 * xc + b0 * yc + setup.k0;
+            let wc1 = a1 * xc + b1 * yc + setup.k1;
+            let wc2 = a2 * xc + b2 * yc + setup.k2;
+            let wd_c = iw0 * wc0 + iw1 * wc1 + iw2 * wc2;
             let mut major = 1.0f32;
             let mut minor = 1.0f32;
             let mut major_vec_u = 0.0f32;
             let mut major_vec_v = 0.0f32;
-            if den.abs() > 0.0001 {
-                let inv_den = 1.0 / den;
-                let du1 = v1.u - v0.u;
-                let du2 = v2.u - v0.u;
-                let dv1 = v1.v - v0.v;
-                let dv2 = v2.v - v0.v;
+            if wd_c.abs() > 0.000001 {
+                let inv_wd_c = 1.0 / wd_c;
                 let bw = base.w as f32;
                 let bh = base.h as f32;
-                let du_dx = (du1 * dy2 - du2 * dy1) * inv_den * bw;
-                let du_dy = (dx1 * du2 - dx2 * du1) * inv_den * bw;
-                let dv_dx = (dv1 * dy2 - dv2 * dy1) * inv_den * bh;
-                let dv_dy = (dx1 * dv2 - dx2 * dv1) * inv_den * bh;
+                let uc = (uw0 * wc0 + uw1 * wc1 + uw2 * wc2) * inv_wd_c;
+                let vc = (v0_w * wc0 + v1_w * wc1 + v2_w * wc2) * inv_wd_c;
+                let du_dx = (un_dx - uc * wd_dx) * inv_wd_c * bw;
+                let du_dy = (un_dy - uc * wd_dy) * inv_wd_c * bw;
+                let dv_dx = (vn_dx - vc * wd_dx) * inv_wd_c * bh;
+                let dv_dy = (vn_dy - vc * wd_dy) * inv_wd_c * bh;
 
                 let a = du_dx * du_dx + du_dy * du_dy;
                 let b = du_dx * dv_dx + du_dy * dv_dy;

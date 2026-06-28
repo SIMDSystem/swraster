@@ -306,21 +306,40 @@ void draw_triangle_barycentric_strip(uint8_t* pixels, int pitch, float* depth_bu
     if (has_texture) {
         const PackedTextureLevel& base = texture->levels[0];
         int mip_level = 0;
-        float dx1 = v1.x - v0.x, dy1 = v1.y - v0.y;
-        float dx2 = v2.x - v0.x, dy2 = v2.y - v0.y;
-        float den = dx1 * dy2 - dy1 * dx2;
+        // Perspective-correct texture footprint, evaluated in tile-local space.
+        // The true u,v fields are hyperbolic: u(x,y) = Un(x,y)/Wd(x,y), where the
+        // premultiplied numerator Un = sum((u_i/w_i) * w_edge_i) and denominator
+        // Wd = sum((1/w_i) * w_edge_i) are both linear in screen (x,y), so their
+        // gradients are triangle constants. The Jacobian is evaluated by the
+        // quotient rule at the center of this tile's covered span, so a large
+        // receding triangle gets a sharper LOD in its near tiles and a coarser
+        // one in its far tiles instead of one whole-triangle footprint.
+        float iw0 = v0.inv_w, iw1 = v1.inv_w, iw2 = v2.inv_w;
+        float un_dx = u0_w * A0 + u1_w * A1 + u2_w * A2;
+        float un_dy = u0_w * B0 + u1_w * B1 + u2_w * B2;
+        float vn_dx = v0_w * A0 + v1_w * A1 + v2_w * A2;
+        float vn_dy = v0_w * B0 + v1_w * B1 + v2_w * B2;
+        float wd_dx = iw0  * A0 + iw1  * A1 + iw2  * A2;
+        float wd_dy = iw0  * B0 + iw1  * B1 + iw2  * B2;
+        float xc = 0.5f * (float)(x_min + x_max);
+        float yc = 0.5f * (float)(y_min + y_max);
+        float wc0 = A0 * xc + B0 * yc + setup->K0;
+        float wc1 = A1 * xc + B1 * yc + setup->K1;
+        float wc2 = A2 * xc + B2 * yc + setup->K2;
+        float wd_c = iw0 * wc0 + iw1 * wc1 + iw2 * wc2;
         float major = 1.0f;
         float minor = 1.0f;
         float major_vec_u = 0.0f;
         float major_vec_v = 0.0f;
-        if (fabsf(den) > 0.0001f) {
-            float inv_den = 1.0f / den;
-            float du1 = v1.u - v0.u, du2 = v2.u - v0.u;
-            float dv1 = v1.v - v0.v, dv2 = v2.v - v0.v;
-            float du_dx = (du1 * dy2 - du2 * dy1) * inv_den * base.w;
-            float du_dy = (dx1 * du2 - dx2 * du1) * inv_den * base.w;
-            float dv_dx = (dv1 * dy2 - dv2 * dy1) * inv_den * base.h;
-            float dv_dy = (dx1 * dv2 - dx2 * dv1) * inv_den * base.h;
+        if (fabsf(wd_c) > 0.000001f) {
+            float inv_wd_c = 1.0f / wd_c;
+            float uc = (u0_w * wc0 + u1_w * wc1 + u2_w * wc2) * inv_wd_c;
+            float vc = (v0_w * wc0 + v1_w * wc1 + v2_w * wc2) * inv_wd_c;
+            // Quotient rule d(N/D) = (N' - (N/D) D')/D, scaled to texel space.
+            float du_dx = (un_dx - uc * wd_dx) * inv_wd_c * base.w;
+            float du_dy = (un_dy - uc * wd_dy) * inv_wd_c * base.w;
+            float dv_dx = (vn_dx - vc * wd_dx) * inv_wd_c * base.h;
+            float dv_dy = (vn_dy - vc * wd_dy) * inv_wd_c * base.h;
 
             float a = du_dx * du_dx + du_dy * du_dy;
             float b = du_dx * dv_dx + du_dy * dv_dy;
